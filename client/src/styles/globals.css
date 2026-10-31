@@ -5236,3 +5236,15 @@ button.ch-tree-vu-stream svg { width:21px;height:21px; }
     transition-duration: .01ms !important;
   }
 }
+
+.e2ee-status-indicator,
+.dm-e2ee-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  color: var(--green, #22c55e);
+  font-size: 13px;
+  line-height: 1;
+  opacity: .9;
+}
