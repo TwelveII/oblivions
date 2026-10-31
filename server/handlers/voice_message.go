@@ -99,6 +99,12 @@ func (h *VoiceMessageHandler) Create(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Content = r.FormValue("content")
+		if r.FormValue("encryption_version") == "1" {
+			req.EncryptionVersion = 1
+			if value := r.FormValue("ciphertext"); value != "" { req.Ciphertext = &value }
+			if value := r.FormValue("sender_device_id"); value != "" { req.SenderDeviceID = &value }
+			if value := r.FormValue("e2ee_metadata"); value != "" { req.E2EEMetadata = &value }
+		}
 		if r.MultipartForm != nil && len(r.MultipartForm.File["files"]) > 0 {
 			req.HasFiles = true
 		}
