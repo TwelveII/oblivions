@@ -98,21 +98,14 @@ func (s *dmService) markOwnDelivered(ctx context.Context, channel *models.DMChan
 // directions. The client alone picks the path, so a client that misreads the state would store the
 // message in the clear — or, the other way, as ciphertext nobody in the conversation can decrypt.
 func enforceDMEncryptionPolicy(channel *models.DMChannel, encryptionVersion int) error {
-	if channel.E2EEEnabled && encryptionVersion != 1 {
+	if encryptionVersion != 1 {
 		return pkg.WithCode(
-			fmt.Errorf("%w: this conversation requires end-to-end encrypted messages", pkg.ErrBadRequest),
+			fmt.Errorf("%w: all direct messages require end-to-end encryption", pkg.ErrBadRequest),
 			pkg.CodeEncryptionRequired,
-		)
-	}
-	if !channel.E2EEEnabled && encryptionVersion == 1 {
-		return pkg.WithCode(
-			fmt.Errorf("%w: this conversation does not use end-to-end encryption", pkg.ErrBadRequest),
-			pkg.CodeEncryptionNotAvailable,
 		)
 	}
 	return nil
 }
-
 // SendMessage creates a DM message. WS broadcast is done via BroadcastCreate after file uploads.
 func (s *dmService) SendMessage(ctx context.Context, userID, channelID string, req *models.CreateDMMessageRequest) (*models.DMMessage, bool, error) {
 	if err := req.Validate(); err != nil {
