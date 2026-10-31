@@ -1,0 +1,446 @@
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/akinalp/mqvi/middleware"
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg/ctxkeys"
+	"github.com/akinalp/mqvi/pkg/fileacl"
+	"github.com/akinalp/mqvi/pkg/files"
+	"github.com/akinalp/mqvi/pkg/signedurl"
+	"github.com/akinalp/mqvi/repository"
+	"github.com/akinalp/mqvi/services"
+)
+
+// initRoutes registers all API endpoints.
+// Literal paths must be registered before parametric ones
+// (e.g. "/api/servers/join" before "/api/servers/{serverId}").
+func initRoutes(
+	mux *http.ServeMux,
+	h *Handlers,
+	authService services.AuthService,
+	userRepo repository.UserRepository,
+	roleRepo repository.RoleRepository,
+	serverRepo repository.ServerRepository,
+	fileSigner *signedurl.Signer,
+	fileACL *fileacl.Checker,
+) {
+	// Middleware
+	authMw := middleware.NewAuthMiddleware(authService, userRepo)
+	permMw := middleware.NewPermissionMiddleware(roleRepo)
+	serverMw := middleware.NewServerMembershipMiddleware(serverRepo)
+	platformAdminMw := middleware.NewPlatformAdminMiddleware()
+
+	// Middleware chain helpers
+	auth := func(handler http.HandlerFunc) http.Handler {
+		return authMw.Require(http.HandlerFunc(handler))
+	}
+	authServer := func(handler http.HandlerFunc) http.Handler {
+		return authMw.Require(serverMw.Require(http.HandlerFunc(handler)))
+	}
+	// authServerNoMemberCheck: extracts serverId without member-or-active check.
+	// Used for owner-only endpoints on soft-deleted servers (restore, permanent delete).
+	// The handler/service is responsible for ownership authorization.
+	authServerNoMemberCheck := func(handler http.HandlerFunc) http.Handler {
+		return authMw.Require(serverMw.RequireServerID(http.HandlerFunc(handler)))
+	}
+	authServerPerm := func(perm models.Permission, handler http.HandlerFunc) http.Handler {
+		return authMw.Require(serverMw.Require(permMw.Require(perm, http.HandlerFunc(handler))))
+	}
+	authServerPermLoad := func(handler http.HandlerFunc) http.Handler {
+		return authMw.Require(serverMw.Require(permMw.Load(http.HandlerFunc(handler))))
+	}
+	authAdmin := func(handler http.HandlerFunc) http.Handler {
+		return authMw.Require(platformAdminMw.Require(http.HandlerFunc(handler)))
+	}
+
+	// ╔══════════════════════════════════════════╗
+	// ║  GLOBAL ROUTES (server-independent)       ║
+	// ╚══════════════════════════════════════════╝
+
+	// Auth
+	mux.HandleFunc("POST /api/auth/register", h.Auth.Register)
+	mux.HandleFunc("POST /api/auth/login", h.Auth.Login)
+	mux.HandleFunc("POST /api/auth/refresh", h.Auth.Refresh)
+	// No access token required: the refresh token is the credential, as for /refresh, so a device
+	// can still end its session after the access token has lapsed (an offline sign-out sent later).
+	mux.HandleFunc("POST /api/auth/logout", h.Auth.Logout)
+	mux.Handle("GET /api/auth/sessions", auth(h.Session.List))
+	mux.Handle("DELETE /api/auth/sessions", auth(h.Session.RevokeOthers))
+	mux.Handle("DELETE /api/auth/sessions/{sessionId}", auth(h.Session.Revoke))
+	mux.Handle("POST /api/auth/credential-store-failure", auth(h.Auth.CredentialStoreFailure))
+			mux.HandleFunc("POST /api/auth/restore", h.Auth.RestoreAccount)
+
+	// User
+	mux.Handle("GET /api/users/me", auth(h.Auth.Me))
+	mux.Handle("GET /api/users/me/signup-invites", auth(h.SignupInvite.List))
+	mux.Handle("POST /api/users/me/signup-invites", auth(h.SignupInvite.Create))
+	mux.Handle("DELETE /api/users/me/signup-invites/{inviteId}", auth(h.SignupInvite.Revoke))
+	mux.Handle("PATCH /api/users/me/profile", auth(h.Member.UpdateProfile))
+	mux.Handle("POST /api/users/me/password", auth(h.Auth.ChangePassword))
+		mux.Handle("POST /api/users/me/avatar", auth(h.Avatar.UploadUserAvatar))
+	mux.Handle("POST /api/users/me/wallpaper", auth(h.Avatar.UploadUserWallpaper))
+	mux.Handle("DELETE /api/users/me/wallpaper", auth(h.Avatar.DeleteUserWallpaper))
+	mux.Handle("GET /api/users/me/preferences", auth(h.Preferences.Get))
+	mux.Handle("POST /api/users/me/dismiss-download-prompt", auth(h.DownloadPrompt.Dismiss))
+	mux.Handle("POST /api/users/me/dismiss-welcome", auth(h.DownloadPrompt.DismissWelcome))
+	mux.Handle("GET /api/users/me/guide", auth(h.Guide.Get))
+	mux.Handle("PUT /api/users/me/guide", auth(h.Guide.Update))
+	mux.Handle("POST /api/users/me/guide/app", auth(h.Guide.MarkAppUsed))
+	mux.Handle("GET /api/users/me/deleted-servers", auth(h.Server.GetDeletedServers))
+	mux.Handle("DELETE /api/users/me", auth(h.Auth.SoftDeleteSelf))
+	mux.Handle("PATCH /api/users/me/preferences", auth(h.Preferences.Update))
+	mux.Handle("GET /api/users/me/storage", auth(h.Storage.GetUsage))
+
+	// Servers
+	mux.Handle("GET /api/servers", auth(h.Server.ListMyServers))
+	mux.Handle("POST /api/servers", auth(h.Server.CreateServer))
+	mux.Handle("POST /api/servers/join", auth(h.Server.JoinServer))
+	mux.Handle("PATCH /api/servers/reorder", auth(h.Server.ReorderServers))
+
+	// Server mutes — literal path before {serverId} wildcard
+	mux.Handle("GET /api/servers/mutes", auth(h.ServerMute.ListMuted))
+
+	// File URL refresh — re-signs a path the user already has a valid signature for.
+	// Accepts POST with {"url":"/api/files/...?exp=...&sig=..."} body.
+	// The existing signature must still be valid AND the user must still have ACL access.
+	mux.Handle("POST /api/files/refresh", auth(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
+			http.Error(w, "url required", http.StatusBadRequest)
+			return
+		}
+		// Verify the caller actually has a valid (non-expired) signed URL.
+		if err := fileSigner.VerifyURL(req.URL); err != nil {
+			http.Error(w, "invalid or expired signed URL", http.StatusForbidden)
+			return
+		}
+		// Extract path portion.
+		path := req.URL
+		if idx := strings.IndexByte(path, '?'); idx != -1 {
+			path = path[:idx]
+		}
+		if !strings.HasPrefix(path, files.URLPathPrefix+"/") {
+			http.Error(w, "invalid file path", http.StatusBadRequest)
+			return
+		}
+		// ACL check: verify user still has permission to access this file.
+		user, _ := r.Context().Value(ctxkeys.User).(*models.User)
+		if err := fileACL.Check(r.Context(), user, path); err != nil {
+			http.Error(w, "access denied", http.StatusForbidden)
+			return
+		}
+		signed := fileSigner.Sign(path, time.Hour)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"url": signed})
+	}))
+
+	// DMs — literal paths before parametric
+	mux.Handle("GET /api/dms/settings", auth(h.DMSettings.GetSettings))
+	mux.Handle("GET /api/dms", auth(h.DM.ListChannels))
+	mux.Handle("POST /api/dms", auth(h.DM.CreateOrGetChannel))
+
+	// DM Settings — /api/dms/channels/ prefix avoids route ambiguity with /api/dms/{channelId}
+	mux.Handle("POST /api/dms/channels/{channelId}/hide", auth(h.DMSettings.HideDM))
+	mux.Handle("DELETE /api/dms/channels/{channelId}/hide", auth(h.DMSettings.UnhideDM))
+	mux.Handle("POST /api/dms/channels/{channelId}/pin-conversation", auth(h.DMSettings.PinConversation))
+	mux.Handle("DELETE /api/dms/channels/{channelId}/pin-conversation", auth(h.DMSettings.UnpinConversation))
+	mux.Handle("POST /api/dms/channels/{channelId}/mute", auth(h.DMSettings.MuteDM))
+	mux.Handle("DELETE /api/dms/channels/{channelId}/mute", auth(h.DMSettings.UnmuteDM))
+
+	// DM Request accept/decline
+	mux.Handle("POST /api/dms/channels/{channelId}/accept", auth(h.DM.AcceptRequest))
+	mux.Handle("POST /api/dms/channels/{channelId}/decline", auth(h.DM.DeclineRequest))
+
+	// DM Messages
+	mux.Handle("GET /api/dms/{channelId}/messages", auth(h.DM.GetMessages))
+	mux.Handle("POST /api/dms/{channelId}/messages", auth(h.DM.SendMessage))
+	mux.Handle("PATCH /api/dms/messages/{id}", auth(h.DM.EditMessage))
+	mux.Handle("DELETE /api/dms/messages/{id}", auth(h.DM.DeleteMessage))
+	mux.Handle("POST /api/dms/messages/{id}/reactions", auth(h.DM.ToggleReaction))
+	mux.Handle("POST /api/dms/messages/{id}/pin", auth(h.DM.PinMessage))
+	mux.Handle("DELETE /api/dms/messages/{id}/pin", auth(h.DM.UnpinMessage))
+	mux.Handle("GET /api/dms/{channelId}/pinned", auth(h.DM.GetPinnedMessages))
+	mux.Handle("GET /api/dms/{channelId}/search", auth(h.DM.SearchMessages))
+	mux.Handle("PATCH /api/dms/channels/{channelId}/e2ee", auth(h.DM.ToggleE2EE))
+	mux.Handle("POST /api/dms/channels/{channelId}/read", auth(h.DM.MarkRead))
+	mux.Handle("POST /api/dms/channels/{channelId}/delivered", auth(h.DM.MarkDelivered))
+	mux.Handle("POST /api/dms/delivered", auth(h.DM.MarkDeliveredLatest))
+
+	// Block — literal "blocked" before parametric {userId}
+	mux.Handle("GET /api/users/blocked", auth(h.Block.ListBlocked))
+	mux.Handle("POST /api/users/{userId}/block", auth(h.Block.BlockUser))
+	mux.Handle("DELETE /api/users/{userId}/block", auth(h.Block.UnblockUser))
+
+	// Report
+	mux.Handle("POST /api/users/{userId}/report", auth(h.Report.CreateReport))
+
+	// Feedback
+	mux.Handle("POST /api/feedback", auth(h.Feedback.CreateTicket))
+	mux.Handle("GET /api/feedback", auth(h.Feedback.ListMyTickets))
+	mux.Handle("GET /api/feedback/badge", auth(h.Feedback.GetMyBadge))
+	mux.Handle("POST /api/feedback/mark-seen", auth(h.Feedback.MarkMySeen))
+	mux.Handle("GET /api/feedback/{id}", auth(h.Feedback.GetTicket))
+	mux.Handle("POST /api/feedback/{id}/reply", auth(h.Feedback.AddReply))
+	mux.Handle("DELETE /api/feedback/{id}", auth(h.Feedback.DeleteTicket))
+
+	// E2EE Devices
+	mux.Handle("GET /api/devices", auth(h.Device.List))
+	mux.Handle("POST /api/devices", auth(h.Device.Register))
+	mux.Handle("DELETE /api/devices/{deviceId}", auth(h.Device.Delete))
+	mux.Handle("POST /api/devices/{deviceId}/prekeys", auth(h.Device.UploadPrekeys))
+	mux.Handle("PUT /api/devices/{deviceId}/signed-prekey", auth(h.Device.UpdateSignedPrekey))
+	mux.Handle("GET /api/devices/{deviceId}/prekey-count", auth(h.Device.GetPrekeyCount))
+
+	// E2EE Key Backup
+	mux.Handle("PUT /api/e2ee/key-backup", auth(h.E2EE.UpsertKeyBackup))
+	mux.Handle("GET /api/e2ee/key-backup", auth(h.E2EE.GetKeyBackup))
+	mux.Handle("DELETE /api/e2ee/key-backup", auth(h.E2EE.DeleteKeyBackup))
+
+	// E2EE User Devices / Prekey Bundles
+	mux.Handle("GET /api/users/{userId}/devices", auth(h.Device.ListPublicDevices))
+	mux.Handle("GET /api/users/{userId}/prekey-bundles", auth(h.Device.GetPrekeyBundles))
+
+	// Push Notifications
+	mux.Handle("POST /api/push/tokens", auth(h.PushToken.Register))
+	mux.Handle("DELETE /api/push/tokens", auth(h.PushToken.Unregister))
+
+	// Channel mutes — literal path before {serverId} wildcard
+	mux.Handle("GET /api/channels/mutes", auth(h.ChannelMute.ListMuted))
+
+	// Link Preview
+	mux.Handle("GET /api/link-preview", auth(h.LinkPreview.Get))
+
+	// Badges — literal paths before parametric
+	mux.Handle("GET /api/badges", auth(h.Badge.ListBadges))
+	mux.Handle("POST /api/badges", auth(h.Badge.CreateBadge))
+	mux.Handle("POST /api/badges/icon", auth(h.Badge.UploadBadgeIcon))
+	mux.Handle("PATCH /api/badges/{id}", auth(h.Badge.UpdateBadge))
+	mux.Handle("DELETE /api/badges/{id}", auth(h.Badge.DeleteBadge))
+	mux.Handle("POST /api/badges/{id}/assign", auth(h.Badge.AssignBadge))
+	mux.Handle("DELETE /api/badges/{id}/assign/{userId}", auth(h.Badge.UnassignBadge))
+	mux.Handle("GET /api/users/{userId}/badges", auth(h.Badge.GetUserBadges))
+
+	// GIFs (Klipy proxy)
+	mux.Handle("GET /api/gifs/trending", auth(h.Gif.Trending))
+	mux.Handle("GET /api/gifs/search", auth(h.Gif.Search))
+
+	// Friends
+	mux.Handle("GET /api/friends/requests", auth(h.Friendship.ListRequests))
+	mux.Handle("POST /api/friends/requests", auth(h.Friendship.SendRequest))
+	mux.Handle("POST /api/friends/requests/{id}/accept", auth(h.Friendship.AcceptRequest))
+	mux.Handle("DELETE /api/friends/requests/{id}", auth(h.Friendship.DeclineRequest))
+	mux.Handle("GET /api/friends", auth(h.Friendship.ListFriends))
+	mux.Handle("DELETE /api/friends/{userId}", auth(h.Friendship.RemoveFriend))
+
+	// P2P Calls — ICE servers (STUN + TURN relay fallback). Fetched per call so
+	// the short-lived HMAC TURN credential is always fresh.
+	mux.Handle("GET /api/calls/ice-servers", auth(h.ICEServer.GetICEServers))
+	// No session: sent by the iOS native layer while the page is suspended; the per-call key
+	// authorizes it (see P2PCall.CallerEndKey).
+	mux.HandleFunc("POST /api/calls/{id}/hangup", h.P2PHangup.Hangup)
+
+	// Platform Admin — LiveKit
+	mux.Handle("GET /api/admin/livekit-regions", authAdmin(h.Admin.ListLiveKitRegions))
+	mux.Handle("GET /api/admin/livekit-instances", authAdmin(h.Admin.ListLiveKitInstances))
+	mux.Handle("GET /api/admin/livekit-instances/{id}/metrics/timeseries", authAdmin(h.Admin.GetLiveKitInstanceMetricsTimeSeries))
+	mux.Handle("GET /api/admin/livekit-instances/{id}/metrics/history", authAdmin(h.Admin.GetLiveKitInstanceMetricsHistory))
+	mux.Handle("GET /api/admin/livekit-instances/{id}/metrics", authAdmin(h.Admin.GetLiveKitInstanceMetrics))
+	mux.Handle("GET /api/admin/livekit-instances/{id}", authAdmin(h.Admin.GetLiveKitInstance))
+	mux.Handle("POST /api/admin/livekit-instances", authAdmin(h.Admin.CreateLiveKitInstance))
+	mux.Handle("PATCH /api/admin/livekit-instances/{id}", authAdmin(h.Admin.UpdateLiveKitInstance))
+	mux.Handle("DELETE /api/admin/livekit-instances/{id}", authAdmin(h.Admin.DeleteLiveKitInstance))
+
+	// Platform Admin — Servers
+	mux.Handle("GET /api/admin/servers", authAdmin(h.Admin.ListServers))
+	mux.Handle("PATCH /api/admin/servers/{serverId}/instance", authAdmin(h.Admin.MigrateServerInstance))
+	mux.Handle("PATCH /api/admin/servers/{serverId}/discovery-flag", authAdmin(h.Admin.SetServerDiscoveryFlag))
+	mux.Handle("DELETE /api/admin/servers/{serverId}", authAdmin(h.Admin.AdminDeleteServer))
+	mux.Handle("POST /api/admin/servers/{serverId}/restore", authAdmin(h.Admin.AdminRestoreServer))
+
+	// Platform Admin — Reports
+	mux.Handle("GET /api/admin/reports", authAdmin(h.Admin.ListReports))
+	mux.Handle("PATCH /api/admin/reports/{id}/status", authAdmin(h.Admin.UpdateReportStatus))
+	mux.Handle("DELETE /api/admin/reports/{id}/message", authAdmin(h.Admin.DeleteReportedMessage))
+	mux.Handle("GET /api/admin/server-reports", authAdmin(h.Admin.ListServerReports))
+	mux.Handle("PATCH /api/admin/server-reports/{id}/status", authAdmin(h.Admin.UpdateServerReportStatus))
+	mux.Handle("POST /api/admin/reports/mark-seen", authAdmin(h.Admin.MarkReportsSeen))
+
+	// Platform Admin — Badge indicators (new feedback / new reports)
+	mux.Handle("GET /api/admin/badges", authAdmin(h.Admin.GetBadges))
+
+	// Platform Admin — Feedback
+	mux.Handle("GET /api/admin/feedback", authAdmin(h.Feedback.AdminListTickets))
+	mux.Handle("GET /api/admin/feedback/{id}", authAdmin(h.Feedback.AdminGetTicket))
+	mux.Handle("POST /api/admin/feedback/{id}/reply", authAdmin(h.Feedback.AdminReply))
+	mux.Handle("PATCH /api/admin/feedback/{id}/status", authAdmin(h.Feedback.AdminUpdateStatus))
+	mux.Handle("POST /api/admin/feedback/mark-seen", authAdmin(h.Admin.MarkFeedbackSeen))
+
+	// Platform Admin — Users
+	mux.Handle("GET /api/admin/users", authAdmin(h.Admin.ListUsers))
+	mux.Handle("POST /api/admin/users/{id}/ban", authAdmin(h.Admin.PlatformBanUser))
+	mux.Handle("DELETE /api/admin/users/{id}/ban", authAdmin(h.Admin.PlatformUnbanUser))
+	mux.Handle("DELETE /api/admin/users/{id}", authAdmin(h.Admin.HardDeleteUser))
+	mux.Handle("POST /api/admin/users/{id}/restore", authAdmin(h.Admin.AdminRestoreUser))
+	mux.Handle("PATCH /api/admin/users/{id}/platform-admin", authAdmin(h.Admin.SetUserPlatformAdmin))
+	mux.Handle("PATCH /api/admin/users/{id}/quota", authAdmin(h.Storage.AdminSetQuota))
+	mux.Handle("GET /api/admin/signup-invites/relationships", authAdmin(h.SignupInvite.AdminListRelationships))
+	mux.Handle("PATCH /api/admin/users/{id}/signup-invite-limit", authAdmin(h.SignupInvite.AdminSetLimit))
+
+	// Platform Admin — App Logs
+	mux.Handle("GET /api/admin/logs", authAdmin(h.Admin.ListAppLogs))
+	mux.Handle("DELETE /api/admin/logs", authAdmin(h.Admin.ClearAppLogs))
+
+	// LiveKit Webhook — no auth middleware, verified via HMAC signature
+	mux.HandleFunc("POST /api/livekit/webhook", h.LiveKitWebhook.HandleWebhook)
+
+	// Stats — public
+	mux.HandleFunc("GET /api/stats", h.Stats.GetPublicStats)
+	mux.HandleFunc("GET /api/client-policy", h.ClientPolicy.Get)
+	// Optional auth: a signed-in client's reports carry its user; signed-out ones are still taken.
+	mux.Handle("POST /api/client-errors", authMw.Optional(http.HandlerFunc(h.ClientError.Report)))
+
+	// Invite Preview — public (no auth)
+	mux.HandleFunc("GET /api/invites/{code}/preview", h.Invite.Preview)
+
+	// ╔══════════════════════════════════════════╗
+	// ║  SERVER-SCOPED ROUTES                     ║
+	// ╚══════════════════════════════════════════╝
+
+	// Server
+	mux.Handle("GET /api/servers/{serverId}", authServer(h.Server.GetServer))
+	mux.Handle("PATCH /api/servers/{serverId}", authServerPerm(models.PermAdmin, h.Server.UpdateServer))
+	mux.Handle("DELETE /api/servers/{serverId}", authServer(h.Server.DeleteServer))
+	mux.Handle("POST /api/servers/{serverId}/restore", authServerNoMemberCheck(h.Server.RestoreServer))
+	mux.Handle("DELETE /api/servers/{serverId}/permanent", authServerNoMemberCheck(h.Server.HardDeleteServer))
+	mux.Handle("POST /api/servers/{serverId}/leave", authServer(h.Server.LeaveServer))
+	mux.Handle("POST /api/servers/{serverId}/icon", authServerPerm(models.PermAdmin, h.Avatar.UploadServerIcon))
+	mux.Handle("POST /api/servers/{serverId}/banner", authServerPerm(models.PermAdmin, h.Avatar.UploadServerBanner))
+
+	// Public server discovery (login required; not server-scoped)
+	mux.Handle("GET /api/discovery/servers", auth(h.Discovery.ListPublicServers))
+	mux.Handle("GET /api/discovery/servers/{id}", auth(h.Discovery.GetPublicServer))
+	mux.Handle("POST /api/discovery/servers/{id}/join", auth(h.Discovery.JoinPublicServer))
+	mux.Handle("POST /api/discovery/servers/{id}/report", auth(h.Discovery.ReportServer))
+
+	// Server Mute
+	mux.Handle("POST /api/servers/{serverId}/mute", authServer(h.ServerMute.Mute))
+	mux.Handle("DELETE /api/servers/{serverId}/mute", authServer(h.ServerMute.Unmute))
+
+	// Channel Mute
+	mux.Handle("POST /api/servers/{serverId}/channels/{id}/mute", authServer(h.ChannelMute.Mute))
+	mux.Handle("DELETE /api/servers/{serverId}/channels/{id}/mute", authServer(h.ChannelMute.Unmute))
+
+	// LiveKit settings
+	mux.Handle("GET /api/servers/{serverId}/livekit", authServerPerm(models.PermAdmin, h.Server.GetLiveKitSettings))
+
+	// Channels
+	mux.Handle("GET /api/servers/{serverId}/channels", authServer(h.Channel.List))
+	mux.Handle("POST /api/servers/{serverId}/channels", authServerPerm(models.PermManageChannels, h.Channel.Create))
+	mux.Handle("PATCH /api/servers/{serverId}/channels/reorder", authServerPerm(models.PermManageChannels, h.Channel.Reorder))
+	mux.Handle("PATCH /api/servers/{serverId}/channels/{id}", authServerPerm(models.PermManageChannels, h.Channel.Update))
+	mux.Handle("DELETE /api/servers/{serverId}/channels/{id}", authServerPerm(models.PermManageChannels, h.Channel.Delete))
+
+	// Categories
+	mux.Handle("GET /api/servers/{serverId}/categories", authServer(h.Category.List))
+	mux.Handle("POST /api/servers/{serverId}/categories", authServerPerm(models.PermManageChannels, h.Category.Create))
+	mux.Handle("PATCH /api/servers/{serverId}/categories/{id}", authServerPerm(models.PermManageChannels, h.Category.Update))
+	mux.Handle("DELETE /api/servers/{serverId}/categories/{id}", authServerPerm(models.PermManageChannels, h.Category.Delete))
+	mux.Handle("PATCH /api/servers/{serverId}/categories/reorder", authServerPerm(models.PermManageChannels, h.Category.Reorder))
+
+	// Messages
+	mux.Handle("GET /api/servers/{serverId}/channels/{id}/messages", authServer(h.Message.List))
+	mux.Handle("POST /api/servers/{serverId}/channels/{id}/messages", authServer(h.Message.Create))
+	mux.Handle("PATCH /api/servers/{serverId}/messages/{id}", authServer(h.Message.Update))
+	mux.Handle("DELETE /api/servers/{serverId}/messages/{id}", authServerPermLoad(h.Message.Delete))
+
+	// Reactions
+	mux.Handle("POST /api/servers/{serverId}/messages/{messageId}/reactions", authServer(h.Reaction.Toggle))
+
+	// Pins
+	mux.Handle("GET /api/servers/{serverId}/channels/{id}/pins", authServer(h.Pin.ListPins))
+	mux.Handle("POST /api/servers/{serverId}/channels/{channelId}/messages/{messageId}/pin", authServerPerm(models.PermManageMessages, h.Pin.Pin))
+	mux.Handle("DELETE /api/servers/{serverId}/channels/{channelId}/messages/{messageId}/pin", authServerPerm(models.PermManageMessages, h.Pin.Unpin))
+
+	// Read State — literal "read-all" and "unread" before {id} wildcard
+	mux.Handle("POST /api/servers/{serverId}/channels/read-all", authServer(h.ReadState.MarkAllRead))
+	mux.Handle("GET /api/servers/{serverId}/channels/unread", authServer(h.ReadState.GetUnreads))
+	mux.Handle("POST /api/servers/{serverId}/channels/{id}/read/mentions", authServer(h.ReadState.MarkMentionSeen))
+	mux.Handle("POST /api/servers/{serverId}/channels/{id}/read", authServer(h.ReadState.MarkRead))
+
+	// Members
+	mux.Handle("GET /api/servers/{serverId}/members", authServer(h.Member.List))
+	mux.Handle("GET /api/servers/{serverId}/members/{id}", authServer(h.Member.Get))
+	mux.Handle("PATCH /api/servers/{serverId}/members/{id}/roles", authServerPerm(models.PermManageRoles, h.Member.ModifyRoles))
+	mux.Handle("DELETE /api/servers/{serverId}/members/{id}", authServerPerm(models.PermKickMembers, h.Member.Kick))
+	mux.Handle("POST /api/servers/{serverId}/members/{id}/ban", authServerPerm(models.PermBanMembers, h.Member.Ban))
+
+	// Bans
+	mux.Handle("GET /api/servers/{serverId}/bans", authServerPerm(models.PermBanMembers, h.Member.GetBans))
+	mux.Handle("DELETE /api/servers/{serverId}/bans/{id}", authServerPerm(models.PermBanMembers, h.Member.Unban))
+
+	// Roles
+	mux.Handle("GET /api/servers/{serverId}/roles", authServer(h.Role.List))
+	mux.Handle("POST /api/servers/{serverId}/roles", authServerPerm(models.PermManageRoles, h.Role.Create))
+	mux.Handle("PATCH /api/servers/{serverId}/roles/reorder", authServerPerm(models.PermManageRoles, h.Role.Reorder))
+	mux.Handle("PATCH /api/servers/{serverId}/roles/{id}", authServerPerm(models.PermManageRoles, h.Role.Update))
+	mux.Handle("DELETE /api/servers/{serverId}/roles/{id}", authServerPerm(models.PermManageRoles, h.Role.Delete))
+
+	// Channel Permissions
+	mux.Handle("GET /api/servers/{serverId}/channels/{id}/permissions", authServer(h.ChannelPermission.ListOverrides))
+	mux.Handle("PUT /api/servers/{serverId}/channels/{channelId}/permissions/{roleId}", authServerPerm(models.PermManageChannels, h.ChannelPermission.SetOverride))
+	mux.Handle("DELETE /api/servers/{serverId}/channels/{channelId}/permissions/{roleId}", authServerPerm(models.PermManageChannels, h.ChannelPermission.DeleteOverride))
+
+	// Invites
+	mux.Handle("GET /api/servers/{serverId}/invites", authServerPerm(models.PermManageInvites, h.Invite.List))
+	mux.Handle("POST /api/servers/{serverId}/invites", authServerPerm(models.PermManageInvites, h.Invite.Create))
+	mux.Handle("DELETE /api/servers/{serverId}/invites/{code}", authServerPerm(models.PermManageInvites, h.Invite.Delete))
+
+	// Join Requests (approval-required servers) — PermApproveMembers gates view + act
+	mux.Handle("GET /api/servers/{serverId}/requests", authServerPerm(models.PermApproveMembers, h.Server.ListJoinRequests))
+	mux.Handle("GET /api/servers/{serverId}/requests/count", authServerPerm(models.PermApproveMembers, h.Server.CountJoinRequests))
+	mux.Handle("POST /api/servers/{serverId}/requests/{userId}/approve", authServerPerm(models.PermApproveMembers, h.Server.ApproveJoinRequest))
+	mux.Handle("DELETE /api/servers/{serverId}/requests/{userId}", authServerPerm(models.PermApproveMembers, h.Server.RejectJoinRequest))
+
+	// E2EE Group Sessions
+	mux.Handle("POST /api/servers/{serverId}/channels/{channelId}/group-sessions", authServer(h.E2EE.CreateGroupSession))
+	mux.Handle("GET /api/servers/{serverId}/channels/{channelId}/group-sessions", authServer(h.E2EE.GetGroupSessions))
+
+	// Search
+	mux.Handle("GET /api/servers/{serverId}/search", authServer(h.Search.Search))
+
+	// Voice
+	mux.Handle("POST /api/servers/{serverId}/voice/token", authServer(h.Voice.Token))
+	mux.Handle("POST /api/servers/{serverId}/voice/screen-token", authServer(h.Voice.ScreenShareToken))
+	mux.Handle("POST /api/servers/{serverId}/voice/screen-share-fallback", authServer(h.Voice.ScreenShareFallback))
+	mux.Handle("POST /api/servers/{serverId}/voice/screen-share-stopped", authServer(h.Voice.ScreenShareStop))
+	mux.Handle("POST /api/servers/{serverId}/voice/noise-reduction-failure", authServer(h.Voice.NoiseReductionFailure))
+	mux.Handle("GET /api/servers/{serverId}/voice/states", authServer(h.Voice.VoiceStates))
+
+	// Voice channel ephemeral chat — membership check (must be in voice) lives in the service
+	mux.Handle("GET /api/voice-channels/{channelId}/messages", auth(h.VoiceMessage.List))
+	mux.Handle("POST /api/voice-channels/{channelId}/messages", auth(h.VoiceMessage.Create))
+	mux.Handle("PATCH /api/voice-channels/{channelId}/messages/{messageId}", auth(h.VoiceMessage.Update))
+	mux.Handle("DELETE /api/voice-channels/{channelId}/messages/{messageId}", auth(h.VoiceMessage.Delete))
+
+	// Soundboard
+	mux.Handle("GET /api/servers/{serverId}/soundboard/sounds", authServer(h.Soundboard.List))
+	mux.Handle("POST /api/servers/{serverId}/soundboard/sounds", authServerPerm(models.PermManageSoundboard, h.Soundboard.Create))
+	mux.Handle("PATCH /api/servers/{serverId}/soundboard/sounds/{soundId}", authServerPerm(models.PermManageSoundboard, h.Soundboard.Update))
+	mux.Handle("DELETE /api/servers/{serverId}/soundboard/sounds/{soundId}", authServerPerm(models.PermManageSoundboard, h.Soundboard.Delete))
+	// Sounds from every server the user is in — the panel stacks them all.
+	mux.Handle("GET /api/soundboard/sounds", auth(h.Soundboard.ListAll))
+	// authServer, not authServerPerm: membership of the sound's server is what this route can
+	// check. PermUseSoundboard belongs to the voice channel the sound will be PLAYED into —
+	// which routinely belongs to a different server — so the service resolves it there.
+	mux.Handle("POST /api/servers/{serverId}/soundboard/sounds/{soundId}/play", authServer(h.Soundboard.Play))
+
+	// WebSocket
+	mux.HandleFunc("GET /ws", h.WS.HandleConnection)
+}

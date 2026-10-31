@@ -1,0 +1,255 @@
+/**
+ * DM-domain WS event handlers.
+ * Handles: DM channel, DM message CRUD, DM typing, DM reactions, DM pins, DM settings.
+ */
+
+import { useDMStore } from "../../stores/dmStore";
+import { useBlockStore } from "../../stores/blockStore";
+import { useAuthStore } from "../../stores/authStore";
+import { isAppInForeground } from "../../stores/appFocusStore";
+import { useE2EEStore } from "../../stores/e2eeStore";
+import { decryptDMMessage, popEditPlaintext, isCacheable } from "../../crypto/dmEncryption";
+import { sentPayload } from "../../stores/outboxStore";
+import { reportDMDelivered } from "../../stores/shared/dmDeliveryReports";
+import * as keyStorage from "../../crypto/keyStorage";
+import { playNotificationSound } from "../../utils/sounds";
+import type { WSMessage, DMChannelWithUser, DMMessage, ReactionGroup, DMDeliveryMark } from "../../types";
+
+export async function handleDMEvent(msg: WSMessage): Promise<boolean> {
+  switch (msg.op) {
+    case "dm_channel_create":
+      useDMStore.getState().handleDMChannelCreate(msg.d as DMChannelWithUser);
+      return true;
+    case "dm_channel_update": {
+      const dmChannel = msg.d as DMChannelWithUser;
+      useDMStore.getState().handleDMChannelUpdate(dmChannel);
+      // Trigger recovery password prompt if E2EE was just enabled
+      if (dmChannel.e2ee_enabled) {
+        useE2EEStore.getState().checkAndPromptRecovery();
+      }
+      return true;
+    }
+
+    case "dm_message_create": {
+      let dmMsg = msg.d as DMMessage;
+      const dmCurrentUserId = useAuthStore.getState().user?.id;
+
+      if (dmMsg.encryption_version === 1 && dmMsg.ciphertext && dmMsg.sender_device_id) {
+        const isOwnMessage = dmMsg.user_id === dmCurrentUserId;
+        let decrypted = false;
+
+        if (isOwnMessage) {
+          try {
+            const cached = sentPayload(dmMsg.client_nonce);
+            if (cached) {
+              dmMsg = { ...dmMsg, content: cached.content, e2ee_file_keys: cached.file_keys };
+              decrypted = true;
+              keyStorage.cacheDecryptedMessage({
+                messageId: dmMsg.id, channelId: "", dmChannelId: dmMsg.dm_channel_id,
+                content: cached.content, timestamp: new Date(dmMsg.created_at).getTime(),
+                fileKeys: cached.file_keys,
+              }).catch(() => {});
+            } else {
+              const idbCached = await keyStorage.getCachedDecryptedMessage(dmMsg.id);
+              if (idbCached) {
+                dmMsg = { ...dmMsg, content: idbCached.content, e2ee_file_keys: idbCached.fileKeys };
+                decrypted = true;
+              }
+            }
+          } catch (cacheErr) {
+            console.error("[ws] DM own message cache lookup failed:", cacheErr);
+          }
+        }
+
+        // The cache lookups above need no keys, so they run either way. A real decrypt does —
+        // and before init completes it cannot succeed, it just burns a decryption-error entry.
+        // The ready transition refetches the conversation. Mirrors channelEventHandlers.
+        if (!decrypted && useE2EEStore.getState().initStatus !== "ready") {
+          dmMsg = { ...dmMsg, content: null };
+        } else if (!decrypted) {
+          try {
+            const payload = await decryptDMMessage(dmMsg.user_id, dmMsg.ciphertext!, dmMsg.sender_device_id!);
+            if (payload) {
+              dmMsg = { ...dmMsg, content: payload.content, e2ee_file_keys: payload.file_keys };
+              if (isCacheable(payload)) {
+                keyStorage.cacheDecryptedMessage({
+                  messageId: dmMsg.id, channelId: "", dmChannelId: dmMsg.dm_channel_id,
+                  content: payload.content, timestamp: new Date(dmMsg.created_at).getTime(),
+                  fileKeys: payload.file_keys,
+                }).catch(() => {});
+              }
+            } else {
+              dmMsg = { ...dmMsg, content: null };
+            }
+          } catch (err) {
+            console.error("[ws] DM decrypt failed:", err);
+            dmMsg = { ...dmMsg, content: null };
+            useE2EEStore.getState().addDecryptionError({
+              messageId: dmMsg.id, channelId: dmMsg.dm_channel_id,
+              error: err instanceof Error ? err.message : "Decryption failed", timestamp: Date.now(),
+            });
+          }
+        }
+      }
+
+      useDMStore.getState().handleDMMessageCreate(dmMsg);
+
+      if (dmMsg.user_id === dmCurrentUserId) return true;
+
+      // It reached this app: the sender's double tick. Whether the conversation is open or not.
+      reportDMDelivered(dmMsg.dm_channel_id, dmMsg.id);
+
+      const dmState = useDMStore.getState();
+      // The same test DMChat uses to decide the message is READ. Selection alone is not enough:
+      // a selected DM in a backgrounded window used to get no badge, no sound and no flash while
+      // the server still counted it unread and pushed to the phone — the one conversation the
+      // desktop stayed silent about was the one it had open.
+      const isLookingAtIt =
+        dmMsg.dm_channel_id === dmState.selectedDMId && isAppInForeground();
+
+      if (!isLookingAtIt) {
+        // The badge still counts a muted conversation — muting silences the interruption, not the
+        // fact that something arrived. The count also has to stay, because the server keeps its
+        // own and the next channel-list snapshot would paint it straight back.
+        dmState.incrementDMUnread(dmMsg.dm_channel_id);
+
+        const isMuted =
+          dmState.channels.find((ch) => ch.id === dmMsg.dm_channel_id)?.is_muted ?? false;
+        if (!isMuted) {
+          playNotificationSound();
+          window.electronAPI?.flashFrame();
+        }
+      }
+      // No mark-read here: DMChat's effect fires on the message we just stored and advances the
+      // watermark, but only against what actually decrypted. Marking it read here would claim a
+      // message that failed to decrypt — the user sees a placeholder, and retracting its push
+      // takes it away from the device that might still have shown it.
+      return true;
+    }
+
+    case "dm_message_update": {
+      let dmUpdateMsg = msg.d as DMMessage;
+      const dmEditCurrentUserId = useAuthStore.getState().user?.id;
+
+      if (dmUpdateMsg.encryption_version === 1 && dmUpdateMsg.ciphertext && dmUpdateMsg.sender_device_id) {
+        const isOwnEdit = dmUpdateMsg.user_id === dmEditCurrentUserId;
+        let editDecrypted = false;
+
+        if (isOwnEdit) {
+          try {
+            const cached = popEditPlaintext(dmUpdateMsg.id);
+            if (cached) {
+              dmUpdateMsg = { ...dmUpdateMsg, content: cached.content, e2ee_file_keys: cached.file_keys };
+              editDecrypted = true;
+            } else {
+              const idbCached = await keyStorage.getCachedDecryptedMessage(dmUpdateMsg.id);
+              if (idbCached) {
+                dmUpdateMsg = { ...dmUpdateMsg, content: idbCached.content, e2ee_file_keys: idbCached.fileKeys };
+                editDecrypted = true;
+              }
+            }
+          } catch (cacheErr) {
+            console.error("[ws] DM own edit cache lookup failed:", cacheErr);
+          }
+        }
+
+        if (!editDecrypted && useE2EEStore.getState().initStatus !== "ready") {
+          dmUpdateMsg = { ...dmUpdateMsg, content: null };
+        } else if (!editDecrypted) {
+          try {
+            const payload = await decryptDMMessage(
+              dmUpdateMsg.user_id, dmUpdateMsg.ciphertext!, dmUpdateMsg.sender_device_id!
+            );
+            dmUpdateMsg = { ...dmUpdateMsg, content: payload?.content ?? null, e2ee_file_keys: payload?.file_keys };
+
+            if (payload && isCacheable(payload)) {
+              // An edit's payload carries no file keys of its own; overwriting the entry without
+              // the ones this device holds would lose the attachments on the next load.
+              const held = useDMStore.getState().messagesByChannel[dmUpdateMsg.dm_channel_id]
+                ?.find((m) => m.id === dmUpdateMsg.id);
+              keyStorage.cacheDecryptedMessage({
+                messageId: dmUpdateMsg.id, channelId: "", dmChannelId: dmUpdateMsg.dm_channel_id,
+                content: payload.content, timestamp: new Date(dmUpdateMsg.created_at).getTime(),
+                fileKeys: payload.file_keys ?? held?.e2ee_file_keys,
+              }).catch(() => {});
+            }
+          } catch (err) {
+            console.error("[ws] DM edit decrypt failed:", err);
+            dmUpdateMsg = { ...dmUpdateMsg, content: null };
+          }
+        }
+      }
+
+      useDMStore.getState().handleDMMessageUpdate(dmUpdateMsg);
+      return true;
+    }
+
+    case "dm_message_delete": {
+      const dmDelData = msg.d as { id: string; dm_channel_id: string };
+      const dmState = useDMStore.getState();
+      const dmUnread = dmState.dmUnreadCounts[dmDelData.dm_channel_id] ?? 0;
+      if (dmUnread > 0) {
+        const dmMessages = dmState.messagesByChannel[dmDelData.dm_channel_id];
+        const deletedDMMsg = dmMessages?.find((m) => m.id === dmDelData.id);
+        const myId = useAuthStore.getState().user?.id;
+        // Only when we actually held it. On an unloaded conversation `undefined?.user_id` is
+        // not our id either, so the old check decremented the badge when we deleted our OWN
+        // message. Not holding it means we cannot tell whose it was, or whether it was even
+        // counted — leave the badge alone and let the next server snapshot settle it.
+        if (deletedDMMsg && deletedDMMsg.user_id !== myId) {
+          dmState.decrementDMUnread(dmDelData.dm_channel_id);
+        }
+      }
+      dmState.handleDMMessageDelete(dmDelData);
+      return true;
+    }
+
+    case "dm_reaction_update": {
+      const data = msg.d as { dm_message_id: string; dm_channel_id: string; reactions: ReactionGroup[] };
+      useDMStore.getState().handleDMReactionUpdate(data);
+      return true;
+    }
+
+    case "dm_typing_start": {
+      const data = msg.d as { user_id: string; username: string; dm_channel_id: string };
+      if (useBlockStore.getState().isBlocked(data.user_id)) return true;
+      useDMStore.getState().handleDMTypingStart(data.dm_channel_id, data.username);
+      return true;
+    }
+
+    case "dm_message_pin":
+      useDMStore.getState().handleDMMessagePin(msg.d as { dm_channel_id: string; message: DMMessage });
+      return true;
+    case "dm_message_unpin":
+      useDMStore.getState().handleDMMessageUnpin(msg.d as { dm_channel_id: string; message_id: string });
+      return true;
+
+    case "dm_settings_update":
+      useDMStore.getState().handleDMSettingsUpdate(msg.d as { dm_channel_id: string; action: string });
+      return true;
+
+    // Read on another of our own devices — clear the badge and pull back the notification.
+    case "dm_delivered":
+      useDMStore.getState().handleDMDelivered(msg.d as DMDeliveryMark);
+      return true;
+
+    case "dm_read":
+      useDMStore.getState().handleDMRead(msg.d as { dm_channel_id: string; unread_count: number });
+      return true;
+
+    case "dm_channel_status_change": {
+      const statusData = msg.d as { dm_channel_id: string; status: "accepted" | "pending"; initiated_by: string | null };
+      useDMStore.getState().handleDMChannelStatusChange(statusData);
+      return true;
+    }
+    case "dm_request_accept":
+      useDMStore.getState().handleDMRequestAccept(msg.d as { dm_channel_id: string });
+      return true;
+    case "dm_request_decline":
+      useDMStore.getState().handleDMRequestDecline(msg.d as { dm_channel_id: string });
+      return true;
+
+    default:
+      return false;
+  }
+}

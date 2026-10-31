@@ -1,0 +1,122 @@
+[package]
+name = "mqvi-game-capture"
+version = "0.1.0"
+edition = "2021"
+description = "Native WGC+NVENC game capture, published to LiveKit with E2EE (NGC spike)."
+publish = false
+
+[lib]
+name = "mqvi_game_capture"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mqvi-game-capture"
+path = "src/main.rs"
+
+# macOS share audio. A separate binary on purpose: see the file's header.
+[[bin]]
+name = "mqvi-audio-capture"
+path = "src/bin/mqvi_audio_capture.rs"
+
+[[bin]]
+name = "test-encode"
+path = "src/bin/test_encode.rs"
+
+# No [profile.release] tuning: the 31 MB is statically-linked libwebrtc, not symbols. Measured —
+# strip changed nothing (release carries no debug info) and thin LTO made it 0.5 MB *bigger* while
+# turning a 12 s incremental build into 1m44s.
+
+[dependencies]
+# native (default) feature pulls libwebrtc → gives us the FrameCryptor E2EE that is
+# format-compatible with our JS clients' ExternalE2EEKeyProvider. rustls avoids an
+# OpenSSL dependency on Windows MSVC.
+livekit = { version = "0.7", features = ["rustls-tls-native-roots"] }
+# Never used directly: pins the version the vendored, patched copy below is. A livekit that wants
+# another webrtc-sys then fails to resolve, instead of building against the unpatched crate with
+# only a "patch was not used" warning.
+webrtc-sys = "=0.3.38"
+tokio = { version = "1", features = ["full", "parking_lot"] }
+clap = { version = "4", features = ["derive", "env"] }
+# Already in the tree via livekit — no extra download. Used only to read the connection secrets
+# handed to us on stdin.
+serde_json = "1"
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"
+
+# Windows Media Foundation (hardware encode) + Windows.Graphics.Capture (WGC screen capture).
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Foundation",
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    # MMCSS (avrt.dll): the capture/encode pump registers as a multimedia thread so a game that
+    # saturates the CPU cannot starve it out of the scheduler.
+    "Win32_System_Threading",
+    # WGC + D3D11 interop for zero-copy screen/game capture (NGC-03)
+    "Graphics_Capture",
+    # GraphicsCaptureAccess::RequestAccessAsync returns an AppCapabilityAccessStatus — without this
+    # feature windows-rs omits the method entirely (borderless capture needs it).
+    "Security_Authorization_AppCapabilityAccess",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    # d3dcompiler: the HDR tone-map compute shader is compiled at start-up.
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    # QueryDisplayConfig / DisplayConfigGetDeviceInfo: the SDR white level of an HDR display.
+    "Win32_Devices_Display",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+# macOS: ScreenCaptureKit. Safe bindings over a Swift bridge it builds with SwiftPM, so the build
+# needs the Xcode toolchain. Pinned exactly: the crate moves fast (v9 to v11 in a month), and a
+# capture API that shifts under a minor bump is not one to float. macos_14_0 for
+# SCShareableContentInfo, the only source of a filter's real pixel size.
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "=11.0.0", features = ["macos_14_0"] }
+# Already in the tree under screencapturekit, at this version. Used directly for one call:
+# `cg::Display::main()`, a safe CGMainDisplayID — see mac_capture::Source::find.
+apple-cf = { version = "=0.11.3", features = ["cg"] }
+
+[[bin]]
+name = "probe-encoders"
+path = "src/bin/probe_encoders.rs"
+
+[[bin]]
+name = "probe-capture"
+path = "src/bin/probe_capture.rs"
+
+# Drives the capture layer without a room: the only way to exercise resize/close locally.
+[[bin]]
+name = "probe-lifecycle"
+path = "src/bin/probe_lifecycle.rs"
+
+[[bin]]
+name = "test-capture-encode"
+path = "src/bin/test_capture_encode.rs"
+
+# macOS: the ScreenCaptureKit capture with no room — permission, real frame size, frame rate.
+[[bin]]
+name = "probe-sck"
+path = "src/bin/probe_sck.rs"
+
+# One frame through the shipping capture path to a BMP: checks the HDR tone-map on a real display.
+[[bin]]
+name = "snapshot-capture"
+path = "src/bin/snapshot_capture.rs"
+
+# webrtc-sys with our pass-through encoder fixes: a frame of our hardware encoder's that libwebrtc
+# drops or fails to send is noticed, and deltas wait for a keyframe instead of decoding against a
+# missing reference. What changed and why: vendor/webrtc-sys/MQVI-PATCHES.md. Drop the vendored
+# copy, and the pin above, once livekit/rust-sdks ships an equivalent.
+[patch.crates-io]
+webrtc-sys = { path = "vendor/webrtc-sys" }

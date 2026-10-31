@@ -1,0 +1,557 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { renderHook, act } from "@testing-library/react";
+
+const { ensureFreshToken, getMe } = vi.hoisted(() => ({ ensureFreshToken: vi.fn(), getMe: vi.fn() }));
+
+vi.mock("../api/client", () => ({ ensureFreshToken }));
+vi.mock("../api/auth", () => ({ getMe }));
+vi.mock("../utils/nativePlugins", () => ({ APP_RESUME_EVENT: "mqvi:app-resume" }));
+const { sendWSRef, previousPageCall } = vi.hoisted(() => ({
+  sendWSRef: { current: null as null | ((op: string, data?: unknown) => void) },
+  previousPageCall: { checked: Promise.resolve() as Promise<void> },
+}));
+vi.mock("../stores/p2pCallStore", () => ({
+  useP2PCallStore: {
+    getState: () => ({
+      registerSendWS: (fn: (op: string, data?: unknown) => void) => {
+        sendWSRef.current = fn;
+      },
+      _previousPageCallChecked: previousPageCall.checked,
+      _adoptCandidate: null,
+    }),
+  },
+}));
+vi.mock("../stores/voiceStore", () => ({
+  useVoiceStore: { getState: () => ({ isMuted: false, isDeafened: false }) },
+}));
+vi.mock("../utils/constants", () => ({
+  WS_URL: "ws://test/ws",
+  WS_HEARTBEAT_INTERVAL: 30_000,
+  WS_HEARTBEAT_PROBE_INTERVAL: 10_000,
+  WS_HEARTBEAT_MAX_MISS: 3,
+  WS_MAX_RECONNECT_ATTEMPTS: 7,
+  getCapacitorPlatform: () => "web",
+}));
+vi.mock("./ws/channelEventHandlers", () => ({ handleChannelEvent: async () => false }));
+vi.mock("./ws/dmEventHandlers", () => ({ handleDMEvent: async () => false }));
+vi.mock("./ws/voiceEventHandlers", () => ({ handleVoiceEvent: async () => false }));
+vi.mock("./ws/systemEventHandlers", () => ({
+  handleSystemEvent: async (
+    msg: { op: string },
+    _ctx: unknown,
+    setStatus: (s: string) => void
+  ) => {
+    if (msg.op === "ready") {
+      setStatus("connected");
+      return true;
+    }
+    return false;
+  },
+}));
+
+import { useWebSocket } from "./useWebSocket";
+
+const CONNECTING = 0;
+const OPEN = 1;
+const CLOSING = 2;
+const CLOSED = 3;
+
+/**
+ * Fake WebSocket. close() dispatches onclose on a microtask, matching the browser —
+ * the stale-socket guard exists precisely because that event lands after the hook has
+ * already installed a replacement socket.
+ */
+class FakeSocket {
+  static instances: FakeSocket[] = [];
+  static readonly CONNECTING = CONNECTING;
+  static readonly OPEN = OPEN;
+  static readonly CLOSING = CLOSING;
+  static readonly CLOSED = CLOSED;
+
+  readyState = CONNECTING;
+  sent: string[] = [];
+  url: string;
+  onopen: (() => void) | null = null;
+  onmessage: ((e: { data: string }) => void) | null = null;
+  onclose: ((e: { code: number; reason: string }) => void) | null = null;
+  onerror: (() => void) | null = null;
+
+  constructor(url: string) {
+    this.url = url;
+    FakeSocket.instances.push(this);
+  }
+
+  send(data: string) {
+    this.sent.push(data);
+  }
+
+  close() {
+    if (this.readyState === CLOSED || this.readyState === CLOSING) return;
+    this.readyState = CLOSING;
+    queueMicrotask(() => {
+      this.readyState = CLOSED;
+      this.onclose?.({ code: 1006, reason: "" });
+    });
+  }
+
+  /** Test helper — completes the handshake. */
+  accept() {
+    this.readyState = OPEN;
+    this.onopen?.();
+  }
+
+  /** Test helper — the peer drops the connection. */
+  drop(code = 1006) {
+    this.readyState = CLOSED;
+    this.onclose?.({ code, reason: "" });
+  }
+
+  /** Test helper — pushes a server frame. */
+  deliver(msg: unknown) {
+    this.onmessage?.({ data: JSON.stringify(msg) });
+  }
+
+  get heartbeats() {
+    return this.sent.filter((s) => JSON.parse(s).op === "heartbeat").length;
+  }
+}
+
+const originalWebSocket = globalThis.WebSocket;
+
+function sockets() {
+  return FakeSocket.instances;
+}
+
+function latest() {
+  return FakeSocket.instances[FakeSocket.instances.length - 1];
+}
+
+async function advance(ms: number) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+}
+
+function resumeApp() {
+  act(() => {
+    window.dispatchEvent(new CustomEvent("mqvi:app-resume"));
+  });
+}
+
+function goOnline() {
+  act(() => {
+    window.dispatchEvent(new Event("online"));
+  });
+}
+
+/** Mounts the hook and completes the initial handshake up to `ready`. */
+async function connect() {
+  const view = renderHook(() => useWebSocket());
+  await advance(0);
+  await act(async () => {
+    latest().accept();
+    latest().deliver({ op: "ready", d: {} });
+  });
+  return view;
+}
+
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  FakeSocket.instances = [];
+  ensureFreshToken.mockReset().mockResolvedValue("token");
+  getMe.mockReset().mockResolvedValue({ success: true });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test double for the global
+  globalThis.WebSocket = FakeSocket as any;
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  globalThis.WebSocket = originalWebSocket;
+});
+
+describe("useWebSocket connection status", () => {
+  it("should report connecting when the socket drops and a retry is pending", async () => {
+    const { result } = await connect();
+    expect(result.current.connectionStatus).toBe("connected");
+
+    await act(async () => {
+      latest().drop();
+    });
+
+    expect(result.current.connectionStatus).toBe("connecting");
+  });
+
+  it("should report disconnected only once the attempt budget is exhausted", async () => {
+    ensureFreshToken.mockResolvedValue(null);
+    const { result } = renderHook(() => useWebSocket());
+
+    await advance(0);
+    expect(result.current.connectionStatus).toBe("connecting");
+
+    // 7 attempts, capped at 20s each with +-25% jitter.
+    await advance(150_000);
+
+    expect(result.current.connectionStatus).toBe("disconnected");
+    expect(sockets()).toHaveLength(0);
+  });
+
+  it("should keep retrying after the failure banner appears, without flipping back to connecting", async () => {
+    ensureFreshToken.mockResolvedValue(null);
+    const { result } = renderHook(() => useWebSocket());
+    await advance(150_000);
+    expect(result.current.connectionStatus).toBe("disconnected");
+
+    // Network is back: the next capped retry must reconnect on its own.
+    ensureFreshToken.mockResolvedValue("token");
+    await advance(26_000);
+
+    expect(sockets().length).toBeGreaterThan(0);
+    // A silent retry must not repaint the banner yellow.
+    expect(result.current.connectionStatus).toBe("disconnected");
+
+    await act(async () => {
+      latest().accept();
+      latest().deliver({ op: "ready", d: {} });
+    });
+    expect(result.current.connectionStatus).toBe("connected");
+  });
+
+  it("should clear the exhausted latch so a later blip reports connecting again", async () => {
+    ensureFreshToken.mockResolvedValue(null);
+    const { result } = renderHook(() => useWebSocket());
+    await advance(150_000);
+
+    ensureFreshToken.mockResolvedValue("token");
+    await advance(26_000);
+    await act(async () => {
+      latest().accept();
+      latest().deliver({ op: "ready", d: {} });
+    });
+
+    await act(async () => {
+      latest().drop();
+    });
+    expect(result.current.connectionStatus).toBe("connecting");
+  });
+});
+
+// A device signed out elsewhere still holds an unexpired access token; the server refuses its
+// handshake, which the browser reports as a bare close. Only an API call can surface the 401.
+describe("useWebSocket refused handshake", () => {
+  it("should ask the API about the session when a socket closes without ever opening", async () => {
+    renderHook(() => useWebSocket());
+    await advance(0);
+
+    act(() => latest().drop());
+
+    expect(getMe).toHaveBeenCalledTimes(1);
+  });
+
+  it("should not query the API when an established socket drops", async () => {
+    renderHook(() => useWebSocket());
+    await advance(0);
+    act(() => latest().accept());
+
+    act(() => latest().drop());
+
+    expect(getMe).not.toHaveBeenCalled();
+  });
+});
+
+describe("useWebSocket stale socket handling", () => {
+  it("should ignore onclose from a socket that has already been replaced", async () => {
+    const { result } = await connect();
+    const stale = latest();
+
+    // Mobile resume path: the socket is already gone, so the hook builds a new one.
+    stale.readyState = CLOSED;
+    resumeApp();
+    await advance(0);
+
+    expect(sockets()).toHaveLength(2);
+    const live = latest();
+
+    // The dead socket's queued close event lands late. It must not tear down the
+    // replacement or schedule a competing reconnect.
+    await act(async () => {
+      stale.onclose?.({ code: 1006, reason: "" });
+    });
+    await advance(30_000);
+
+    expect(sockets()).toHaveLength(2);
+    expect(latest()).toBe(live);
+    expect(result.current.connectionStatus).toBe("connecting");
+  });
+});
+
+describe("useWebSocket network-online recovery", () => {
+  it("should reconnect immediately when the interface returns mid-backoff", async () => {
+    const { result } = await connect();
+
+    await act(async () => {
+      latest().drop();
+    });
+    // Sitting inside the first backoff window — the scheduled retry is ~1.5s away.
+    await advance(200);
+    expect(sockets()).toHaveLength(1);
+
+    goOnline();
+    await advance(0);
+
+    expect(sockets()).toHaveLength(2);
+    expect(result.current.reconnectAttempt).toBe(0);
+
+    // The armed retry must have been cancelled, not left to fire alongside this connect. If it
+    // still ran, a third socket would appear once its delay elapsed.
+    await advance(10_000);
+    expect(sockets()).toHaveLength(2);
+  });
+
+  it("should escape the exhausted state instead of waiting out the capped retry", async () => {
+    ensureFreshToken.mockResolvedValue(null);
+    const { result } = renderHook(() => useWebSocket());
+    await advance(150_000);
+    expect(result.current.connectionStatus).toBe("disconnected");
+
+    ensureFreshToken.mockResolvedValue("token");
+    goOnline();
+    await advance(0);
+
+    expect(sockets()).toHaveLength(1);
+    await act(async () => {
+      latest().accept();
+      latest().deliver({ op: "ready", d: {} });
+    });
+    expect(result.current.connectionStatus).toBe("connected");
+  });
+
+  it("should ignore a repeat online event inside the rate floor", async () => {
+    await connect();
+    await act(async () => {
+      latest().drop();
+    });
+
+    goOnline();
+    await advance(0);
+    expect(sockets()).toHaveLength(2);
+
+    // A flapping interface fires again straight away. Honouring it would cancel the backoff a
+    // second time and turn the event into a reconnect loop with no backoff at all.
+    await act(async () => {
+      latest().drop();
+    });
+    goOnline();
+    await advance(0);
+    expect(sockets()).toHaveLength(2);
+  });
+
+  it("should probe rather than replace a socket that is still open", async () => {
+    await connect();
+    const socket = latest();
+
+    goOnline();
+
+    // Probe cadence is 10s; the steady-state interval is 30s. One beat here proves the probe
+    // started, and the socket count proves nothing was torn down.
+    await advance(10_000);
+    expect(sockets()).toHaveLength(1);
+    expect(socket.heartbeats).toBe(1);
+    expect(socket.readyState).toBe(OPEN);
+  });
+});
+
+describe("useWebSocket resume probe", () => {
+  it("should close a socket that reads OPEN but never acks the probe", async () => {
+    await connect();
+    const socket = latest();
+
+    resumeApp();
+
+    await advance(25_000);
+    expect(socket.heartbeats).toBe(2);
+    expect(socket.readyState).toBe(OPEN);
+
+    await advance(5_000);
+    expect(socket.heartbeats).toBe(3);
+    expect(socket.readyState).not.toBe(OPEN);
+  });
+
+  it("should restore the steady-state interval once the probe is acked", async () => {
+    await connect();
+    const socket = latest();
+
+    resumeApp();
+
+    await advance(10_000);
+    expect(socket.heartbeats).toBe(1);
+
+    await act(async () => {
+      socket.deliver({ op: "heartbeat_ack" });
+    });
+
+    // Probe cancelled: the next beat is a full interval away, not 10s.
+    await advance(10_000);
+    expect(socket.heartbeats).toBe(1);
+
+    await advance(20_000);
+    expect(socket.heartbeats).toBe(2);
+    expect(socket.readyState).toBe(OPEN);
+  });
+
+  it("should not let an ack with no outstanding beat cancel the probe", async () => {
+    await connect();
+    const socket = latest();
+
+    resumeApp();
+
+    // An ack the OS buffered before the app froze: it answers no beat we just sent,
+    // so it proves nothing about the socket and must leave the probe running.
+    await act(async () => {
+      socket.deliver({ op: "heartbeat_ack" });
+    });
+
+    await advance(30_000);
+    expect(socket.heartbeats).toBe(3);
+    expect(socket.readyState).not.toBe(OPEN);
+  });
+});
+
+/**
+ * A call declined from the native call UI is usually declined with no socket at all: the app was
+ * launched into the background by the VoIP push. Dropping that message leaves the caller ringing
+ * until the server's ring timeout.
+ */
+describe("useWebSocket call teardown queue", () => {
+  it("should deliver a decline that was sent before the socket opened", async () => {
+    renderHook(() => useWebSocket());
+    await advance(0);
+
+    act(() => {
+      sendWSRef.current?.("p2p_call_decline", { call_id: "c1" });
+    });
+    expect(latest().sent).toHaveLength(0);
+
+    await act(async () => {
+      latest().accept();
+    });
+
+    expect(latest().sent.map((s) => JSON.parse(s))).toContainEqual({
+      op: "p2p_call_decline",
+      d: { call_id: "c1" },
+    });
+  });
+
+  it("should not replay a teardown older than the server keeps an away call", async () => {
+    renderHook(() => useWebSocket());
+    await advance(0);
+
+    act(() => {
+      sendWSRef.current?.("p2p_call_end", { call_id: "c1" });
+    });
+    await advance(4 * 60 * 60 * 1000 + 1_000);
+
+    await act(async () => {
+      latest().accept();
+    });
+
+    expect(latest().sent.some((s) => JSON.parse(s).op === "p2p_call_end")).toBe(false);
+  });
+
+  // Back from suspension the socket can read OPEN and be dead: the hang-up written into it is
+  // lost, and the store has nothing left to resume. It goes again on the next connection.
+  it("should replay a teardown sent on a socket that turned out dead", async () => {
+    await connect();
+    act(() => {
+      sendWSRef.current?.("p2p_call_end", { call_id: "c1" });
+    });
+    const dead = latest();
+    expect(dead.sent.map((x) => JSON.parse(x).op)).toContain("p2p_call_end");
+
+    await act(async () => {
+      dead.drop();
+    });
+    await advance(60_000);
+    await act(async () => {
+      latest().accept();
+    });
+
+    expect(latest()).not.toBe(dead);
+    expect(latest().sent.map((x) => JSON.parse(x))).toContainEqual({ op: "p2p_call_end", d: { call_id: "c1" } });
+  });
+
+  it("should stop replaying once the server reports the call over", async () => {
+    await connect();
+    act(() => {
+      sendWSRef.current?.("p2p_call_end", { call_id: "c1" });
+    });
+    await act(async () => {
+      latest().deliver({ op: "p2p_call_end", d: { call_id: "c1" } });
+      latest().drop();
+    });
+    await advance(60_000);
+    await act(async () => {
+      latest().accept();
+    });
+
+    expect(latest().sent.some((x) => JSON.parse(x).op === "p2p_call_end")).toBe(false);
+  });
+
+  // Replayed later, an end that names no call would hang up whatever call came after.
+  it("should not keep an end that names no call", async () => {
+    renderHook(() => useWebSocket());
+    await advance(0);
+
+    act(() => {
+      sendWSRef.current?.("p2p_call_end");
+    });
+    await act(async () => {
+      latest().accept();
+    });
+
+    expect(latest().sent.some((x) => JSON.parse(x).op === "p2p_call_end")).toBe(false);
+  });
+
+  it("should drop everything else sent with no socket", async () => {
+    renderHook(() => useWebSocket());
+    await advance(0);
+
+    act(() => {
+      sendWSRef.current?.("p2p_call_initiate", { receiver_id: "them" });
+    });
+
+    await act(async () => {
+      latest().accept();
+    });
+
+    expect(latest().sent.some((s) => JSON.parse(s).op === "p2p_call_initiate")).toBe(false);
+  });
+});
+
+// The URL says whether this page holds the call the previous page left running; connecting before
+// that is known would let the server release a call this page is about to take over.
+describe("useWebSocket and a call the previous page left running", () => {
+  afterEach(() => {
+    previousPageCall.checked = Promise.resolve();
+  });
+
+  it("should not connect until the native side has been asked", async () => {
+    let settle: () => void = () => {};
+    previousPageCall.checked = new Promise<void>((resolve) => (settle = resolve));
+    renderHook(() => useWebSocket());
+    await advance(0);
+    expect(sockets()).toHaveLength(0);
+
+    await act(async () => settle());
+    await advance(0);
+    expect(sockets()).toHaveLength(1);
+  });
+
+  it("should connect anyway when the native side never answers", async () => {
+    previousPageCall.checked = new Promise<void>(() => {});
+    renderHook(() => useWebSocket());
+    await advance(2_000);
+    expect(sockets()).toHaveLength(1);
+  });
+});

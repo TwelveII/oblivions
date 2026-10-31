@@ -1,0 +1,590 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"mime/multipart"
+	"net/http"
+	"strconv"
+
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
+	"github.com/akinalp/mqvi/pkg/ctxkeys"
+	"github.com/akinalp/mqvi/pkg/ratelimit"
+	"github.com/akinalp/mqvi/services"
+)
+
+const maxDMUploadFiles = 10
+
+// DMHandler handles DM endpoints.
+// messageLimiter is shared with MessageHandler (user-based total rate).
+type DMHandler struct {
+	dmService       services.DMService
+	dmUploadService services.DMUploadService
+	storageService  services.StorageService
+	maxUploadSize   int64
+	messageLimiter  *ratelimit.MessageRateLimiter
+	readLimiter     *ratelimit.MessageRateLimiter
+	deliveryLimiter *ratelimit.MessageRateLimiter
+	urlSigner       services.FileURLSigner
+}
+
+func NewDMHandler(
+	dmService services.DMService,
+	dmUploadService services.DMUploadService,
+	storageService services.StorageService,
+	maxUploadSize int64,
+	messageLimiter *ratelimit.MessageRateLimiter,
+	readLimiter *ratelimit.MessageRateLimiter,
+	deliveryLimiter *ratelimit.MessageRateLimiter,
+	urlSigner services.FileURLSigner,
+) *DMHandler {
+	return &DMHandler{
+		dmService:       dmService,
+		dmUploadService: dmUploadService,
+		storageService:  storageService,
+		maxUploadSize:   maxUploadSize,
+		messageLimiter:  messageLimiter,
+		readLimiter:     readLimiter,
+		deliveryLimiter: deliveryLimiter,
+		urlSigner:       urlSigner,
+	}
+}
+
+// rateLimited replies 429 with a Retry-After and reports whether it did. Shared by the
+// mark-read endpoints, which are cheap per call and ruinous in a loop.
+func rateLimited(w http.ResponseWriter, limiter *ratelimit.MessageRateLimiter, userID string) bool {
+	if limiter == nil || limiter.Allow(userID) {
+		return false
+	}
+	retryAfter := limiter.CooldownSeconds(userID)
+	w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+	pkg.ErrorWithMessage(w, http.StatusTooManyRequests,
+		fmt.Sprintf("too many requests, please wait %s", ratelimit.FormatRetryMessage(retryAfter)))
+	return true
+}
+
+type createDMChannelRequest struct {
+	UserID string `json:"user_id"`
+}
+
+// ListChannels handles GET /api/dms
+func (h *DMHandler) ListChannels(w http.ResponseWriter, r *http.Request) {
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	channels, err := h.dmService.ListChannels(r.Context(), user.ID)
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, channels)
+}
+
+// CreateOrGetChannel handles POST /api/dms
+// Finds or creates a DM channel between two users.
+func (h *DMHandler) CreateOrGetChannel(w http.ResponseWriter, r *http.Request) {
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	var req createDMChannelRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.UserID == "" {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "user_id is required")
+		return
+	}
+
+	channel, err := h.dmService.GetOrCreateChannel(r.Context(), user.ID, req.UserID)
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, channel)
+}
+
+// AcceptRequest handles POST /api/dms/{channelId}/accept
+func (h *DMHandler) AcceptRequest(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelId")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	if err := h.dmService.AcceptRequest(r.Context(), user.ID, channelID); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// DeclineRequest handles POST /api/dms/{channelId}/decline
+func (h *DMHandler) DeclineRequest(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelId")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	if err := h.dmService.DeclineRequest(r.Context(), user.ID, channelID); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// GetMessages handles GET /api/dms/{channelId}/messages?before=&limit=
+func (h *DMHandler) GetMessages(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelId")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	beforeID := r.URL.Query().Get("before")
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	page, err := h.dmService.GetMessages(r.Context(), user.ID, channelID, beforeID, limit)
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, page)
+}
+
+// SendMessage handles POST /api/dms/{channelId}/messages
+// Accepts JSON or multipart/form-data. Files uploaded after message creation, then WS broadcast.
+func (h *DMHandler) SendMessage(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelId")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	if h.messageLimiter != nil && !h.messageLimiter.Allow(user.ID) {
+		retryAfter := h.messageLimiter.CooldownSeconds(user.ID)
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+		pkg.ErrorWithMessage(w, http.StatusTooManyRequests,
+			fmt.Sprintf("too many messages, please wait %s",
+				ratelimit.FormatRetryMessage(retryAfter)))
+		return
+	}
+
+	contentType := r.Header.Get("Content-Type")
+	var req models.CreateDMMessageRequest
+
+	if isMultipart(contentType) {
+		limitMultipartBody(w, r, h.maxUploadSize, maxDMUploadFiles)
+		if err := r.ParseMultipartForm(h.maxUploadSize); err != nil {
+			pkg.ErrorWithMessage(w, http.StatusBadRequest, "failed to parse multipart form")
+			return
+		}
+		if r.MultipartForm != nil && len(r.MultipartForm.File["files"]) > maxDMUploadFiles {
+			pkg.ErrorWithMessage(w, http.StatusBadRequest, "too many files")
+			return
+		}
+
+		req.Content = r.FormValue("content")
+		req.ClientNonce = r.FormValue("client_nonce")
+		if replyTo := r.FormValue("reply_to_id"); replyTo != "" {
+			req.ReplyToID = &replyTo
+		}
+
+		// E2EE fields from multipart
+		if ev := r.FormValue("encryption_version"); ev == "1" {
+			req.EncryptionVersion = 1
+			if ct := r.FormValue("ciphertext"); ct != "" {
+				req.Ciphertext = &ct
+			}
+			if sd := r.FormValue("sender_device_id"); sd != "" {
+				req.SenderDeviceID = &sd
+			}
+			if em := r.FormValue("e2ee_metadata"); em != "" {
+				req.E2EEMetadata = &em
+			}
+		}
+
+		if r.MultipartForm != nil && len(r.MultipartForm.File["files"]) > 0 {
+			req.HasFiles = true
+		}
+	} else {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+
+	// Reserve storage quota before creating the DM message
+	var reservedBytes int64
+	if isMultipart(contentType) && r.MultipartForm != nil && len(r.MultipartForm.File["files"]) > 0 {
+		for _, fh := range r.MultipartForm.File["files"] {
+			reservedBytes += fh.Size
+		}
+		// Previews are stored bytes too. Leaving them out made them an unmetered store: trivial
+		// files with large "thumbnails" cost the uploader nothing.
+		reservedBytes += thumbnailBytes(r.MultipartForm, len(r.MultipartForm.File["files"]))
+		if err := h.storageService.Reserve(r.Context(), user.ID, reservedBytes); err != nil {
+			pkg.Error(w, err)
+			return
+		}
+	}
+
+	msg, repeat, err := h.dmService.SendMessage(r.Context(), user.ID, channelID, &req)
+	if err != nil {
+		releaseQuota(r.Context(), h.storageService, "dm", user.ID, reservedBytes)
+		pkg.Error(w, err)
+		return
+	}
+	// A retry of a send that went through: same answer as the first time, and nothing else — no
+	// upload, no broadcast, no push; the first request did all of it.
+	if repeat {
+		releaseQuota(r.Context(), h.storageService, "dm", user.ID, reservedBytes)
+		pkg.JSON(w, http.StatusCreated, msg)
+		return
+	}
+
+	if reservedBytes > 0 {
+		isEncrypted := req.EncryptionVersion == 1
+
+		attachments, uploadedBytes, err := uploadEachFile(
+			r.Context(), r.MultipartForm.File["files"], r.MultipartForm,
+			func(ctx context.Context, file multipart.File, header *multipart.FileHeader, thumb *services.ThumbnailUpload) (*models.DMAttachment, error) {
+				attachment, err := h.dmUploadService.Upload(ctx, msg.ID, file, header, isEncrypted, thumb)
+				if err != nil {
+					return nil, err
+				}
+				services.SignDMAttachmentURLs(h.urlSigner, attachment)
+				return attachment, nil
+			},
+			func(a *models.DMAttachment) int64 { return storedSize(a.FileSize, a.ThumbSize) },
+		)
+		msg.Attachments = append(msg.Attachments, attachments...)
+
+		if err != nil {
+			// The message goes too: a partial set would mis-key every attachment after the missing
+			// one. See uploadEachFile.
+			// Not on the request's context — see the same cleanup in MessageHandler.Create.
+			cleanup := context.WithoutCancel(r.Context())
+			if delErr := h.dmService.DeleteMessage(cleanup, user.ID, msg.ID); delErr != nil {
+				log.Printf("[dm] failed to remove message %s after its upload failed: %v", msg.ID, delErr)
+			}
+			releaseQuota(cleanup, h.storageService, "dm", user.ID, reservedBytes-uploadedBytes)
+			respondUploadFailure(w, err)
+			return
+		}
+
+		releaseQuota(r.Context(), h.storageService, "dm", user.ID, reservedBytes-uploadedBytes)
+	}
+
+	// Broadcast after uploads so clients see attachments
+	h.dmService.BroadcastCreate(msg)
+
+	pkg.JSON(w, http.StatusCreated, msg)
+}
+
+// EditMessage handles PATCH /api/dms/messages/{id} (owner only).
+func (h *DMHandler) EditMessage(w http.ResponseWriter, r *http.Request) {
+	messageID := r.PathValue("id")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	var req models.UpdateDMMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	msg, err := h.dmService.EditMessage(r.Context(), user.ID, messageID, &req)
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, msg)
+}
+
+// DeleteMessage handles DELETE /api/dms/messages/{id} (owner only).
+func (h *DMHandler) DeleteMessage(w http.ResponseWriter, r *http.Request) {
+	messageID := r.PathValue("id")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	if err := h.dmService.DeleteMessage(r.Context(), user.ID, messageID); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, map[string]string{"message": "message deleted"})
+}
+
+// ─── Reaction Endpoints ───
+
+// ToggleReaction handles POST /api/dms/messages/{id}/reactions
+func (h *DMHandler) ToggleReaction(w http.ResponseWriter, r *http.Request) {
+	messageID := r.PathValue("id")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	var req models.ToggleDMReactionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := h.dmService.ToggleReaction(r.Context(), user.ID, messageID, req.Emoji); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ─── Pin Endpoints ───
+
+// PinMessage handles POST /api/dms/messages/{id}/pin
+func (h *DMHandler) PinMessage(w http.ResponseWriter, r *http.Request) {
+	messageID := r.PathValue("id")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	if err := h.dmService.PinMessage(r.Context(), user.ID, messageID); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, map[string]string{"status": "pinned"})
+}
+
+// UnpinMessage handles DELETE /api/dms/messages/{id}/pin
+func (h *DMHandler) UnpinMessage(w http.ResponseWriter, r *http.Request) {
+	messageID := r.PathValue("id")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	if err := h.dmService.UnpinMessage(r.Context(), user.ID, messageID); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, map[string]string{"status": "unpinned"})
+}
+
+// GetPinnedMessages handles GET /api/dms/{channelId}/pinned
+func (h *DMHandler) GetPinnedMessages(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelId")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	messages, err := h.dmService.GetPinnedMessages(r.Context(), user.ID, channelID)
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, messages)
+}
+
+// MarkRead handles POST /api/dms/channels/{channelId}/read
+func (h *DMHandler) MarkRead(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelId")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+	if rateLimited(w, h.readLimiter, user.ID) {
+		return
+	}
+
+	// The id is optional: a client clearing a conversation it never loaded (the sidebar's
+	// "mark as read") has no message to point at, and an empty id means "all of it".
+	var req struct {
+		LastReadMessageID string `json:"last_read_message_id"`
+	}
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+
+	unread, err := h.dmService.MarkRead(r.Context(), user.ID, channelID, req.LastReadMessageID)
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, map[string]int{"unread_count": unread})
+}
+
+// MarkDelivered handles POST /api/dms/channels/{channelId}/delivered — the recipient's app saying
+// how far it has received the conversation. Its own rate-limit bucket, never mark-read's: every
+// device reports, and spending the read budget would hold read state back.
+func (h *DMHandler) MarkDelivered(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelId")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+	if rateLimited(w, h.deliveryLimiter, user.ID) {
+		return
+	}
+
+	var req struct {
+		MessageID string `json:"message_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MessageID == "" {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "message_id is required")
+		return
+	}
+
+	if err := h.dmService.MarkDelivered(r.Context(), user.ID, channelID, req.MessageID); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// MarkDeliveredLatest handles POST /api/dms/delivered — after connecting, the app reports every
+// conversation it learned has new messages, in one request rather than one each.
+func (h *DMHandler) MarkDeliveredLatest(w http.ResponseWriter, r *http.Request) {
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+	if rateLimited(w, h.deliveryLimiter, user.ID) {
+		return
+	}
+
+	var req struct {
+		DMChannelIDs []string `json:"dm_channel_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.DMChannelIDs) == 0 {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "dm_channel_ids is required")
+		return
+	}
+
+	if err := h.dmService.MarkDeliveredLatest(r.Context(), user.ID, req.DMChannelIDs); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ─── Search Endpoint ───
+
+// SearchMessages handles GET /api/dms/{channelId}/search?q=&limit=&offset=
+// FTS5 full-text search within a DM channel.
+func (h *DMHandler) SearchMessages(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelId")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		pkg.JSON(w, http.StatusOK, models.DMSearchResult{Messages: []models.DMMessage{}, TotalCount: 0})
+		return
+	}
+
+	limit := 25
+	offset := 0
+
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 && parsed <= 100 {
+			limit = parsed
+		}
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
+			offset = parsed
+		}
+	}
+
+	result, err := h.dmService.SearchMessages(r.Context(), user.ID, channelID, query, limit, offset)
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, result)
+}
+
+// ToggleE2EE handles PATCH /api/dms/{channelId}/e2ee
+// Enables or disables E2EE on a DM channel. Either participant can toggle.
+func (h *DMHandler) ToggleE2EE(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("channelId")
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	channel, err := h.dmService.ToggleE2EE(r.Context(), user.ID, channelID, req.Enabled)
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, channel)
+}

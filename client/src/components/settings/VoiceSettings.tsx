@@ -1,0 +1,758 @@
+/** VoiceSettings — Voice & Audio settings tab. All settings persisted via voiceStore + localStorage. */
+
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import { useVoiceStore } from "../../stores/voiceStore";
+import type { InputMode } from "../../stores/voiceStore";
+import type { NoiseReductionMode } from "../../stores/slices/voiceSettingsSlice";
+import {
+  DEFAULT_MUTE_SHORTCUT,
+  DEFAULT_DEAFEN_SHORTCUT,
+  DOM_BUTTON_TO_MOUSE_TOKEN,
+  type ShortcutBinding,
+} from "../../stores/slices/voiceSettingsSlice";
+import { isElectron } from "../../utils/constants";
+import { RnnoiseWorkletNode, loadRnnoise, GtcrnWorkletNode, loadGtcrn } from "@sapphi-red/web-noise-suppressor";
+import rnnoiseWorkletPath from "@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url";
+import rnnoiseWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise.wasm?url";
+import rnnoiseSimdWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url";
+import gtcrnWorkletPath from "@sapphi-red/web-noise-suppressor/gtcrnWorklet.js?url";
+import gtcrnWasmPath from "@sapphi-red/web-noise-suppressor/gtcrn.wasm?url";
+import vadGateWorkletPath from "../../audio/vadGateWorklet.js?url";
+import { sensitivityToThreshold } from "../../audio/micSensitivity";
+import { gtcrnSupportsSampleRate } from "../../audio/gtcrnSampleRate";
+import { useToastStore } from "../../stores/toastStore";
+
+
+/** Segment order, quietest processing first. */
+const NOISE_REDUCTION_MODES: readonly NoiseReductionMode[] = ["off", "standard", "strong"];
+
+/** Simplified MediaDeviceInfo for select options. */
+type DeviceOption = {
+  deviceId: string;
+  label: string;
+};
+
+/** Convert KeyboardEvent.code to a human-readable key name. */
+function formatKeyCode(code: string): string {
+  if (code.startsWith("Key")) return code.slice(3);
+  if (code.startsWith("Digit")) return code.slice(5);
+
+  const mapping: Record<string, string> = {
+    Mouse3: "Mouse 3 (Middle)",
+    Mouse4: "Mouse 4 (Back)",
+    Mouse5: "Mouse 5 (Forward)",
+    Space: "Space",
+    ControlLeft: "Left Ctrl",
+    ControlRight: "Right Ctrl",
+    ShiftLeft: "Left Shift",
+    ShiftRight: "Right Shift",
+    AltLeft: "Left Alt",
+    AltRight: "Right Alt",
+    Tab: "Tab",
+    CapsLock: "Caps Lock",
+    Backquote: "`",
+    Backslash: "\\",
+    BracketLeft: "[",
+    BracketRight: "]",
+    Semicolon: ";",
+    Quote: "'",
+    Comma: ",",
+    Period: ".",
+    Slash: "/",
+    Minus: "-",
+    Equal: "=",
+  };
+
+  return mapping[code] ?? code;
+}
+
+function formatBinding(b: ShortcutBinding): string {
+  const parts: string[] = [];
+  if (b.ctrl) parts.push("Ctrl");
+  if (b.shift) parts.push("Shift");
+  if (b.alt) parts.push("Alt");
+  parts.push(formatKeyCode(b.code));
+  return parts.join(" + ");
+}
+
+/** Inline gradient for slider filled portion (Chrome lacks ::-moz-range-progress). */
+function sliderTrackStyle(value: number, max: number): React.CSSProperties {
+  const pct = (value / max) * 100;
+  return {
+    background: `linear-gradient(to right, var(--primary) ${pct}%, var(--bg-5) ${pct}%)`,
+  };
+}
+
+function VoiceSettings() {
+  const { t } = useTranslation("settings");
+  const { t: tVoice } = useTranslation("voice");
+
+  // ─── Store state ───
+  const inputMode = useVoiceStore((s) => s.inputMode);
+  const pttKey = useVoiceStore((s) => s.pttKey);
+  const micSensitivity = useVoiceStore((s) => s.micSensitivity);
+  const inputDevice = useVoiceStore((s) => s.inputDevice);
+  const outputDevice = useVoiceStore((s) => s.outputDevice);
+  const masterVolume = useVoiceStore((s) => s.masterVolume);
+  const inputVolume = useVoiceStore((s) => s.inputVolume);
+  const soundsEnabled = useVoiceStore((s) => s.soundsEnabled);
+  const noiseReductionMode = useVoiceStore((s) => s.noiseReductionMode);
+  const notificationVolume = useVoiceStore((s) => s.notificationVolume);
+  const appSoundVolume = useVoiceStore((s) => s.appSoundVolume);
+
+  const setInputMode = useVoiceStore((s) => s.setInputMode);
+  const setPTTKey = useVoiceStore((s) => s.setPTTKey);
+  const setMicSensitivity = useVoiceStore((s) => s.setMicSensitivity);
+  const setInputDevice = useVoiceStore((s) => s.setInputDevice);
+  const setOutputDevice = useVoiceStore((s) => s.setOutputDevice);
+  const setMasterVolume = useVoiceStore((s) => s.setMasterVolume);
+  const setInputVolume = useVoiceStore((s) => s.setInputVolume);
+  const setSoundsEnabled = useVoiceStore((s) => s.setSoundsEnabled);
+  const setNoiseReductionMode = useVoiceStore((s) => s.setNoiseReductionMode);
+  const setNotificationVolume = useVoiceStore((s) => s.setNotificationVolume);
+  const setAppSoundVolume = useVoiceStore((s) => s.setAppSoundVolume);
+
+  const muteShortcut = useVoiceStore((s) => s.muteShortcut);
+  const deafenShortcut = useVoiceStore((s) => s.deafenShortcut);
+  const setMuteShortcut = useVoiceStore((s) => s.setMuteShortcut);
+  const setDeafenShortcut = useVoiceStore((s) => s.setDeafenShortcut);
+
+
+  // ─── Local state ───
+  const [audioInputs, setAudioInputs] = useState<DeviceOption[]>([]);
+  const [audioOutputs, setAudioOutputs] = useState<DeviceOption[]>([]);
+  const [isListeningKey, setIsListeningKey] = useState(false);
+  const [listeningShortcut, setListeningShortcut] = useState<null | "mute" | "deafen">(null);
+
+  // ─── Mic Test ───
+  const [isTesting, setIsTesting] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
+  const micTestRef = useRef<{
+    stream: MediaStream;
+    ctx: AudioContext;
+    analyser: AnalyserNode;
+    gainNode: GainNode;
+    raf: number;
+    denoiseNode: (AudioWorkletNode & { destroy(): void }) | null;
+    vadGateNode: AudioWorkletNode | null;
+    loopbackAudio: HTMLAudioElement | null;
+  } | null>(null);
+
+  const startMicTest = useCallback(async () => {
+    try {
+      // Match real voice pipeline constraints (browser AGC + AEC + NS)
+      const audioConstraints: MediaTrackConstraints = {
+        noiseSuppression: true,
+        autoGainControl: true,
+        echoCancellation: true,
+        ...(inputDevice ? { deviceId: { exact: inputDevice } } : {}),
+      };
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+      const ctx = new AudioContext();
+      const source = ctx.createMediaStreamSource(stream);
+
+      // Read current settings
+      const nrMode = useVoiceStore.getState().noiseReductionMode;
+      const sens = useVoiceStore.getState().micSensitivity;
+      const inVol = useVoiceStore.getState().inputVolume;
+
+      // Input volume GainNode — applied before all processing (same as real pipeline)
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = inVol / 100;
+      source.connect(gainNode);
+
+      let lastNode: AudioNode = gainNode;
+      let denoiseNode: (AudioWorkletNode & { destroy(): void }) | null = null;
+      let vadGateNode: AudioWorkletNode | null = null;
+
+      // The same rate limit that applies in a call. Without it the test just shows a dead level
+      // meter: GTCRN's worklet throws where nothing can catch it and emits silence.
+      let engine = nrMode;
+      if (engine === "strong" && !gtcrnSupportsSampleRate(ctx.sampleRate)) {
+        useToastStore
+          .getState()
+          .addToast("warning", tVoice("strongUnavailableHere", { rate: ctx.sampleRate }));
+        useVoiceStore.getState().setNoiseReductionMode("standard");
+        engine = "standard";
+      }
+
+      if (engine !== "off") {
+        // Whichever engine the user picked — the point of this test is to hear what a call will
+        // actually sound like, and previewing RNNoise while the call runs GTCRN would make the
+        // audition worthless.
+        const strong = engine === "strong";
+        const wasmBinary = strong
+          ? await loadGtcrn({ url: gtcrnWasmPath })
+          : await loadRnnoise({ url: rnnoiseWasmPath, simdUrl: rnnoiseSimdWasmPath });
+
+        await Promise.all([
+          ctx.audioWorklet.addModule(strong ? gtcrnWorkletPath : rnnoiseWorkletPath),
+          ctx.audioWorklet.addModule(vadGateWorkletPath),
+        ]);
+
+        denoiseNode = strong
+          ? new GtcrnWorkletNode(ctx, { wasmBinary, maxChannels: 1 })
+          : new RnnoiseWorkletNode(ctx, { wasmBinary, maxChannels: 1 });
+
+        vadGateNode = new AudioWorkletNode(ctx, "vad-gate-processor");
+        vadGateNode.port.postMessage({
+          threshold: sensitivityToThreshold(sens),
+        });
+
+        gainNode.connect(denoiseNode);
+        denoiseNode.connect(vadGateNode);
+        lastNode = vadGateNode;
+      } else if (sens < 100) {
+        // VAD gate only (no noise reduction but sensitivity threshold active)
+        await ctx.audioWorklet.addModule(vadGateWorkletPath);
+        vadGateNode = new AudioWorkletNode(ctx, "vad-gate-processor");
+        vadGateNode.port.postMessage({
+          threshold: sensitivityToThreshold(sens),
+        });
+        gainNode.connect(vadGateNode);
+        lastNode = vadGateNode;
+      }
+
+      // Analyser after processing — shows post-pipeline levels
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      lastNode.connect(analyser);
+
+      // Loopback: route processed audio to selected output device
+      const loopbackDest = ctx.createMediaStreamDestination();
+      lastNode.connect(loopbackDest);
+      const loopbackAudio = new Audio();
+      loopbackAudio.srcObject = loopbackDest.stream;
+      if (outputDevice && typeof loopbackAudio.setSinkId === "function") {
+        await loopbackAudio.setSinkId(outputDevice).catch(() => {});
+      }
+      loopbackAudio.play().catch(() => {});
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+      function tick() {
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+        const avg = sum / dataArray.length;
+        setMicLevel(Math.min(100, Math.round((avg / 128) * 100)));
+        if (micTestRef.current) {
+          micTestRef.current.raf = requestAnimationFrame(tick);
+        }
+      }
+
+      micTestRef.current = { stream, ctx, analyser, gainNode, raf: 0, denoiseNode, vadGateNode, loopbackAudio };
+      micTestRef.current.raf = requestAnimationFrame(tick);
+      setIsTesting(true);
+    } catch (err) {
+      console.error("[MicTest] Failed to start:", err);
+    }
+  }, [inputDevice, outputDevice]);
+
+  const stopMicTest = useCallback(() => {
+    if (!micTestRef.current) return;
+    const { stream, ctx, raf, denoiseNode, vadGateNode, loopbackAudio } = micTestRef.current;
+    cancelAnimationFrame(raf);
+    stream.getTracks().forEach((t) => t.stop());
+    if (loopbackAudio) {
+      loopbackAudio.pause();
+      loopbackAudio.srcObject = null;
+    }
+    try { denoiseNode?.disconnect(); denoiseNode?.destroy(); } catch {}
+    try { vadGateNode?.disconnect(); } catch {}
+    ctx.close().catch(() => {});
+    micTestRef.current = null;
+    setMicLevel(0);
+    setIsTesting(false);
+  }, []);
+
+  // Stop mic test on unmount
+  useEffect(() => {
+    return () => {
+      if (micTestRef.current) {
+        const { stream, ctx, raf, denoiseNode, loopbackAudio } = micTestRef.current;
+        cancelAnimationFrame(raf);
+        stream.getTracks().forEach((t) => t.stop());
+        if (loopbackAudio) {
+          loopbackAudio.pause();
+          loopbackAudio.srcObject = null;
+        }
+        try { denoiseNode?.disconnect(); denoiseNode?.destroy(); } catch {}
+        ctx.close().catch(() => {});
+        micTestRef.current = null;
+      }
+    };
+  }, []);
+
+  // Restart test if device changes while testing
+  useEffect(() => {
+    if (isTesting) {
+      stopMicTest();
+      startMicTest();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inputDevice, outputDevice]);
+
+  // Update VAD gate threshold live when sensitivity changes during test
+  useEffect(() => {
+    if (micTestRef.current?.vadGateNode) {
+      micTestRef.current.vadGateNode.port.postMessage({
+        threshold: sensitivityToThreshold(micSensitivity),
+      });
+    }
+  }, [micSensitivity]);
+
+  // Update gain live when input volume changes during test
+  useEffect(() => {
+    if (micTestRef.current?.gainNode) {
+      micTestRef.current.gainNode.gain.value = inputVolume / 100;
+    }
+  }, [inputVolume]);
+
+  // Restart test when noise reduction toggles during test
+  useEffect(() => {
+    if (isTesting) {
+      stopMicTest();
+      startMicTest();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [noiseReductionMode]);
+
+  // ─── Device enumeration ───
+  useEffect(() => {
+    async function loadDevices() {
+      try {
+        // Request mic permission first — labels are empty without it
+        await navigator.mediaDevices.getUserMedia({ audio: true })
+          .then((stream) => {
+            // Close stream immediately after getting permission
+            stream.getTracks().forEach((t) => t.stop());
+          })
+          .catch(() => {});
+
+        const devices = await navigator.mediaDevices.enumerateDevices();
+
+        const inputs: DeviceOption[] = devices
+          .filter((d) => d.kind === "audioinput")
+          .map((d, i) => ({
+            deviceId: d.deviceId,
+            label: d.label || `${t("inputDevice")} ${i + 1}`,
+          }));
+
+        const outputs: DeviceOption[] = devices
+          .filter((d) => d.kind === "audiooutput")
+          .map((d, i) => ({
+            deviceId: d.deviceId,
+            label: d.label || `${t("outputDevice")} ${i + 1}`,
+          }));
+
+        setAudioInputs(inputs);
+        setAudioOutputs(outputs);
+      } catch {}
+    }
+
+    loadDevices();
+  }, [t]);
+
+  // ─── Mute / Deafen shortcut rebind ───
+  useEffect(() => {
+    if (!listeningShortcut) return;
+
+    function handleKeyDown(e: KeyboardEvent) {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.code === "Escape") {
+        setListeningShortcut(null);
+        return;
+      }
+      // Ignore pure modifier presses — wait for a real key.
+      if (
+        e.code === "ControlLeft" || e.code === "ControlRight" ||
+        e.code === "ShiftLeft" || e.code === "ShiftRight" ||
+        e.code === "AltLeft" || e.code === "AltRight" ||
+        e.code === "MetaLeft" || e.code === "MetaRight"
+      ) {
+        return;
+      }
+
+      // No modifier required — useKeyboardShortcuts already skips when a text
+      // input/textarea/contentEditable is focused, so a bare letter is safe and
+      // macros (single-key bindings) work as expected.
+
+      const binding: ShortcutBinding = {
+        code: e.code,
+        ctrl: e.ctrlKey,
+        shift: e.shiftKey,
+        alt: e.altKey,
+      };
+      if (listeningShortcut === "mute") setMuteShortcut(binding);
+      else setDeafenShortcut(binding);
+      setListeningShortcut(null);
+    }
+
+    function handleMouseDown(e: MouseEvent) {
+      const token = DOM_BUTTON_TO_MOUSE_TOKEN[e.button];
+      if (!token) return; // ignore left/right — needed for normal interaction
+      e.preventDefault();
+      e.stopPropagation();
+
+      const binding: ShortcutBinding = {
+        code: token,
+        ctrl: e.ctrlKey,
+        shift: e.shiftKey,
+        alt: e.altKey,
+      };
+      if (listeningShortcut === "mute") setMuteShortcut(binding);
+      else setDeafenShortcut(binding);
+      setListeningShortcut(null);
+    }
+
+    document.addEventListener("keydown", handleKeyDown, { capture: true });
+    document.addEventListener("mousedown", handleMouseDown, { capture: true });
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown, { capture: true });
+      document.removeEventListener("mousedown", handleMouseDown, { capture: true });
+    };
+  }, [listeningShortcut, setMuteShortcut, setDeafenShortcut]);
+
+  // ─── PTT Key Binding ───
+  useEffect(() => {
+    if (!isListeningKey) return;
+
+    function handleKeyDown(e: KeyboardEvent) {
+      e.preventDefault();
+      e.stopPropagation();
+
+      // Cancel with Escape
+      if (e.code === "Escape") {
+        setIsListeningKey(false);
+        return;
+      }
+
+      setPTTKey(e.code);
+      setIsListeningKey(false);
+    }
+
+    function handleMouseDown(e: MouseEvent) {
+      const token = DOM_BUTTON_TO_MOUSE_TOKEN[e.button];
+      if (!token) return; // ignore left/right — needed for normal interaction
+      e.preventDefault();
+      e.stopPropagation();
+      setPTTKey(token);
+      setIsListeningKey(false);
+    }
+
+    document.addEventListener("keydown", handleKeyDown, { capture: true });
+    document.addEventListener("mousedown", handleMouseDown, { capture: true });
+
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown, { capture: true });
+      document.removeEventListener("mousedown", handleMouseDown, { capture: true });
+    };
+  }, [isListeningKey, setPTTKey]);
+
+  const handleInputModeChange = useCallback(
+    (mode: InputMode) => {
+      setInputMode(mode);
+    },
+    [setInputMode]
+  );
+
+  return (
+    <div className="voice-settings">
+      <h2 className="settings-section-title">{t("voiceSettings")}</h2>
+
+      {/* ─── Input Mode ─── */}
+      <div className="vs-section">
+        <div className="vs-label">{t("voiceInputMode")}</div>
+        <div className="vs-radio-group">
+          <button
+            className={`vs-radio${inputMode === "voice_activity" ? " active" : ""}`}
+            onClick={() => handleInputModeChange("voice_activity")}
+          >
+            <div className="vs-radio-dot" />
+            <div>
+              <div className="vs-radio-title">{t("voiceActivity")}</div>
+              <div className="vs-desc">{t("voiceActivityDesc")}</div>
+            </div>
+          </button>
+          <button
+            className={`vs-radio${inputMode === "push_to_talk" ? " active" : ""}`}
+            onClick={() => handleInputModeChange("push_to_talk")}
+          >
+            <div className="vs-radio-dot" />
+            <div>
+              <div className="vs-radio-title">{t("pushToTalk")}</div>
+              <div className="vs-desc">{t("pushToTalkDesc")}</div>
+            </div>
+          </button>
+        </div>
+      </div>
+
+      {/* ─── PTT Key (only in PTT mode) ─── */}
+      {inputMode === "push_to_talk" && (
+        <div className="vs-section">
+          <div className="vs-label">{t("pttKey")}</div>
+          <button
+            className={`vs-keybind${isListeningKey ? " listening" : ""}`}
+            onClick={() => setIsListeningKey(true)}
+          >
+            {isListeningKey ? t("pttListening") : formatKeyCode(pttKey)}
+          </button>
+          <div className="vs-desc">{t("pttKeyHint")}</div>
+          {!isElectron() && (
+            <div className="vs-desc vs-warning">
+              {t("pttWebOnly")}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ─── Mic Sensitivity (voice activity mode only) ─── */}
+      {inputMode === "voice_activity" && (
+        <div className="vs-section">
+          <div className="vs-label">{t("micSensitivity")}</div>
+          <div className="vs-slider-row">
+            <input
+              type="range"
+              min={0}
+              max={100}
+              value={micSensitivity}
+              onChange={(e) => setMicSensitivity(Number(e.target.value))}
+              className="vs-range"
+              style={sliderTrackStyle(micSensitivity, 100)}
+            />
+            <span className="vs-slider-value">{micSensitivity}%</span>
+          </div>
+        </div>
+      )}
+
+      {/* ─── Input Device ─── */}
+      <div className="vs-section">
+        <div className="vs-label">{t("inputDevice")}</div>
+        <select
+          className="vs-select"
+          value={inputDevice}
+          onChange={(e) => setInputDevice(e.target.value)}
+        >
+          <option value="">{t("defaultDevice")}</option>
+          {audioInputs.map((d) => (
+            <option key={d.deviceId} value={d.deviceId}>
+              {d.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* ─── Input Volume ─── */}
+      <div className="vs-section">
+        <div className="vs-label">{t("inputVolume")}</div>
+        <div className="vs-slider-row">
+          <input
+            type="range"
+            min={0}
+            max={200}
+            value={inputVolume}
+            onChange={(e) => setInputVolume(Number(e.target.value))}
+            className="vs-range"
+            style={sliderTrackStyle(inputVolume, 200)}
+          />
+          <span className="vs-slider-value">{inputVolume}%</span>
+        </div>
+      </div>
+
+      {/* ─── Mic Test ─── */}
+      <div className="vs-section">
+        <div className="vs-mic-test-row">
+          <button
+            className={`vs-mic-test-btn${isTesting ? " active" : ""}`}
+            onClick={isTesting ? stopMicTest : startMicTest}
+          >
+            {isTesting ? t("micTestStop") : t("micTest")}
+          </button>
+          <div className="vs-mic-meter">
+            {Array.from({ length: 40 }, (_, i) => {
+              const threshold = (i / 40) * 100;
+              return (
+                <div
+                  key={i}
+                  className={`vs-mic-bar${micLevel > threshold ? " active" : ""}`}
+                />
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {/* ─── Output Device ─── */}
+      <div className="vs-section">
+        <div className="vs-label">{t("outputDevice")}</div>
+        <select
+          className="vs-select"
+          value={outputDevice}
+          onChange={(e) => setOutputDevice(e.target.value)}
+        >
+          <option value="">{t("defaultDevice")}</option>
+          {audioOutputs.map((d) => (
+            <option key={d.deviceId} value={d.deviceId}>
+              {d.label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* ─── Master Volume ─── */}
+      <div className="vs-section">
+        <div className="vs-label">{t("masterVolume")}</div>
+        <div className="vs-slider-row">
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={masterVolume}
+            onChange={(e) => setMasterVolume(Number(e.target.value))}
+            className="vs-range"
+            style={sliderTrackStyle(masterVolume, 100)}
+          />
+          <span className="vs-slider-value">{masterVolume}%</span>
+        </div>
+      </div>
+
+      {/* ─── Notification Volume ─── */}
+      <div className="vs-section">
+        <div className="vs-label">{t("notificationVolume")}</div>
+        <div className="vs-desc">{t("notificationVolumeDesc")}</div>
+        <div className="vs-slider-row">
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={notificationVolume}
+            onChange={(e) => setNotificationVolume(Number(e.target.value))}
+            className="vs-range"
+            style={sliderTrackStyle(notificationVolume, 100)}
+          />
+          <span className="vs-slider-value">{notificationVolume}%</span>
+        </div>
+      </div>
+
+      {/* ─── App Sound Volume ─── */}
+      <div className="vs-section">
+        <div className="vs-label">{t("appSoundVolume")}</div>
+        <div className="vs-desc">{t("appSoundVolumeDesc")}</div>
+        <div className="vs-slider-row">
+          <input
+            type="range"
+            min={0}
+            max={100}
+            value={appSoundVolume}
+            onChange={(e) => setAppSoundVolume(Number(e.target.value))}
+            className="vs-range"
+            style={sliderTrackStyle(appSoundVolume, 100)}
+          />
+          <span className="vs-slider-value">{appSoundVolume}%</span>
+        </div>
+      </div>
+
+      {/* ─── Noise Reduction ─── */}
+      <div className="vs-section">
+        <div className="vs-toggle-row">
+          <div>
+            <div className="vs-label">{t("noiseReduction")}</div>
+            {/* The description follows the choice: "Strong" trades voice bandwidth for quiet, and
+                someone picking it should be told that before they wonder why they sound duller. */}
+            <div className="vs-desc">{t(`noiseReductionDesc_${noiseReductionMode}`)}</div>
+          </div>
+          <div className="vs-segment" role="radiogroup" aria-label={t("noiseReduction")}>
+            {NOISE_REDUCTION_MODES.map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                role="radio"
+                aria-checked={noiseReductionMode === mode}
+                className={`vs-segment-item${noiseReductionMode === mode ? " active" : ""}`}
+                onClick={() => setNoiseReductionMode(mode)}
+              >
+                {t(`noiseReduction_${mode}`)}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* ─── Join/Leave Sounds ─── */}
+      <div className="vs-section">
+        <div className="vs-toggle-row">
+          <div>
+            <div className="vs-label">{t("joinLeaveSounds")}</div>
+            <div className="vs-desc">{t("joinLeaveSoundsDesc")}</div>
+          </div>
+          <label className="vs-switch">
+            <input
+              type="checkbox"
+              checked={soundsEnabled}
+              onChange={(e) => setSoundsEnabled(e.target.checked)}
+            />
+            <span className="vs-switch-slider" />
+          </label>
+        </div>
+      </div>
+
+      {/* ─── Keyboard Shortcuts ─── */}
+      <div className="vs-section">
+        <div className="vs-label">{t("shortcuts")}</div>
+        <div className="vs-desc">{t("shortcutsDesc")}</div>
+
+        <div className="vs-shortcut-row">
+          <div className="vs-shortcut-name">{t("shortcutMute")}</div>
+          <button
+            className={`vs-keybind${listeningShortcut === "mute" ? " listening" : ""}`}
+            onClick={() => setListeningShortcut("mute")}
+          >
+            {listeningShortcut === "mute" ? t("pttListening") : formatBinding(muteShortcut)}
+          </button>
+          <button
+            className="vs-shortcut-reset"
+            onClick={() => setMuteShortcut(DEFAULT_MUTE_SHORTCUT)}
+            disabled={
+              muteShortcut.code === DEFAULT_MUTE_SHORTCUT.code &&
+              muteShortcut.ctrl === DEFAULT_MUTE_SHORTCUT.ctrl &&
+              muteShortcut.shift === DEFAULT_MUTE_SHORTCUT.shift &&
+              muteShortcut.alt === DEFAULT_MUTE_SHORTCUT.alt
+            }
+          >
+            {t("shortcutReset")}
+          </button>
+        </div>
+
+        <div className="vs-shortcut-row">
+          <div className="vs-shortcut-name">{t("shortcutDeafen")}</div>
+          <button
+            className={`vs-keybind${listeningShortcut === "deafen" ? " listening" : ""}`}
+            onClick={() => setListeningShortcut("deafen")}
+          >
+            {listeningShortcut === "deafen" ? t("pttListening") : formatBinding(deafenShortcut)}
+          </button>
+          <button
+            className="vs-shortcut-reset"
+            onClick={() => setDeafenShortcut(DEFAULT_DEAFEN_SHORTCUT)}
+            disabled={
+              deafenShortcut.code === DEFAULT_DEAFEN_SHORTCUT.code &&
+              deafenShortcut.ctrl === DEFAULT_DEAFEN_SHORTCUT.ctrl &&
+              deafenShortcut.shift === DEFAULT_DEAFEN_SHORTCUT.shift &&
+              deafenShortcut.alt === DEFAULT_DEAFEN_SHORTCUT.alt
+            }
+          >
+            {t("shortcutReset")}
+          </button>
+        </div>
+      </div>
+
+      {/* Screen Share Audio toggle moved to ScreenPicker modal */}
+    </div>
+  );
+}
+
+export default VoiceSettings;

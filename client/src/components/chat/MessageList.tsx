@@ -1,0 +1,451 @@
+/** MessageList — Scrollable message container with auto-scroll, infinite scroll, and compact mode. */
+
+import { useEffect, useLayoutEffect, useRef, useCallback, useMemo, useState, type ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import { useChatContext, type ChatMessage } from "../../hooks/useChatContext";
+import { useBlockStore } from "../../stores/blockStore";
+import { useAuthStore } from "../../stores/authStore";
+import { useActiveMembers } from "../../stores/memberStore";
+import { useReadStateStore } from "../../stores/readStateStore";
+import { useOutboxStore, type PendingMessage } from "../../stores/outboxStore";
+import { MessageSkeleton } from "../shared/Skeleton";
+import Message from "./Message";
+import CallLogRow from "./CallLogRow";
+import BlockedMessagesRow from "./BlockedMessagesRow";
+import { useChatLayoutStore } from "../../hooks/useNarrowChat";
+
+/** Below this column width the message layout switches to the compact (mobile-style) mode.
+ *  Kept in sync with the `@container (max-width:600px)` rule in globals.css. */
+const NARROW_COLUMN_WIDTH = 600;
+
+/** Compact threshold for consecutive messages from same author (ms) */
+const COMPACT_THRESHOLD = 5 * 60 * 1000;
+
+/** Per-channel scroll position cache. Survives component unmount/remount. */
+const scrollPositions = new Map<string, number>();
+
+const NO_PENDING: PendingMessage[] = [];
+
+/** A pending send drawn as the message it will become, authored by the current user. */
+/**
+ * One key for a send from pending to stored. Keyed by id, confirming a send deleted its pending row
+ * and inserted the stored one: for a moment the list was a row shorter, Safari (no scroll
+ * anchoring) clamped the scroll position to that and kept it, so the newest message ended one row
+ * below the visible area and the list stopped following. Same key: React updates the row in place.
+ */
+const rowKey = (msg: ChatMessage) => (msg.client_nonce ? `send-${msg.client_nonce}` : msg.id);
+
+function pendingAsMessage(pending: PendingMessage, author: ChatMessage["author"]): ChatMessage {
+  return {
+    id: `pending-${pending.nonce}`,
+    client_nonce: pending.nonce,
+    user_id: author.id,
+    content: pending.content,
+    edited_at: null,
+    created_at: pending.createdAt,
+    reply_to_id: pending.replyToId,
+    is_pinned: false,
+    author,
+    attachments: pending.attachments.map((att, i) => ({ id: `${pending.nonce}-${i}`, ...att })),
+    reactions: [],
+    referenced_message: pending.referencedMessage,
+    // Local files are shown as they are, never decrypted.
+    encryption_version: 0,
+  };
+}
+
+function MessageList() {
+  const { t } = useTranslation("chat");
+  const {
+    mode,
+    channelId,
+    channelName,
+    messages,
+    isLoading,
+    isLoadingMore,
+    hasMore,
+    fetchMessages,
+    fetchOlderMessages,
+    scrollToMessageId,
+    setScrollToMessageId,
+  } = useChatContext();
+
+  const currentUser = useAuthStore((s) => s.user);
+  const members = useActiveMembers();
+  const queued = useOutboxStore((s) => s.pendingByConversation[channelId]) ?? NO_PENDING;
+  // A pending send whose stored copy is already here is drawn once, as the stored message: both
+  // would share one row key (rowKey), and React would mix the two rows up.
+  const pending = useMemo(() => {
+    if (queued.length === 0) return queued;
+    const stored = new Set(messages.map((m) => m.client_nonce).filter(Boolean));
+    return stored.size === 0 ? queued : queued.filter((p) => !stored.has(p.nonce));
+  }, [queued, messages]);
+
+  // Unconfirmed sends go under every stored message: the server decides where they land once it
+  // has them, and until then they are the newest thing in the conversation.
+  const pendingByMessageId = useMemo(() => {
+    const byId = new Map<string, PendingMessage>();
+    for (const p of pending) byId.set(`pending-${p.nonce}`, p);
+    return byId;
+  }, [pending]);
+  const rows = useMemo(
+    () => (currentUser && pending.length > 0
+      ? [...messages, ...pending.map((p) => pendingAsMessage(p, currentUser))]
+      : messages),
+    [messages, pending, currentUser]
+  );
+  const blockedUserIds = useBlockStore((s) => s.blockedUserIds);
+
+  // Blocked authors' messages collapse into one row; "show" reveals them for this visit only.
+  const [revealedIds, setRevealedIds] = useState<Set<string>>(() => new Set());
+  const isHidden = useCallback(
+    (msg: ChatMessage) => blockedUserIds.includes(msg.user_id) && !revealedIds.has(msg.id),
+    [blockedUserIds, revealedIds],
+  );
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+
+  // Reflow the message layout by the column's real width (survives sidebar toggles / split-view).
+  const narrowObserverRef = useRef<ResizeObserver | null>(null);
+  const setViewportRef = useCallback((el: HTMLDivElement | null) => {
+    narrowObserverRef.current?.disconnect();
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width ?? 0;
+      if (w > 0) useChatLayoutStore.getState().setIsNarrow(w < NARROW_COLUMN_WIDTH);
+    });
+    ro.observe(el);
+    narrowObserverRef.current = ro;
+  }, []);
+  // Intent flag: "user wants to stay pinned to bottom". Only the user scrolling
+  // UP invalidates it; programmatic scrollTo / image-load resize do not.
+  const stickToBottomRef = useRef(true);
+  const prevScrollTopRef = useRef(0);
+  const prevMessageCountRef = useRef(0);
+
+  function scrollToBottom() {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }
+
+  // ─── Mention Navigation State ───
+  const lastMentionSeen = useReadStateStore((s) => s.lastMentionSeen[channelId]);
+  const markMentionSeen = useReadStateStore((s) => s.markMentionSeen);
+
+  const mentionMessageIds = useMemo(() => {
+    if (!currentUser) return [];
+    const myMember = members.find((m) => m.id === currentUser.id);
+    const myRoleIds = myMember?.roles?.length
+      ? new Set(myMember.roles.map((r) => r.id))
+      : null;
+
+    const ids: string[] = [];
+    for (const msg of messages) {
+      if (blockedUserIds.includes(msg.user_id)) continue;
+      if (lastMentionSeen) {
+        if (msg.created_at < lastMentionSeen.at) continue;
+        if (msg.created_at === lastMentionSeen.at && msg.id <= lastMentionSeen.messageId) continue;
+      }
+
+      if (msg.mentions?.includes(currentUser.id)) {
+        ids.push(msg.id);
+        continue;
+      }
+      if (msg.role_mentions?.length && myRoleIds) {
+        if (msg.role_mentions.some((rid) => myRoleIds.has(rid))) {
+          ids.push(msg.id);
+        }
+      }
+    }
+    return ids;
+  }, [messages, currentUser, members, lastMentionSeen, blockedUserIds]);
+
+  const mentionCount = mentionMessageIds.length;
+
+  function handleMentionNavClick() {
+    if (mentionCount === 0) return;
+    const msgId = mentionMessageIds[0];
+    const msg = messages.find((m) => m.id === msgId);
+
+    // Advance the watermark — server-persisted, survives hard refresh
+    if (msg) markMentionSeen(channelId, msgId, msg.created_at);
+
+    const el = document.getElementById(`msg-${msgId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.add("msg-highlight");
+      setTimeout(() => el.classList.remove("msg-highlight"), 2000);
+    }
+  }
+
+  // A layout effect, declared before the restore below, so the reset runs FIRST. As a plain
+  // effect it ran after every layout effect: a conversation that opens already holding messages
+  // (from memory or the device cache) was pinned to the bottom by the restore and then unpinned
+  // here, and new messages stopped scrolling it until the user scrolled by hand.
+  useLayoutEffect(() => {
+    stickToBottomRef.current = false;
+  }, [channelId]);
+
+  useEffect(() => {
+    setRevealedIds(new Set());
+    if (channelId) fetchMessages();
+  }, [channelId, fetchMessages]);
+
+  // Auto-scroll on new message when intent is sticky. Sending is the user's own act, so a new
+  // pending message brings the view down even when they had scrolled up.
+  const prevPendingCountRef = useRef(pending.length);
+  useEffect(() => {
+    if (pending.length > prevPendingCountRef.current) stickToBottomRef.current = true;
+    prevPendingCountRef.current = pending.length;
+    if (rows.length > prevMessageCountRef.current && stickToBottomRef.current) {
+      scrollToBottom();
+    }
+    prevMessageCountRef.current = rows.length;
+  }, [rows.length, pending.length]);
+
+  // Re-pin to bottom while async content (images, embeds, GIFs) expands the
+  // container. Uses the intent flag, not a position re-measurement, so the
+  // programmatic-scroll → handleScroll feedback loop can't unstick.
+  useEffect(() => {
+    if (!contentRef.current) return;
+    const observer = new ResizeObserver(() => {
+      if (stickToBottomRef.current && scrollRef.current) {
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      }
+    });
+    observer.observe(contentRef.current);
+    return () => observer.disconnect();
+  }, [isLoading, channelId]);
+
+  // Re-pin when the scroll viewport itself changes height — the soft keyboard opening shrinks
+  // .messages-scroll (via #root's keyboard padding) without changing content size, so the
+  // contentRef observer above never fires for it and the newest message would hide behind the
+  // composer. Keyed on clientHeight so a plain scrollTop change can't loop back in here.
+  useEffect(() => {
+    const scroller = scrollRef.current;
+    if (!scroller) return;
+    let prevHeight = scroller.clientHeight;
+    const observer = new ResizeObserver(() => {
+      const h = scroller.clientHeight;
+      // Only re-pin when the viewport SHRINKS (keyboard opening, window narrowing) — that's when
+      // the newest message would slip behind the composer. On grow, a bottom-anchored scroll stays
+      // put, and re-pinning mid-resize-drag on desktop just adds jitter.
+      const shrank = h < prevHeight;
+      prevHeight = h;
+      if (shrank && stickToBottomRef.current) {
+        scroller.scrollTop = scroller.scrollHeight;
+      }
+    });
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [isLoading, channelId]);
+
+  /** Restore scroll position — runs before paint via useLayoutEffect. */
+  useLayoutEffect(() => {
+    if (!isLoading && messages.length > 0 && scrollRef.current) {
+      const savedPos = scrollPositions.get(channelId);
+      if (savedPos !== undefined) {
+        scrollRef.current.scrollTop = savedPos;
+        const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
+        stickToBottomRef.current = scrollHeight - scrollTop - clientHeight < 20;
+      } else {
+        scrollToBottom();
+        stickToBottomRef.current = true;
+      }
+      prevMessageCountRef.current = rows.length;
+      prevScrollTopRef.current = scrollRef.current.scrollTop;
+    }
+  }, [isLoading, channelId]);
+
+  /** Scroll-to-message effect — triggered when reply preview is clicked. */
+  useEffect(() => {
+    if (!scrollToMessageId) return;
+
+    // A collapsed (blocked) target has no DOM node yet: reveal it and let the effect re-run.
+    const target = messages.find((m) => m.id === scrollToMessageId);
+    if (target && isHidden(target)) {
+      setRevealedIds((prev) => new Set([...Array.from(prev), target.id]));
+      return;
+    }
+
+    const el = document.getElementById(`msg-${scrollToMessageId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.add("msg-highlight");
+      const timer = setTimeout(() => {
+        el.classList.remove("msg-highlight");
+      }, 2000);
+      setScrollToMessageId(null);
+      return () => clearTimeout(timer);
+    }
+
+    setScrollToMessageId(null);
+  }, [scrollToMessageId, setScrollToMessageId, messages, isHidden]);
+
+  /** Scroll handler — direction-based intent tracking + persist position + infinite scroll. */
+  const handleScroll = useCallback(() => {
+    if (!scrollRef.current) return;
+
+    const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
+    const prev = prevScrollTopRef.current;
+
+    // Only USER scroll-up unstuck intent; programmatic scrolls (scrollToBottom on resize,
+    // infinite-scroll restore) move scrollTop forward, never decrease it.
+    if (scrollTop < prev - 5) {
+      stickToBottomRef.current = false;
+    }
+    if (scrollHeight - scrollTop - clientHeight < 20) {
+      stickToBottomRef.current = true;
+    }
+    prevScrollTopRef.current = scrollTop;
+
+    if (channelId) {
+      scrollPositions.set(channelId, scrollTop);
+    }
+
+    if (scrollTop < 100 && hasMore && !isLoadingMore && channelId) {
+      const prevScrollHeight = scrollRef.current.scrollHeight;
+      fetchOlderMessages().then(() => {
+        if (scrollRef.current) {
+          scrollRef.current.scrollTop =
+            scrollRef.current.scrollHeight - prevScrollHeight;
+        }
+      });
+    }
+  }, [hasMore, isLoadingMore, channelId, fetchOlderMessages]);
+
+  /** Compact mode for consecutive messages from same author within 5min. Replies always show full header. */
+  function isCompact(index: number): boolean {
+    if (index === 0) return false;
+
+    const current = rows[index];
+    if (current.reply_to_id) return false;
+
+    const previous = rows[index - 1];
+    // A collapsed blocked message cannot lend its header to the next one.
+    if (isHidden(previous)) return false;
+
+    if (current.user_id !== previous.user_id) return false;
+
+    const timeDiff =
+      new Date(current.created_at).getTime() -
+      new Date(previous.created_at).getTime();
+
+    return timeDiff < COMPACT_THRESHOLD;
+  }
+
+  /** Consecutive hidden (blocked) messages become one BlockedMessagesRow. */
+  function renderMessages(): ReactNode[] {
+    const nodes: ReactNode[] = [];
+    let run: ChatMessage[] = [];
+    const flushRun = () => {
+      if (run.length === 0) return;
+      const ids = run.map((m) => m.id);
+      nodes.push(
+        <BlockedMessagesRow
+          key={`blocked-${ids[0]}`}
+          count={ids.length}
+          onReveal={() => setRevealedIds((prev) => new Set([...Array.from(prev), ...ids]))}
+        />,
+      );
+      run = [];
+    };
+    rows.forEach((msg, index) => {
+      if (isHidden(msg)) {
+        run.push(msg);
+        return;
+      }
+      flushRun();
+      nodes.push(
+        <div key={rowKey(msg)} id={`msg-${msg.id}`}>
+          {msg.message_type === "call" && msg.call_meta ? (
+            <CallLogRow meta={msg.call_meta} createdAt={msg.created_at} />
+          ) : (
+            <Message message={msg} isCompact={isCompact(index)} pending={pendingByMessageId.get(msg.id)} />
+          )}
+        </div>,
+      );
+    });
+    flushRun();
+    return nodes;
+  }
+
+  if (!channelId) {
+    return <div className="no-channel">{t("noChannel")}</div>;
+  }
+
+  // Only with nothing to show: a conversation already holding messages keeps them on screen.
+  if (isLoading && rows.length === 0) {
+    return (
+      <div className="messages-scroll">
+        <MessageSkeleton count={6} />
+      </div>
+    );
+  }
+
+  // Welcome icon: "#" for channels, "@" for DMs, speaker for voice
+  const welcomeIcon = mode === "dm" ? "@" : mode === "voice" ? "🔊" : "#";
+
+  return (
+    <div className="chat-msg-viewport" ref={setViewportRef} style={{ position: "relative", flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="messages-scroll"
+      >
+        {/* Loading more indicator */}
+        {isLoadingMore && (
+          <div style={{ display: "flex", justifyContent: "center", padding: "16px 0" }}>
+            <div className="spinner" />
+          </div>
+        )}
+
+        {/* Messages */}
+        {rows.length === 0 ? (
+          <div className="msg-welcome">
+            <div className="msg-welcome-icon">
+              <span>{welcomeIcon}</span>
+            </div>
+            <h2>
+              {mode === "dm"
+                ? t("welcomeDM", { user: channelName })
+                : mode === "voice"
+                  ? t("welcomeVoice", { channel: channelName })
+                  : t("welcomeChannel", { channel: channelName })}
+            </h2>
+            <p>
+              {mode === "dm"
+                ? t("dmStart", { user: channelName })
+                : mode === "voice"
+                  ? t("voiceStart")
+                  : t("channelStart", { channel: channelName })}
+            </p>
+          </div>
+        ) : (
+          <div ref={contentRef} style={{ display: "flex", flexDirection: "column", justifyContent: "flex-end", padding: "8px 0" }}>
+            {renderMessages()}
+          </div>
+        )}
+      </div>
+
+      {/* Mention Navigation FAB */}
+      {mentionCount > 0 && (
+        <button
+          className="mention-nav-fab"
+          onClick={handleMentionNavClick}
+          title={t("jumpToMention")}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="4" />
+            <path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8" />
+          </svg>
+          <span>{mentionCount}</span>
+        </button>
+      )}
+    </div>
+  );
+}
+
+export default MessageList;

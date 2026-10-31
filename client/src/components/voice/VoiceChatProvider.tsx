@@ -1,0 +1,148 @@
+/**
+ * VoiceChatProvider — Maps voiceMessageStore + voiceMessages API to ChatContext,
+ * so the existing Message/MessageInput/MessageList components can render the
+ * ephemeral voice channel chat without duplicating UI.
+ *
+ * Voice chat has no reactions/replies/pins/mentions/typing — those context
+ * actions are stubbed as no-ops and gated off in shared components via
+ * `mode === "voice"`.
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ChatContext, type ChatContextValue, type ChatMessage } from "../../hooks/useChatContext";
+import { useVoiceMessageStore } from "../../stores/voiceMessageStore";
+import { listVoiceMessages } from "../../api/voiceMessages";
+import type { MemberWithRoles, VoiceMessage } from "../../types";
+import type { UploadOptions } from "../../api/client";
+
+const EMPTY_VOICE: VoiceMessage[] = [];
+const EMPTY_MEMBERS: MemberWithRoles[] = [];
+
+type Props = {
+  channelId: string;
+  channelName: string;
+  children: ReactNode;
+};
+
+function VoiceChatProvider({ channelId, channelName, children }: Props) {
+  const rawMessages = useVoiceMessageStore(
+    (s) => s.messagesByChannel[channelId] ?? EMPTY_VOICE,
+  );
+  const setForChannel = useVoiceMessageStore((s) => s.setForChannel);
+  const send = useVoiceMessageStore((s) => s.send);
+  const edit = useVoiceMessageStore((s) => s.edit);
+  const del = useVoiceMessageStore((s) => s.del);
+
+  // Adapt VoiceMessage → ChatMessage shape with safe defaults for the fields
+  // shared components might read (reply/pin/reactions) — voice chat has none.
+  const messages = useMemo<ChatMessage[]>(
+    () =>
+      rawMessages.map((m) => ({
+        id: m.id,
+        user_id: m.user_id,
+        content: m.content,
+        edited_at: m.edited_at,
+        created_at: m.created_at,
+        reply_to_id: null,
+        is_pinned: false,
+        author: m.author,
+        attachments: (m.attachments ?? []).map((a) => ({
+          id: a.id,
+          filename: a.filename,
+          file_url: a.file_url,
+          file_size: a.file_size,
+          mime_type: a.mime_type,
+        })),
+        reactions: [],
+        referenced_message: null,
+      })),
+    [rawMessages],
+  );
+
+  const [isLoading, setIsLoading] = useState(true);
+  const addFilesRef = useRef<((files: File[]) => void) | null>(null);
+
+  // Initial load when channel changes.
+  useEffect(() => {
+    let cancelled = false;
+    setIsLoading(true);
+    listVoiceMessages(channelId).then((res) => {
+      if (cancelled) return;
+      if (res.success && res.data) {
+        setForChannel(channelId, res.data);
+      }
+      setIsLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [channelId, setForChannel]);
+
+  const sendMessage = useCallback(
+    (content: string, files?: File[], _replyToId?: string, upload?: UploadOptions) =>
+      send(channelId, content, files, upload),
+    [channelId, send],
+  );
+
+  const editMessage = useCallback(
+    (id: string, content: string) => edit(channelId, id, content),
+    [channelId, edit],
+  );
+
+  const deleteMessageAction = useCallback(
+    (id: string) => del(channelId, id),
+    [channelId, del],
+  );
+
+  const fetchMessages = useCallback(async () => {
+    const res = await listVoiceMessages(channelId);
+    if (res.success && res.data) {
+      setForChannel(channelId, res.data);
+    }
+  }, [channelId, setForChannel]);
+
+  const noopAsync = useCallback(async () => {}, []);
+  const noop = useCallback(() => {}, []);
+
+  const value: ChatContextValue = useMemo(
+    () => ({
+      mode: "voice" as const,
+      channelId,
+      channelName,
+      serverId: undefined,
+      messages,
+      isLoading,
+      isLoadingMore: false,
+      hasMore: false,
+      replyingTo: null,
+      scrollToMessageId: null,
+      sendMessage,
+      // Voice chat has no idempotent send to retry under, so it keeps sending in the foreground.
+      sendsInBackground: false,
+      retryPending: noop,
+      discardPending: noop,
+      editMessage,
+      deleteMessage: deleteMessageAction,
+      fetchMessages,
+      fetchOlderMessages: noopAsync,
+      toggleReaction: () => {},
+      setReplyingTo: () => {},
+      setScrollToMessageId: () => {},
+      sendTyping: () => {},
+      pinMessage: noopAsync,
+      unpinMessage: noopAsync,
+      isMessagePinned: () => false,
+      canSend: true,
+      canManageMessages: false,
+      showRoleColors: false,
+      members: EMPTY_MEMBERS,
+      addFilesRef,
+    }),
+    [
+      channelId, channelName, messages, isLoading,
+      sendMessage, editMessage, deleteMessageAction, fetchMessages, noopAsync, noop,
+    ],
+  );
+
+  return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;
+}
+
+export default VoiceChatProvider;

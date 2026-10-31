@@ -1,0 +1,264 @@
+// Package services — DM channel lifecycle (create / list).
+// Channel creation enforces `friends_only` privacy at creation time; the
+// `message_request` flow is handled lazily on first message (see dm_message.go).
+package services
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
+	"github.com/akinalp/mqvi/ws"
+)
+
+func (s *dmService) GetOrCreateChannel(ctx context.Context, userID, otherUserID string) (*models.DMChannelWithUser, error) {
+	if userID == otherUserID {
+		return nil, fmt.Errorf("%w: cannot create DM with yourself", pkg.ErrBadRequest)
+	}
+
+	// Active user only — DM cannot be created with a deleted/tombstone user.
+	otherUser, err := s.userRepo.GetActiveByID(ctx, otherUserID)
+	if err != nil {
+		if errors.Is(err, pkg.ErrNotFound) {
+			return nil, fmt.Errorf("%w: user not found", pkg.ErrNotFound)
+		}
+		return nil, fmt.Errorf("failed to look up user: %w", err)
+	}
+
+	user1, user2 := sortUserIDs(userID, otherUserID)
+
+	existing, err := s.dmRepo.GetChannelByUsers(ctx, user1, user2)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check existing DM channel: %w", err)
+	}
+
+	if existing != nil {
+		otherUser.PasswordHash = ""
+		otherUser.AvatarURL = s.urlSigner.SignURLPtr(otherUser.AvatarURL)
+		// An existing conversation can have unread messages. Reporting 0 here would make the
+		// API lie to anyone who seeds their badge from this response.
+		unread, err := s.dmRepo.CountUnread(ctx, userID, existing.ID)
+		if err != nil {
+			return nil, err
+		}
+		return &models.DMChannelWithUser{
+			ID:            existing.ID,
+			OtherUser:     otherUser,
+			Status:        existing.Status,
+			InitiatedBy:   existing.InitiatedBy,
+			CreatedAt:     existing.CreatedAt,
+			LastMessageAt: existing.LastMessageAt,
+			UnreadCount:   unread,
+		}, nil
+	}
+
+	// Check friends_only at channel creation time (blocks DM window entirely)
+	// Platform admins bypass all DM privacy restrictions
+	sender, _ := s.userRepo.GetByID(ctx, userID)
+	isPlatformAdmin := sender != nil && sender.IsPlatformAdmin
+
+	if !isPlatformAdmin && otherUser.DMPrivacy == "friends_only" && s.friendChecker != nil {
+		friends, err := s.friendChecker.AreFriends(ctx, userID, otherUserID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check friendship: %w", err)
+		}
+		if !friends {
+			return nil, fmt.Errorf("%w: this user only accepts messages from friends", pkg.ErrForbidden)
+		}
+	}
+
+	// Opening a conversation tells the other side and shares presence both ways.
+	if err := s.rejectIfBlocked(ctx, isPlatformAdmin, userID, otherUserID); err != nil {
+		return nil, err
+	}
+
+	// Channel always starts as "accepted" — pending status is set on first message in SendMessage
+	channel := &models.DMChannel{
+		User1ID: user1,
+		User2ID: user2,
+		Status:  models.DMStatusAccepted,
+	}
+	if err := s.dmRepo.CreateChannel(ctx, channel); err != nil {
+		return nil, fmt.Errorf("failed to create DM channel: %w", err)
+	}
+
+	otherUser.AvatarURL = s.urlSigner.SignURLPtr(otherUser.AvatarURL)
+	result := &models.DMChannelWithUser{
+		ID:            channel.ID,
+		OtherUser:     otherUser,
+		Status:        channel.Status,
+		InitiatedBy:   channel.InitiatedBy,
+		CreatedAt:     channel.CreatedAt,
+		LastMessageAt: channel.LastMessageAt,
+	}
+
+	// DM partners see each other's presence with or without a shared server. Each live connection
+	// loaded its peer list at connect, so a channel opened now has to be registered on them.
+	s.hub.AddPresencePeer(userID, otherUserID)
+
+	// Notify both users (each sees the other as the "other user")
+	currentUser, err := s.userRepo.GetByID(ctx, userID)
+	if err == nil {
+		currentUser.PasswordHash = ""
+		currentUser.AvatarURL = s.urlSigner.SignURLPtr(currentUser.AvatarURL)
+		s.hub.BroadcastToUser(otherUserID, ws.Event{
+			Op: ws.OpDMChannelCreate,
+			Data: models.DMChannelWithUser{
+				ID:            channel.ID,
+				OtherUser:     currentUser,
+				CreatedAt:     channel.CreatedAt,
+				LastMessageAt: channel.LastMessageAt,
+			},
+		})
+	}
+
+	s.hub.BroadcastToUser(userID, ws.Event{
+		Op:   ws.OpDMChannelCreate,
+		Data: result,
+	})
+
+	return result, nil
+}
+
+func (s *dmService) ListChannels(ctx context.Context, userID string) ([]models.DMChannelWithUser, error) {
+	channels, err := s.dmRepo.ListChannels(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range channels {
+		if channels[i].OtherUser != nil {
+			channels[i].OtherUser.AvatarURL = s.urlSigner.SignURLPtr(channels[i].OtherUser.AvatarURL)
+		}
+	}
+	return channels, nil
+}
+
+// MarkRead records that the user has read this conversation up to messageID (empty means
+// all of it), then tells their other devices so the badge and any delivered notification
+// clear there too. Reading on the desktop is what should silence the phone.
+//
+// The count is read back from the database rather than assumed to be zero: a message can
+// arrive between the client choosing a watermark and this write landing, and reporting an
+// optimistic zero would hide it.
+func (s *dmService) MarkRead(ctx context.Context, userID, channelID, messageID string) (int, error) {
+	if _, err := s.verifyChannelMembership(ctx, userID, channelID); err != nil {
+		return 0, err
+	}
+
+	// No message named: the client is clearing a conversation it hasn't loaded.
+	var moved bool
+	var err error
+	if messageID == "" {
+		moved, err = s.dmRepo.MarkReadLatest(ctx, userID, channelID)
+	} else {
+		moved, err = s.dmRepo.MarkRead(ctx, userID, channelID, messageID)
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	unread, err := s.dmRepo.CountUnread(ctx, userID, channelID)
+	if err != nil {
+		return 0, err
+	}
+
+	// Nothing moved — the conversation was already read this far. Say so and stop: waking
+	// every device of the user, and pushing to their phone, for a no-op is how re-opening a
+	// read DM turns into a burst of FCM traffic.
+	if !moved {
+		return unread, nil
+	}
+
+	// Only this user's sessions — the other participant's unread is their own business.
+	s.hub.BroadcastToUser(userID, ws.Event{
+		Op: ws.OpDMRead,
+		Data: map[string]any{
+			"dm_channel_id": channelID,
+			"unread_count":  unread,
+		},
+	})
+
+	// Devices with no live socket keep showing the notification until they are opened;
+	// a data push retracts it there. Only worth sending once nothing is left unread.
+	if unread == 0 && s.pushNotifier != nil {
+		s.pushNotifier.NotifyDMRead(userID, channelID)
+	}
+
+	return unread, nil
+}
+
+// MarkDelivered records how far the user's app has received the conversation. A no-op report (an
+// older message, a repeat from a second device) tells nobody anything.
+func (s *dmService) MarkDelivered(ctx context.Context, userID, channelID, messageID string) error {
+	channel, err := s.verifyChannelMembership(ctx, userID, channelID)
+	if err != nil {
+		return err
+	}
+	moved, err := s.dmRepo.MarkDelivered(ctx, userID, channelID, messageID)
+	if err != nil {
+		return err
+	}
+	if !moved {
+		return nil
+	}
+	return s.notifyDelivery(ctx, channel, userID)
+}
+
+// MaxDeliveryBatch bounds one catch-up report; a user with more conversations needing it sends
+// the rest on the next connect.
+const MaxDeliveryBatch = 100
+
+func (s *dmService) MarkDeliveredLatest(ctx context.Context, userID string, channelIDs []string) error {
+	if len(channelIDs) > MaxDeliveryBatch {
+		channelIDs = channelIDs[:MaxDeliveryBatch]
+	}
+	for _, channelID := range channelIDs {
+		channel, err := s.verifyChannelMembership(ctx, userID, channelID)
+		if errors.Is(err, pkg.ErrForbidden) || errors.Is(err, pkg.ErrNotFound) {
+			continue // gone or never theirs: nothing to report, and nothing to tell them about it
+		}
+		if err != nil {
+			return err
+		}
+		moved, err := s.dmRepo.MarkDeliveredLatest(ctx, userID, channelID)
+		if err != nil {
+			return err
+		}
+		if moved {
+			if err := s.notifyDelivery(ctx, channel, userID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// notifyDelivery sends the other participant how far receiverID has received the conversation —
+// read back, so two reports racing each other cannot leave the sender on the older one.
+func (s *dmService) notifyDelivery(ctx context.Context, channel *models.DMChannel, receiverID string) error {
+	senderID := channel.User1ID
+	if senderID == receiverID {
+		senderID = channel.User2ID
+	}
+	if senderID == receiverID {
+		return nil // a conversation with oneself has nobody waiting on a tick
+	}
+	mark, err := s.dmRepo.DeliveryMark(ctx, receiverID, channel.ID)
+	if err != nil {
+		return err
+	}
+	if mark == nil {
+		return nil
+	}
+	s.hub.BroadcastToUser(senderID, ws.Event{
+		Op: ws.OpDMDelivered,
+		Data: map[string]any{
+			"dm_channel_id": channel.ID,
+			"message_id":    mark.MessageID,
+			"created_at":    mark.CreatedAt,
+		},
+	})
+	return nil
+}

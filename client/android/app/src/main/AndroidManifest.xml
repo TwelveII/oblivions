@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme">
+
+        <activity
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation|density"
+            android:name=".MainActivity"
+            android:label="@string/title_activity_main"
+            android:theme="@style/AppTheme.NoActionBarLaunch"
+            android:launchMode="singleTask"
+            android:exported="true"
+            android:windowSoftInputMode="adjustNothing">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- App Links: only the paths the app can actually render are claimed. The landing
+                 page, login and the Play-policy pages (/privacy, /delete-account) must stay in
+                 the browser — that is where someone without the app has to land.
+                 autoVerify makes Android fetch https://mqvi.net/.well-known/assetlinks.json at
+                 install time; a missing or mismatched statement silently leaves links in the
+                 browser. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="mqvi.net" />
+                <data android:pathPrefix="/invite/" />
+                <data android:path="/channels" />
+                <data android:pathPrefix="/channels/" />
+            </intent-filter>
+
+        </activity>
+
+        <!-- Foreground service for background voice calls (mic only; screen share
+             runs its own MediaProjection service inside the LiveKit SDK) -->
+        <service
+            android:name=".VoiceCallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+
+        <!-- Incoming-call push: replace the Capacitor FCM service with our subclass so
+             call data messages render a full-screen-intent notification; all other
+             messages (DMs, token refresh) delegate to the Capacitor base via super. -->
+        <service
+            android:name="com.capacitorjs.plugins.pushnotifications.MessagingService"
+            tools:node="remove" />
+        <service
+            android:name=".MqviMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths"></meta-data>
+        </provider>
+    </application>
+
+    <!-- Permissions -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Voice/video call permissions -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- Background audio — keep the voice call alive when app is backgrounded -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Screen share via MediaProjection (Android 14+ requires foreground service type) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <!-- Notifications for foreground service and calls -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Full-screen incoming-call notification (auto-granted for CATEGORY_CALL on Android 14+) -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+</manifest>

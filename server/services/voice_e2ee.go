@@ -1,0 +1,73 @@
+// Package services — voice room E2EE passphrase management.
+// SFrame passphrases are stored in-memory only and cleaned up when rooms empty
+// out so a later session cannot decrypt recorded traffic (forward secrecy).
+package services
+
+import (
+	cryptorand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"log"
+	"strings"
+)
+
+// getOrCreateRoomPassphrase returns or creates a per-room E2EE passphrase.
+// 32 bytes crypto/rand -> base64. All participants in the room share the same passphrase.
+func (s *voiceService) getOrCreateRoomPassphrase(roomName string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if passphrase, ok := s.roomPassphrases[roomName]; ok {
+		return passphrase, nil
+	}
+
+	raw := make([]byte, 32)
+	if _, err := cryptorand.Read(raw); err != nil {
+		return "", fmt.Errorf("crypto/rand failed: %w", err)
+	}
+	passphrase := base64.RawURLEncoding.EncodeToString(raw)
+
+	s.roomPassphrases[roomName] = passphrase
+	log.Printf("[voice] created E2EE passphrase for room %s", roomName)
+	return passphrase, nil
+}
+
+// cleanupRoomPassphraseIfEmpty deletes the passphrase when a room becomes empty (forward secrecy),
+// and releases the channel's LiveKit instance binding at the same moment.
+//
+// The two share this one emptiness check on purpose: they are the same lifetime. A passphrase that
+// outlived the room would break forward secrecy; a binding that outlived it would pin the next
+// session to an instance chosen for people who have all left.
+//
+// Returns the LiveKit instance the channel was released from, or "" if the channel is still
+// occupied or was never bound. Callers that follow up with an SFU teardown must pass it along —
+// after the release nothing else knows which instance the room was on.
+//
+// MUST be called under mu.Lock (caller holds lock).
+func (s *voiceService) cleanupRoomPassphraseIfEmpty(channelID string) string {
+	for _, state := range s.states {
+		if state.ChannelID == channelID {
+			return ""
+		}
+	}
+	// Someone holds a token for this channel and is still completing the LiveKit handshake. They are
+	// not in s.states yet, so without this the last person leaving would release the binding under
+	// them — and the joiner who follows would pick again, open a room of the same name on another
+	// SFU, and hear nobody. Nothing would error.
+	if s.hasPendingJoinLocked(channelID) {
+		return ""
+	}
+
+	released := s.releaseChannelInstanceLocked(channelID)
+
+	// Room empty — clean up all matching room names (format: "{serverID}:{channelID}")
+	suffix := ":" + channelID
+	for roomName := range s.roomPassphrases {
+		if strings.HasSuffix(roomName, suffix) {
+			delete(s.roomPassphrases, roomName)
+			log.Printf("[voice] cleaned up E2EE passphrase for room %s", roomName)
+		}
+	}
+
+	return released
+}

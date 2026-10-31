@@ -1,0 +1,1132 @@
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/akinalp/mqvi/database"
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
+)
+
+type sqliteDMRepo struct {
+	db database.TxQuerier
+}
+
+func NewSQLiteDMRepo(db database.TxQuerier) DMRepository {
+	return &sqliteDMRepo{db: db}
+}
+
+// ─── Channel Operations ───
+
+// GetChannelByUsers returns the DM channel between two users.
+// user1ID and user2ID must be pre-sorted (enforced by service layer).
+func (r *sqliteDMRepo) GetChannelByUsers(ctx context.Context, user1ID, user2ID string) (*models.DMChannel, error) {
+	var ch models.DMChannel
+	var lastMsgAt sql.NullTime
+	var initiatedBy sql.NullString
+	err := r.db.QueryRowContext(ctx,
+		"SELECT id, user1_id, user2_id, e2ee_enabled, status, initiated_by, created_at, last_message_at FROM dm_channels WHERE user1_id = ? AND user2_id = ?",
+		user1ID, user2ID,
+	).Scan(&ch.ID, &ch.User1ID, &ch.User2ID, &ch.E2EEEnabled, &ch.Status, &initiatedBy, &ch.CreatedAt, &lastMsgAt)
+
+	if err == sql.ErrNoRows {
+		return nil, nil // no channel exists
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get DM channel: %w", err)
+	}
+	if lastMsgAt.Valid {
+		ch.LastMessageAt = &lastMsgAt.Time
+	}
+	if initiatedBy.Valid {
+		ch.InitiatedBy = &initiatedBy.String
+	}
+	return &ch, nil
+}
+
+func (r *sqliteDMRepo) GetChannelByID(ctx context.Context, id string) (*models.DMChannel, error) {
+	var ch models.DMChannel
+	var lastMsgAt sql.NullTime
+	var initiatedBy sql.NullString
+	err := r.db.QueryRowContext(ctx,
+		"SELECT id, user1_id, user2_id, e2ee_enabled, status, initiated_by, created_at, last_message_at FROM dm_channels WHERE id = ?",
+		id,
+	).Scan(&ch.ID, &ch.User1ID, &ch.User2ID, &ch.E2EEEnabled, &ch.Status, &initiatedBy, &ch.CreatedAt, &lastMsgAt)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("%w: DM channel not found", pkg.ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get DM channel: %w", err)
+	}
+	if lastMsgAt.Valid {
+		ch.LastMessageAt = &lastMsgAt.Time
+	}
+	if initiatedBy.Valid {
+		ch.InitiatedBy = &initiatedBy.String
+	}
+	return &ch, nil
+}
+
+// IsChannelMuted reports whether the user has an active mute (muted_until in the
+// future) on the DM channel. Used to suppress push notifications. No settings row
+// => not muted.
+func (r *sqliteDMRepo) IsChannelMuted(ctx context.Context, userID, channelID string) (bool, error) {
+	var muted int
+	err := r.db.QueryRowContext(ctx, `
+		SELECT CASE WHEN muted_until IS NOT NULL AND muted_until > datetime('now') THEN 1 ELSE 0 END
+		FROM user_dm_settings
+		WHERE user_id = ? AND dm_channel_id = ?`, userID, channelID).Scan(&muted)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to check DM mute: %w", err)
+	}
+	return muted == 1, nil
+}
+
+// DM messages are ordered by (created_at, rowid), never by created_at alone.
+//
+// created_at comes from CURRENT_TIMESTAMP — WHOLE SECONDS. Two messages sent in the same second
+// are byte-identical on it, and a strict `>` swallows all but the first: it is never counted as
+// unread, no badge appears, and since the count reads 0 the server RETRACTS its push. rowid is
+// assigned in insert order, so it breaks the tie the way a human would. dm_messages.id is random
+// hex and must NOT be used — ordering by it shuffles same-second messages on screen.
+//
+// This order is shared by display, pagination, counting and the watermark. They must not
+// diverge: marking read "up to the last message shown" is only sound if "last shown" and
+// "last read" mean the same thing. Change one, change all.
+//
+// Rowid stability is already load-bearing here: dm_messages_fts is an external-content FTS5
+// table with content_rowid='rowid', and DM search joins fts.rowid = m.rowid. If a VACUUM ever
+// renumbered these, search would return the wrong messages long before unread counts drifted.
+//
+// Known residual: SQLite reuses a rowid when the row holding the table-wide maximum is deleted.
+// A message that reused a DELETED watermark's rowid within the same second would read as
+// already-read. It needs the newest message in the entire table deleted plus a reply landing in
+// that same second. Closing it fully needs a monotonic seq column on dm_messages.
+//
+// The watermark is read as a correlated scalar so it is a constant when dm_messages is seeked.
+// Joined, the planner puts dm_messages in the outer loop and `created_at >= ...` cannot
+// constrain the index — it walks every message in the channel instead of seeking to the unread
+// tail. Both call sites use this one predicate; they must not diverge.
+const dmUnreadPredicate = `
+	m.user_id != ?
+	AND m.message_type != 'call'
+	AND m.created_at >= COALESCE((SELECT last_read_at FROM dm_reads
+	                               WHERE user_id = ? AND dm_channel_id = m.dm_channel_id), '')
+	AND (m.created_at, m.rowid) >
+	    (COALESCE((SELECT last_read_at  FROM dm_reads
+	                WHERE user_id = ? AND dm_channel_id = m.dm_channel_id), ''),
+	     COALESCE((SELECT last_read_seq FROM dm_reads
+	                WHERE user_id = ? AND dm_channel_id = m.dm_channel_id), 0))`
+
+// MarkRead moves the user's watermark up to the given message, in one statement so two
+// devices marking read at once cannot interleave into a lost update. The WHERE on the
+// upsert is what keeps it monotonic: a mark for an older message than the one already
+// recorded changes nothing, rather than un-reading everything after it.
+//
+// The SELECT source also does the validation — a message id that belongs to another
+// channel (or to nothing) produces no row, so there is nothing to insert.
+//
+// Returns whether the watermark actually moved. A no-op mark must not broadcast or push:
+// merely clicking through the sidebar would otherwise wake every device of the user.
+func (r *sqliteDMRepo) MarkRead(ctx context.Context, userID, channelID, messageID string) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		INSERT INTO dm_reads (user_id, dm_channel_id, last_read_message_id, last_read_at, last_read_seq)
+		SELECT ?, ?, m.id, m.created_at, m.rowid
+		FROM dm_messages m
+		WHERE m.id = ? AND m.dm_channel_id = ?
+		ON CONFLICT(user_id, dm_channel_id) DO UPDATE SET
+			last_read_message_id = excluded.last_read_message_id,
+			last_read_at = excluded.last_read_at,
+			last_read_seq = excluded.last_read_seq
+		WHERE (excluded.last_read_at, excluded.last_read_seq)
+		    > (dm_reads.last_read_at, dm_reads.last_read_seq)`,
+		userID, channelID, messageID, channelID)
+	if err != nil {
+		return false, fmt.Errorf("failed to mark DM read: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to mark DM read: %w", err)
+	}
+	return n > 0, nil
+}
+
+// MarkReadLatest points the watermark at the newest message in the channel. Same monotonic
+// guard as MarkRead, same "did it move" contract.
+func (r *sqliteDMRepo) MarkReadLatest(ctx context.Context, userID, channelID string) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		INSERT INTO dm_reads (user_id, dm_channel_id, last_read_message_id, last_read_at, last_read_seq)
+		SELECT ?, ?, m.id, m.created_at, m.rowid
+		FROM dm_messages m
+		WHERE m.dm_channel_id = ?
+		ORDER BY m.created_at DESC, m.rowid DESC
+		LIMIT 1
+		ON CONFLICT(user_id, dm_channel_id) DO UPDATE SET
+			last_read_message_id = excluded.last_read_message_id,
+			last_read_at = excluded.last_read_at,
+			last_read_seq = excluded.last_read_seq
+		WHERE (excluded.last_read_at, excluded.last_read_seq)
+		    > (dm_reads.last_read_at, dm_reads.last_read_seq)`,
+		userID, channelID, channelID)
+	if err != nil {
+		return false, fmt.Errorf("failed to mark DM fully read: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to mark DM fully read: %w", err)
+	}
+	return n > 0, nil
+}
+
+// CountUnread counts what the other participant has sent since the user's watermark.
+// Call logs are not messages — a finished call must not leave a badge behind.
+//
+// One statement, not a read-then-count: split across two, the two halves run on separate pooled
+// connections and therefore separate snapshots, so a mark-read landing from another device in
+// between makes the count report messages the user has already read.
+func (r *sqliteDMRepo) CountUnread(ctx context.Context, userID, channelID string) (int, error) {
+	var count int
+	err := r.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM dm_messages m
+		WHERE m.dm_channel_id = ?
+		  AND `+dmUnreadPredicate,
+		channelID, userID, userID, userID, userID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count unread DMs: %w", err)
+	}
+	return count, nil
+}
+
+// HasRead reports whether the user's watermark has passed this message.
+func (r *sqliteDMRepo) HasRead(ctx context.Context, userID, channelID, messageID string) (bool, error) {
+	var read bool
+	err := r.db.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM dm_messages m
+			JOIN dm_reads dr ON dr.user_id = ? AND dr.dm_channel_id = m.dm_channel_id
+			WHERE m.id = ? AND m.dm_channel_id = ?
+			  AND (m.created_at, m.rowid) <= (dr.last_read_at, dr.last_read_seq)
+		)`, userID, messageID, channelID).Scan(&read)
+	if err != nil {
+		return false, fmt.Errorf("failed to check DM read state: %w", err)
+	}
+	return read, nil
+}
+
+// MarkDelivered moves the user's delivery watermark up to the given message. Same statement shape
+// as MarkRead, for the same reasons: one statement so two devices cannot interleave, the upsert's
+// WHERE keeps it monotonic, and the SELECT drops a message that is not in this channel.
+func (r *sqliteDMRepo) MarkDelivered(ctx context.Context, userID, channelID, messageID string) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		INSERT INTO dm_deliveries (user_id, dm_channel_id, last_delivered_message_id, last_delivered_at, last_delivered_seq)
+		SELECT ?, ?, m.id, m.created_at, m.rowid
+		FROM dm_messages m
+		WHERE m.id = ? AND m.dm_channel_id = ?
+		ON CONFLICT(user_id, dm_channel_id) DO UPDATE SET
+			last_delivered_message_id = excluded.last_delivered_message_id,
+			last_delivered_at = excluded.last_delivered_at,
+			last_delivered_seq = excluded.last_delivered_seq
+		WHERE (excluded.last_delivered_at, excluded.last_delivered_seq)
+		    > (dm_deliveries.last_delivered_at, dm_deliveries.last_delivered_seq)`,
+		userID, channelID, messageID, channelID)
+	if err != nil {
+		return false, fmt.Errorf("failed to mark DM delivered: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to mark DM delivered: %w", err)
+	}
+	return n > 0, nil
+}
+
+// MarkDeliveredLatest points the delivery watermark at the newest message in the conversation, with
+// MarkDelivered's monotonic guard.
+func (r *sqliteDMRepo) MarkDeliveredLatest(ctx context.Context, userID, channelID string) (bool, error) {
+	res, err := r.db.ExecContext(ctx, `
+		INSERT INTO dm_deliveries (user_id, dm_channel_id, last_delivered_message_id, last_delivered_at, last_delivered_seq)
+		SELECT ?, ?, m.id, m.created_at, m.rowid
+		FROM dm_messages m
+		WHERE m.dm_channel_id = ?
+		ORDER BY m.created_at DESC, m.rowid DESC
+		LIMIT 1
+		ON CONFLICT(user_id, dm_channel_id) DO UPDATE SET
+			last_delivered_message_id = excluded.last_delivered_message_id,
+			last_delivered_at = excluded.last_delivered_at,
+			last_delivered_seq = excluded.last_delivered_seq
+		WHERE (excluded.last_delivered_at, excluded.last_delivered_seq)
+		    > (dm_deliveries.last_delivered_at, dm_deliveries.last_delivered_seq)`,
+		userID, channelID, channelID)
+	if err != nil {
+		return false, fmt.Errorf("failed to mark DM delivered: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to mark DM delivered: %w", err)
+	}
+	return n > 0, nil
+}
+
+// DeliveryMark returns the user's delivery watermark.
+func (r *sqliteDMRepo) DeliveryMark(ctx context.Context, userID, channelID string) (*models.DMDeliveryMark, error) {
+	var messageID sql.NullString
+	var at time.Time
+	err := r.db.QueryRowContext(ctx, `
+		SELECT last_delivered_message_id, last_delivered_at
+		FROM dm_deliveries WHERE user_id = ? AND dm_channel_id = ?`, userID, channelID).Scan(&messageID, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read DM delivery mark: %w", err)
+	}
+	return &models.DMDeliveryMark{MessageID: messageID.String, CreatedAt: at}, nil
+}
+
+// DeliveredMessageIDs returns which of messageIDs sit at or before the user's delivery watermark.
+// Compared on (created_at, rowid) in SQL, where same-second messages are still ordered.
+func (r *sqliteDMRepo) DeliveredMessageIDs(ctx context.Context, userID, channelID string, messageIDs []string) (map[string]bool, error) {
+	delivered := make(map[string]bool)
+	if len(messageIDs) == 0 {
+		return delivered, nil
+	}
+
+	placeholders := strings.Repeat("?,", len(messageIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+
+	query := fmt.Sprintf(`
+		SELECT m.id FROM dm_messages m
+		WHERE m.dm_channel_id = ? AND m.id IN (%s)
+		  AND (m.created_at, m.rowid) <= (SELECT last_delivered_at, last_delivered_seq FROM dm_deliveries
+		                                   WHERE user_id = ? AND dm_channel_id = ?)`, placeholders)
+
+	args := make([]any, 0, len(messageIDs)+3)
+	args = append(args, channelID)
+	for _, id := range messageIDs {
+		args = append(args, id)
+	}
+	args = append(args, userID, channelID)
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read DM delivery state: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan DM delivery state: %w", err)
+		}
+		delivered[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read DM delivery state: %w", err)
+	}
+	return delivered, nil
+}
+
+// ListChannels returns a user's DM channels with the other user's info.
+// Joins user_dm_settings to filter hidden channels and include pin/mute state.
+// Sorted: pinned first (by activity), then unpinned by activity.
+func (r *sqliteDMRepo) ListChannels(ctx context.Context, userID string) ([]models.DMChannelWithUser, error) {
+	query := `
+		SELECT dc.id, dc.e2ee_enabled, dc.status, dc.initiated_by, dc.created_at, dc.last_message_at,
+			u.id, u.username, u.display_name, u.avatar_url, u.status, u.deleted_at, u.is_hard_deleted,
+			COALESCE(ds.is_pinned, 0),
+			CASE WHEN ds.muted_until IS NOT NULL AND ds.muted_until > datetime('now') THEN 1 ELSE 0 END,
+			(SELECT COUNT(*) FROM dm_messages m
+			  WHERE m.dm_channel_id = dc.id
+			    AND ` + dmUnreadPredicate + `)
+		FROM dm_channels dc
+		JOIN users u ON u.id = CASE
+			WHEN dc.user1_id = ? THEN dc.user2_id
+			ELSE dc.user1_id
+		END
+		LEFT JOIN user_dm_settings ds ON ds.user_id = ? AND ds.dm_channel_id = dc.id
+		WHERE (dc.user1_id = ? OR dc.user2_id = ?)
+		  AND COALESCE(ds.is_hidden, 0) = 0
+		ORDER BY COALESCE(ds.is_pinned, 0) DESC,
+		         COALESCE(dc.last_message_at, dc.created_at) DESC`
+
+	// 4 for the unread predicate (it reads the watermark itself), then the joins and the filter.
+	rows, err := r.db.QueryContext(ctx, query,
+		userID, userID, userID, userID, // dmUnreadPredicate
+		userID, // other-user CASE
+		userID, // user_dm_settings
+		userID, userID) // membership filter
+	if err != nil {
+		return nil, fmt.Errorf("failed to list DM channels: %w", err)
+	}
+	defer rows.Close()
+
+	var channels []models.DMChannelWithUser
+	for rows.Next() {
+		var ch models.DMChannelWithUser
+		var user models.User
+		var displayName, avatarURL, initiatedBy sql.NullString
+		var lastMsgAt sql.NullTime
+		var isPinned, isMuted int
+
+		if err := rows.Scan(
+			&ch.ID, &ch.E2EEEnabled, &ch.Status, &initiatedBy, &ch.CreatedAt, &lastMsgAt,
+			&user.ID, &user.Username, &displayName, &avatarURL, &user.Status, &user.DeletedAt, &user.IsHardDeleted,
+			&isPinned, &isMuted, &ch.UnreadCount,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan DM channel: %w", err)
+		}
+
+		if lastMsgAt.Valid {
+			ch.LastMessageAt = &lastMsgAt.Time
+		}
+		if displayName.Valid {
+			user.DisplayName = &displayName.String
+		}
+		if avatarURL.Valid {
+			user.AvatarURL = &avatarURL.String
+		}
+		if initiatedBy.Valid {
+			ch.InitiatedBy = &initiatedBy.String
+		}
+
+		ch.OtherUser = &user
+		ch.IsPinned = isPinned == 1
+		ch.IsMuted = isMuted == 1
+		channels = append(channels, ch)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating DM channels: %w", err)
+	}
+
+	if channels == nil {
+		channels = []models.DMChannelWithUser{}
+	}
+	return channels, nil
+}
+
+func (r *sqliteDMRepo) CreateChannel(ctx context.Context, channel *models.DMChannel) error {
+	var lastMsgAt sql.NullTime
+	err := r.db.QueryRowContext(ctx,
+		"INSERT INTO dm_channels (user1_id, user2_id, status, initiated_by) VALUES (?, ?, ?, ?) RETURNING id, created_at, last_message_at",
+		channel.User1ID, channel.User2ID, channel.Status, channel.InitiatedBy,
+	).Scan(&channel.ID, &channel.CreatedAt, &lastMsgAt)
+
+	if err != nil {
+		return fmt.Errorf("failed to create DM channel: %w", err)
+	}
+	if lastMsgAt.Valid {
+		channel.LastMessageAt = &lastMsgAt.Time
+	}
+	return nil
+}
+
+func (r *sqliteDMRepo) UpdateChannelStatus(ctx context.Context, channelID, status string) error {
+	_, err := r.db.ExecContext(ctx,
+		"UPDATE dm_channels SET status = ? WHERE id = ?",
+		status, channelID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update DM channel status: %w", err)
+	}
+	return nil
+}
+
+func (r *sqliteDMRepo) SetInitiatedBy(ctx context.Context, channelID, userID string) error {
+	_, err := r.db.ExecContext(ctx,
+		"UPDATE dm_channels SET initiated_by = ? WHERE id = ?",
+		userID, channelID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to set initiated_by: %w", err)
+	}
+	return nil
+}
+
+func (r *sqliteDMRepo) CountMessagesBySender(ctx context.Context, channelID, userID string) (int, error) {
+	var count int
+	err := r.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM dm_messages WHERE dm_channel_id = ? AND user_id = ?",
+		channelID, userID,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count messages: %w", err)
+	}
+	return count, nil
+}
+
+func (r *sqliteDMRepo) DeleteChannel(ctx context.Context, channelID string) error {
+	_, err := r.db.ExecContext(ctx, "DELETE FROM dm_messages WHERE dm_channel_id = ?", channelID)
+	if err != nil {
+		return fmt.Errorf("failed to delete DM messages: %w", err)
+	}
+	_, err = r.db.ExecContext(ctx, "DELETE FROM dm_channels WHERE id = ?", channelID)
+	if err != nil {
+		return fmt.Errorf("failed to delete DM channel: %w", err)
+	}
+	return nil
+}
+
+func (r *sqliteDMRepo) SetE2EEEnabled(ctx context.Context, channelID string, enabled bool) error {
+	result, err := r.db.ExecContext(ctx,
+		"UPDATE dm_channels SET e2ee_enabled = ? WHERE id = ?",
+		enabled, channelID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update DM E2EE: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if affected == 0 {
+		return pkg.ErrNotFound
+	}
+	return nil
+}
+
+// ─── Message Operations ───
+
+// GetMessages returns DM messages with cursor-based pagination (DESC order).
+// Reply references loaded via LEFT JOIN, same pattern as channel messages.
+func (r *sqliteDMRepo) GetMessages(ctx context.Context, channelID string, beforeID string, limit int) ([]models.DMMessage, error) {
+	var query string
+	var args []any
+
+	if beforeID == "" {
+		query = `
+			SELECT m.id, m.dm_channel_id, m.user_id, m.content, m.edited_at, m.created_at,
+			       m.reply_to_id, m.is_pinned,
+			       m.encryption_version, m.ciphertext, m.sender_device_id, m.e2ee_metadata, m.message_type, m.call_meta,
+			       u.id, u.username, u.display_name, u.avatar_url, u.status, u.deleted_at, u.is_hard_deleted,
+			       rm.id, rm.content,
+			       ru.id, ru.username, ru.display_name, ru.avatar_url, ru.deleted_at, ru.is_hard_deleted
+			FROM dm_messages m
+			LEFT JOIN users u ON m.user_id = u.id
+			LEFT JOIN dm_messages rm ON m.reply_to_id = rm.id
+			LEFT JOIN users ru ON rm.user_id = ru.id
+			WHERE m.dm_channel_id = ?
+			ORDER BY m.created_at DESC, m.rowid DESC
+			LIMIT ?`
+		args = []any{channelID, limit}
+	} else {
+		query = `
+			SELECT m.id, m.dm_channel_id, m.user_id, m.content, m.edited_at, m.created_at,
+			       m.reply_to_id, m.is_pinned,
+			       m.encryption_version, m.ciphertext, m.sender_device_id, m.e2ee_metadata, m.message_type, m.call_meta,
+			       u.id, u.username, u.display_name, u.avatar_url, u.status, u.deleted_at, u.is_hard_deleted,
+			       rm.id, rm.content,
+			       ru.id, ru.username, ru.display_name, ru.avatar_url, ru.deleted_at, ru.is_hard_deleted
+			FROM dm_messages m
+			LEFT JOIN users u ON m.user_id = u.id
+			LEFT JOIN dm_messages rm ON m.reply_to_id = rm.id
+			LEFT JOIN users ru ON rm.user_id = ru.id
+			WHERE m.dm_channel_id = ?
+			  AND (m.created_at, m.rowid) <
+			      (SELECT created_at, rowid FROM dm_messages WHERE id = ?)
+			ORDER BY m.created_at DESC, m.rowid DESC
+			LIMIT ?`
+		args = []any{channelID, beforeID, limit}
+	}
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get DM messages: %w", err)
+	}
+	defer rows.Close()
+
+	var messages []models.DMMessage
+	for rows.Next() {
+		msg, err := scanDMMessageRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, *msg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating DM messages: %w", err)
+	}
+
+	if messages == nil {
+		messages = []models.DMMessage{}
+	}
+	return messages, nil
+}
+
+func (r *sqliteDMRepo) GetMessageByID(ctx context.Context, id string) (*models.DMMessage, error) {
+	query := `
+		SELECT m.id, m.dm_channel_id, m.user_id, m.content, m.edited_at, m.created_at,
+		       m.reply_to_id, m.is_pinned,
+		       m.encryption_version, m.ciphertext, m.sender_device_id, m.e2ee_metadata, m.message_type, m.call_meta,
+		       u.id, u.username, u.display_name, u.avatar_url, u.status, u.deleted_at, u.is_hard_deleted,
+		       rm.id, rm.content,
+		       ru.id, ru.username, ru.display_name, ru.avatar_url, ru.deleted_at, ru.is_hard_deleted
+		FROM dm_messages m
+		LEFT JOIN users u ON m.user_id = u.id
+		LEFT JOIN dm_messages rm ON m.reply_to_id = rm.id
+		LEFT JOIN users ru ON rm.user_id = ru.id
+		WHERE m.id = ?`
+
+	var msg models.DMMessage
+	var callMetaRaw sql.NullString
+	var author models.User
+	var authorID sql.NullString
+	var content sql.NullString
+	var editedAt sql.NullTime
+	var displayName, avatarURL sql.NullString
+	var isPinned int
+
+	var refMsgID, refMsgContent sql.NullString
+	var refAuthorID, refAuthorUsername, refAuthorDisplayName, refAuthorAvatarURL sql.NullString
+	var refAuthorDeletedAt sql.NullTime
+	var refAuthorIsHardDeleted sql.NullBool
+
+	err := r.db.QueryRowContext(ctx, query, id).Scan(
+		&msg.ID, &msg.DMChannelID, &msg.UserID, &content, &editedAt, &msg.CreatedAt,
+		&msg.ReplyToID, &isPinned,
+		&msg.EncryptionVersion, &msg.Ciphertext, &msg.SenderDeviceID, &msg.E2EEMetadata, &msg.MessageType, &callMetaRaw,
+		&authorID, &author.Username, &displayName, &avatarURL, &author.Status, &author.DeletedAt, &author.IsHardDeleted,
+		&refMsgID, &refMsgContent,
+		&refAuthorID, &refAuthorUsername, &refAuthorDisplayName, &refAuthorAvatarURL, &refAuthorDeletedAt, &refAuthorIsHardDeleted,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("%w: DM message not found", pkg.ErrNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get DM message: %w", err)
+	}
+
+	msg.CallMeta = parseCallMeta(callMetaRaw)
+	msg.IsPinned = isPinned == 1
+	if content.Valid {
+		msg.Content = &content.String
+	}
+	if editedAt.Valid {
+		msg.EditedAt = &editedAt.Time
+	}
+	if authorID.Valid {
+		author.ID = authorID.String
+		if displayName.Valid {
+			author.DisplayName = &displayName.String
+		}
+		if avatarURL.Valid {
+			author.AvatarURL = &avatarURL.String
+		}
+		msg.Author = &author
+	}
+
+	msg.ReferencedMessage = buildMessageReference(
+		msg.ReplyToID, refMsgID, refMsgContent,
+		refAuthorID, refAuthorUsername, refAuthorDisplayName, refAuthorAvatarURL,
+		refAuthorDeletedAt, refAuthorIsHardDeleted,
+	)
+
+	return &msg, nil
+}
+
+func (r *sqliteDMRepo) GetMessageByAuthorNonce(ctx context.Context, userID, nonce string) (string, string, error) {
+	var id, channelID string
+	err := r.db.QueryRowContext(ctx,
+		`SELECT id, dm_channel_id FROM dm_messages WHERE user_id = ? AND client_nonce = ?`, userID, nonce,
+	).Scan(&id, &channelID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", pkg.ErrNotFound
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("failed to look up DM message by client nonce: %w", err)
+	}
+	return id, channelID, nil
+}
+
+func (r *sqliteDMRepo) CreateMessage(ctx context.Context, msg *models.DMMessage) error {
+	// Content can be nil (file-only message)
+	var contentPtr *string
+	if msg.Content != nil && *msg.Content != "" {
+		contentPtr = msg.Content
+	}
+
+	messageType := msg.MessageType
+	if messageType == "" {
+		messageType = models.MessageTypeText
+	}
+	var callMetaJSON *string
+	if msg.CallMeta != nil {
+		if b, mErr := json.Marshal(msg.CallMeta); mErr == nil {
+			s := string(b)
+			callMetaJSON = &s
+		}
+	}
+
+	err := r.db.QueryRowContext(ctx,
+		`INSERT INTO dm_messages (dm_channel_id, user_id, content, reply_to_id,
+			encryption_version, ciphertext, sender_device_id, e2ee_metadata, message_type, call_meta, client_nonce)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
+		msg.DMChannelID, msg.UserID, contentPtr, msg.ReplyToID,
+		msg.EncryptionVersion, msg.Ciphertext, msg.SenderDeviceID, msg.E2EEMetadata, messageType, callMetaJSON, msg.ClientNonce,
+	).Scan(&msg.ID, &msg.CreatedAt)
+
+	if err != nil {
+		if isClientNonceViolation(err) {
+			return ErrDuplicateClientNonce
+		}
+		return fmt.Errorf("failed to create DM message: %w", err)
+	}
+	msg.MessageType = messageType
+	msg.CreatedAt = msg.CreatedAt.UTC()
+	return nil
+}
+
+// UpdateMessage edits a DM message.
+// E2EE messages update ciphertext; plaintext messages update content.
+func (r *sqliteDMRepo) UpdateMessage(ctx context.Context, id string, req *models.UpdateDMMessageRequest) error {
+	now := time.Now().UTC()
+
+	var result sql.Result
+	var err error
+
+	// Move the row to the edit's version and drop the other representation. Leaving the version
+	// stale let a conversation toggled between plaintext and E2EE end up with content on one side
+	// and a version pointing at the other, so the edit read as if it never happened.
+	if req.EncryptionVersion == 1 {
+		result, err = r.db.ExecContext(ctx,
+			`UPDATE dm_messages
+			 SET encryption_version = 1, ciphertext = ?, sender_device_id = ?, e2ee_metadata = ?,
+			     content = NULL, edited_at = ?
+			 WHERE id = ?`,
+			req.Ciphertext, req.SenderDeviceID, req.E2EEMetadata, now, id,
+		)
+	} else {
+		result, err = r.db.ExecContext(ctx,
+			`UPDATE dm_messages
+			 SET encryption_version = 0, content = ?, ciphertext = NULL, sender_device_id = NULL,
+			     e2ee_metadata = NULL, edited_at = ?
+			 WHERE id = ?`,
+			req.Content, now, id,
+		)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to update DM message: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: DM message not found", pkg.ErrNotFound)
+	}
+	return nil
+}
+
+func (r *sqliteDMRepo) DeleteMessage(ctx context.Context, id string) error {
+	result, err := r.db.ExecContext(ctx, "DELETE FROM dm_messages WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("failed to delete DM message: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: DM message not found", pkg.ErrNotFound)
+	}
+	return nil
+}
+
+// ─── Reaction Operations ───
+
+// ToggleReaction adds or removes a DM reaction.
+// INSERT OR IGNORE -> if rowsAffected == 0 (UNIQUE hit) -> DELETE. Atomic toggle.
+func (r *sqliteDMRepo) ToggleReaction(ctx context.Context, messageID, userID, emoji string) (bool, error) {
+	insertQuery := `
+		INSERT OR IGNORE INTO dm_reactions (id, dm_message_id, user_id, emoji)
+		VALUES (lower(hex(randomblob(8))), ?, ?, ?)`
+
+	result, err := r.db.ExecContext(ctx, insertQuery, messageID, userID, emoji)
+	if err != nil {
+		return false, fmt.Errorf("toggle DM reaction insert: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("toggle DM reaction rows affected: %w", err)
+	}
+
+	if rowsAffected > 0 {
+		return true, nil // added
+	}
+
+	// Already exists -> remove
+	deleteQuery := `DELETE FROM dm_reactions WHERE dm_message_id = ? AND user_id = ? AND emoji = ?`
+	_, err = r.db.ExecContext(ctx, deleteQuery, messageID, userID, emoji)
+	if err != nil {
+		return false, fmt.Errorf("toggle DM reaction delete: %w", err)
+	}
+
+	return false, nil
+}
+
+func (r *sqliteDMRepo) GetReactionsByMessageID(ctx context.Context, messageID string) ([]models.ReactionGroup, error) {
+	query := `
+		SELECT emoji, COUNT(*) as count, GROUP_CONCAT(user_id) as users
+		FROM dm_reactions
+		WHERE dm_message_id = ?
+		GROUP BY emoji
+		ORDER BY MIN(created_at) ASC`
+
+	rows, err := r.db.QueryContext(ctx, query, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("get DM reactions by message: %w", err)
+	}
+	defer rows.Close()
+
+	return scanReactionGroups(rows)
+}
+
+// GetReactionsByMessageIDs batch-loads reactions for multiple DM messages (avoids N+1).
+func (r *sqliteDMRepo) GetReactionsByMessageIDs(ctx context.Context, messageIDs []string) (map[string][]models.ReactionGroup, error) {
+	if len(messageIDs) == 0 {
+		return make(map[string][]models.ReactionGroup), nil
+	}
+
+	placeholders := make([]string, len(messageIDs))
+	args := make([]any, len(messageIDs))
+	for i, id := range messageIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`
+		SELECT dm_message_id, emoji, COUNT(*) as count, GROUP_CONCAT(user_id) as users
+		FROM dm_reactions
+		WHERE dm_message_id IN (%s)
+		GROUP BY dm_message_id, emoji
+		ORDER BY dm_message_id, MIN(created_at) ASC`,
+		strings.Join(placeholders, ","))
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get DM reactions by message ids: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string][]models.ReactionGroup)
+	for rows.Next() {
+		var messageID, emoji, usersStr string
+		var count int
+		if err := rows.Scan(&messageID, &emoji, &count, &usersStr); err != nil {
+			return nil, fmt.Errorf("scan DM reaction group: %w", err)
+		}
+
+		users := strings.Split(usersStr, ",")
+		result[messageID] = append(result[messageID], models.ReactionGroup{
+			Emoji: emoji,
+			Count: count,
+			Users: users,
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate DM reaction rows: %w", err)
+	}
+
+	return result, nil
+}
+
+// ─── Pin Operations ───
+
+func (r *sqliteDMRepo) PinMessage(ctx context.Context, messageID string) error {
+	result, err := r.db.ExecContext(ctx,
+		"UPDATE dm_messages SET is_pinned = 1 WHERE id = ?", messageID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to pin DM message: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: DM message not found", pkg.ErrNotFound)
+	}
+	return nil
+}
+
+func (r *sqliteDMRepo) UnpinMessage(ctx context.Context, messageID string) error {
+	result, err := r.db.ExecContext(ctx,
+		"UPDATE dm_messages SET is_pinned = 0 WHERE id = ?", messageID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to unpin DM message: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: DM message not found", pkg.ErrNotFound)
+	}
+	return nil
+}
+
+func (r *sqliteDMRepo) GetPinnedMessages(ctx context.Context, channelID string) ([]models.DMMessage, error) {
+	query := `
+		SELECT m.id, m.dm_channel_id, m.user_id, m.content, m.edited_at, m.created_at,
+		       m.reply_to_id, m.is_pinned,
+		       m.encryption_version, m.ciphertext, m.sender_device_id, m.e2ee_metadata, m.message_type, m.call_meta,
+		       u.id, u.username, u.display_name, u.avatar_url, u.status, u.deleted_at, u.is_hard_deleted,
+		       rm.id, rm.content,
+		       ru.id, ru.username, ru.display_name, ru.avatar_url, ru.deleted_at, ru.is_hard_deleted
+		FROM dm_messages m
+		LEFT JOIN users u ON m.user_id = u.id
+		LEFT JOIN dm_messages rm ON m.reply_to_id = rm.id
+		LEFT JOIN users ru ON rm.user_id = ru.id
+		WHERE m.dm_channel_id = ? AND m.is_pinned = 1
+		ORDER BY m.created_at DESC`
+
+	rows, err := r.db.QueryContext(ctx, query, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pinned DM messages: %w", err)
+	}
+	defer rows.Close()
+
+	var messages []models.DMMessage
+	for rows.Next() {
+		msg, err := scanDMMessageRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, *msg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating pinned DM messages: %w", err)
+	}
+
+	if messages == nil {
+		messages = []models.DMMessage{}
+	}
+	return messages, nil
+}
+
+// ─── Attachment Operations ───
+
+func (r *sqliteDMRepo) CreateAttachment(ctx context.Context, attachment *models.DMAttachment) error {
+	err := r.db.QueryRowContext(ctx,
+		`INSERT INTO dm_attachments (dm_message_id, filename, file_url, file_size, mime_type, thumb_url, thumb_width, thumb_height, thumb_size)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, created_at`,
+		attachment.DMMessageID, attachment.Filename, attachment.FileURL, attachment.FileSize, attachment.MimeType,
+		attachment.ThumbURL, attachment.ThumbWidth, attachment.ThumbHeight, attachment.ThumbSize,
+	).Scan(&attachment.ID, &attachment.CreatedAt)
+
+	if err != nil {
+		return fmt.Errorf("failed to create DM attachment: %w", err)
+	}
+	return nil
+}
+
+// GetAttachmentsByMessageIDs batch-loads attachments for multiple DM messages (avoids N+1).
+func (r *sqliteDMRepo) GetAttachmentsByMessageIDs(ctx context.Context, messageIDs []string) (map[string][]models.DMAttachment, error) {
+	if len(messageIDs) == 0 {
+		return make(map[string][]models.DMAttachment), nil
+	}
+
+	placeholders := strings.Repeat("?,", len(messageIDs))
+	placeholders = placeholders[:len(placeholders)-1]
+
+	query := fmt.Sprintf(`
+		SELECT id, dm_message_id, filename, file_url, file_size, mime_type, created_at, thumb_url, thumb_width, thumb_height, thumb_size
+		FROM dm_attachments
+		WHERE dm_message_id IN (%s)
+		ORDER BY created_at ASC`, placeholders)
+
+	args := make([]any, len(messageIDs))
+	for i, id := range messageIDs {
+		args[i] = id
+	}
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get DM attachments by message ids: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string][]models.DMAttachment)
+	for rows.Next() {
+		var a models.DMAttachment
+		if err := rows.Scan(
+			&a.ID, &a.DMMessageID, &a.Filename, &a.FileURL, &a.FileSize, &a.MimeType, &a.CreatedAt,
+			&a.ThumbURL, &a.ThumbWidth, &a.ThumbHeight, &a.ThumbSize,
+		); err != nil {
+			return nil, fmt.Errorf("scan DM attachment row: %w", err)
+		}
+		result[a.DMMessageID] = append(result[a.DMMessageID], a)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate DM attachment rows: %w", err)
+	}
+
+	return result, nil
+}
+
+// ─── Search Operations ───
+
+// SearchMessages performs FTS5 full-text search on DM messages.
+// Returns paginated results ranked by BM25, plus total count for pagination.
+func (r *sqliteDMRepo) SearchMessages(ctx context.Context, channelID string, searchQuery string, limit, offset int) ([]models.DMMessage, int, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	safeQuery := sanitizeFTSQuery(searchQuery)
+	if safeQuery == "" {
+		return []models.DMMessage{}, 0, nil
+	}
+
+	// Total count
+	countQuery := `
+		SELECT COUNT(*)
+		FROM dm_messages_fts fts
+		JOIN dm_messages m ON m.rowid = fts.rowid
+		WHERE dm_messages_fts MATCH ? AND m.dm_channel_id = ?`
+
+	var totalCount int
+	if err := r.db.QueryRowContext(ctx, countQuery, safeQuery, channelID).Scan(&totalCount); err != nil {
+		return nil, 0, fmt.Errorf("failed to count DM search results: %w", err)
+	}
+
+	if totalCount == 0 {
+		return []models.DMMessage{}, 0, nil
+	}
+
+	// Paginated results ranked by BM25
+	dataQuery := `
+		SELECT m.id, m.dm_channel_id, m.user_id, m.content, m.edited_at, m.created_at,
+		       m.reply_to_id, m.is_pinned,
+		       m.encryption_version, m.ciphertext, m.sender_device_id, m.e2ee_metadata, m.message_type, m.call_meta,
+		       u.id, u.username, u.display_name, u.avatar_url, u.status, u.deleted_at, u.is_hard_deleted,
+		       rm.id, rm.content,
+		       ru.id, ru.username, ru.display_name, ru.avatar_url, ru.deleted_at, ru.is_hard_deleted
+		FROM dm_messages m
+		JOIN dm_messages_fts fts ON fts.rowid = m.rowid
+		LEFT JOIN users u ON m.user_id = u.id
+		LEFT JOIN dm_messages rm ON m.reply_to_id = rm.id
+		LEFT JOIN users ru ON rm.user_id = ru.id
+		WHERE m.dm_channel_id = ? AND fts.content MATCH ?
+		ORDER BY fts.rank
+		LIMIT ? OFFSET ?`
+
+	rows, err := r.db.QueryContext(ctx, dataQuery, channelID, safeQuery, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to search DM messages: %w", err)
+	}
+	defer rows.Close()
+
+	var messages []models.DMMessage
+	for rows.Next() {
+		msg, err := scanDMMessageRow(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		messages = append(messages, *msg)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating DM search results: %w", err)
+	}
+
+	if messages == nil {
+		messages = []models.DMMessage{}
+	}
+	return messages, totalCount, nil
+}
+
+// ─── Scan Helpers ───
+
+// parseCallMeta unmarshals a nullable call_meta JSON column into *CallMeta.
+// Returns nil for normal (non-call) messages or malformed JSON.
+func parseCallMeta(raw sql.NullString) *models.CallMeta {
+	if !raw.Valid || raw.String == "" {
+		return nil
+	}
+	var cm models.CallMeta
+	if err := json.Unmarshal([]byte(raw.String), &cm); err != nil {
+		return nil
+	}
+	return &cm
+}
+
+// scanDMMessageRow parses a standard DM message query row including author and reply reference.
+func scanDMMessageRow(rows *sql.Rows) (*models.DMMessage, error) {
+	var msg models.DMMessage
+	var callMetaRaw sql.NullString
+	var author models.User
+	var authorID sql.NullString
+	var content sql.NullString
+	var editedAt sql.NullTime
+	var displayName, avatarURL sql.NullString
+	var isPinned int
+
+	var refMsgID, refMsgContent sql.NullString
+	var refAuthorID, refAuthorUsername, refAuthorDisplayName, refAuthorAvatarURL sql.NullString
+	var refAuthorDeletedAt sql.NullTime
+	var refAuthorIsHardDeleted sql.NullBool
+
+	if err := rows.Scan(
+		&msg.ID, &msg.DMChannelID, &msg.UserID, &content, &editedAt, &msg.CreatedAt,
+		&msg.ReplyToID, &isPinned,
+		&msg.EncryptionVersion, &msg.Ciphertext, &msg.SenderDeviceID, &msg.E2EEMetadata, &msg.MessageType, &callMetaRaw,
+		&authorID, &author.Username, &displayName, &avatarURL, &author.Status, &author.DeletedAt, &author.IsHardDeleted,
+		&refMsgID, &refMsgContent,
+		&refAuthorID, &refAuthorUsername, &refAuthorDisplayName, &refAuthorAvatarURL, &refAuthorDeletedAt, &refAuthorIsHardDeleted,
+	); err != nil {
+		return nil, fmt.Errorf("failed to scan DM message: %w", err)
+	}
+
+	msg.CallMeta = parseCallMeta(callMetaRaw)
+	msg.IsPinned = isPinned == 1
+	if content.Valid {
+		msg.Content = &content.String
+	}
+	if editedAt.Valid {
+		msg.EditedAt = &editedAt.Time
+	}
+	if authorID.Valid {
+		author.ID = authorID.String
+		if displayName.Valid {
+			author.DisplayName = &displayName.String
+		}
+		if avatarURL.Valid {
+			author.AvatarURL = &avatarURL.String
+		}
+		msg.Author = &author
+	}
+
+	msg.ReferencedMessage = buildMessageReference(
+		msg.ReplyToID, refMsgID, refMsgContent,
+		refAuthorID, refAuthorUsername, refAuthorDisplayName, refAuthorAvatarURL,
+		refAuthorDeletedAt, refAuthorIsHardDeleted,
+	)
+
+	return &msg, nil
+}

@@ -1,0 +1,399 @@
+/**
+ * Server Store — Multi-server state management.
+ */
+
+import { create } from "zustand";
+import * as serversApi from "../api/servers";
+import { useChannelStore } from "./channelStore";
+import { useReadStateStore } from "./readStateStore";
+import { useE2EEStore } from "./e2eeStore";
+import { useVoiceStore } from "./voiceStore";
+import { useUIStore } from "./uiStore";
+import type { Server, ServerListItem, CreateServerRequest } from "../types";
+
+/**
+ * The fields a server settings screen may change.
+ *
+ * `e2ee_enabled` is deliberately not among them even though the endpoint accepts it: toggleE2EE
+ * owns that field, because enabling encryption also has to prompt for a recovery password. Routing
+ * it through here would turn E2EE on and skip the prompt, leaving the user with no way back into
+ * their messages.
+ */
+type UpdateServerRequest = Omit<Parameters<typeof serversApi.updateServer>[1], "e2ee_enabled">;
+
+/** Same shape createServer returns, so callers keep showing the server's own error text. */
+type ServerMutation = { server: Server | null; error?: string };
+
+/** Persist last active server across page reloads */
+const LAST_SERVER_KEY = "mqvi_last_server";
+
+/** For sign-out: the next account must not open on this one's last server. */
+export function forgetLastServer(): void {
+  localStorage.removeItem(LAST_SERVER_KEY);
+}
+
+/** Result of a join attempt: joined outright, queued for approval, or failed. */
+export type JoinOutcome =
+  | { status: "joined"; server: Server }
+  | { status: "pending" }
+  | { status: "error" };
+
+type ServerState = {
+  servers: ServerListItem[];
+  /** All server-scoped stores depend on this */
+  activeServerId: string | null;
+  activeServer: Server | null;
+  isLoading: boolean;
+  mutedServerIds: Set<string>;
+
+  // ─── Actions ───
+
+  setServersFromReady: (servers: ServerListItem[]) => void;
+  fetchServers: () => Promise<void>;
+  /** Cascade refetch is done by the caller (AppLayout) to avoid circular deps. */
+  setActiveServer: (serverId: string) => void;
+  fetchActiveServer: () => Promise<void>;
+  createServer: (req: CreateServerRequest) => Promise<{ server: Server | null; error?: string }>;
+  joinServer: (inviteCode: string) => Promise<JoinOutcome>;
+  leaveServer: (serverId: string) => Promise<boolean>;
+  deleteServer: (serverId: string) => Promise<boolean>;
+  reorderServers: (items: { id: string; position: number }[]) => Promise<boolean>;
+
+  // ─── WS Event Handlers ───
+
+  // ─── Mutations ───
+  // The sidebar entry and the active-server detail update on the acting client instead of waiting
+  // for the server_update echo. Each applies its result through handleServerUpdate, the same
+  // handler the echo uses. Shaped like createServer, since every caller shows res.error.
+  updateServer: (serverId: string, data: UpdateServerRequest) => Promise<ServerMutation>;
+  uploadServerIcon: (serverId: string, file: File) => Promise<ServerMutation>;
+  uploadServerBanner: (serverId: string, file: File) => Promise<ServerMutation>;
+
+  handleServerUpdate: (server: Server) => void;
+  handleServerCreate: (server: ServerListItem) => void;
+  handleServerDelete: (serverId: string) => void;
+
+  // ─── Mute Actions ───
+
+  setMutedServersFromReady: (ids: string[]) => void;
+  muteServer: (serverId: string, duration: string) => Promise<boolean>;
+  unmuteServer: (serverId: string) => Promise<boolean>;
+  isServerMuted: (serverId: string) => boolean;
+
+  // ─── E2EE Toggle ───
+
+  /** Toggle server E2EE (owner only) */
+  toggleE2EE: (serverId: string, enabled: boolean) => Promise<boolean>;
+};
+
+/**
+ * Narrows a full Server to the sidebar list shape.
+ *
+ * Six call sites used to build this literal by hand and each one silently dropped `verified` and
+ * `e2ee_enabled` — a rename or an E2EE toggle made the list entry claim the server was unencrypted.
+ * Use this so a field added later cannot be forgotten in one branch.
+ */
+export function toServerListItem(server: Server): ServerListItem {
+  return {
+    id: server.id,
+    name: server.name,
+    icon_url: server.icon_url,
+    verified: server.verified,
+    e2ee_enabled: server.e2ee_enabled,
+    owner_id: server.owner_id,
+  };
+}
+
+/**
+ * Whether a server has E2EE on — for any server the user is in, not just the active one.
+ *
+ * `undefined` means "not known yet", NOT "off": callers must assume encrypted or refuse to send.
+ */
+export function selectServerE2EE(serverId: string | null | undefined) {
+  return (s: ServerState): boolean | undefined => {
+    if (!serverId) return undefined;
+    const source = s.activeServer?.id === serverId ? s.activeServer : s.servers.find((sv) => sv.id === serverId);
+    // Checked rather than `?? false`: an older server omits the field entirely, and that is unknown.
+    return typeof source?.e2ee_enabled === "boolean" ? source.e2ee_enabled : undefined;
+  };
+}
+
+export const useServerStore = create<ServerState>((set, get) => ({
+  servers: [],
+  activeServerId: localStorage.getItem(LAST_SERVER_KEY),
+  activeServer: null,
+  isLoading: false,
+  mutedServerIds: new Set<string>(),
+
+  setServersFromReady: (servers) => {
+    set({ servers });
+    const state = get();
+    if (servers.length > 0) {
+      // If no active server or active not in list, select first
+      const savedId = state.activeServerId;
+      const exists = savedId && servers.some((s) => s.id === savedId);
+      if (!exists) {
+        const firstServer = servers[0];
+        set({ activeServerId: firstServer.id });
+        localStorage.setItem(LAST_SERVER_KEY, firstServer.id);
+      }
+    } else {
+      // No servers — clear stale activeServerId and channel data
+      set({ activeServerId: null, activeServer: null });
+      localStorage.removeItem(LAST_SERVER_KEY);
+      useChannelStore.getState().clearForServerSwitch();
+    }
+  },
+
+  fetchServers: async () => {
+    set({ isLoading: true });
+    const res = await serversApi.getMyServers();
+    if (res.success && res.data) {
+      set({ servers: res.data, isLoading: false });
+    } else {
+      set({ isLoading: false });
+    }
+  },
+
+  setActiveServer: (serverId) => {
+    // Paint the incoming server's channels from cache synchronously (before the switch commits),
+    // so a re-visited server shows instantly instead of blanking until the refetch lands.
+    // readState has no cache — it still clears.
+    useChannelStore.getState().switchToServer(serverId);
+    useReadStateStore.getState().clearForServerSwitch();
+
+    set({ activeServerId: serverId, activeServer: null });
+    localStorage.setItem(LAST_SERVER_KEY, serverId);
+  },
+
+  fetchActiveServer: async () => {
+    const serverId = get().activeServerId;
+    if (!serverId) return;
+
+    const res = await serversApi.getServer(serverId);
+    if (res.success && res.data) {
+      set({ activeServer: res.data });
+    }
+  },
+
+  createServer: async (req) => {
+    const res = await serversApi.createServer(req);
+    if (res.success && res.data) {
+      const server = res.data;
+      // Add to list + set active (atomic). WS event will also come but we add here against race.
+      set((state) => {
+        const servers = state.servers.some((s) => s.id === server.id)
+          ? state.servers
+          : [...state.servers, toServerListItem(server)];
+        return {
+          servers,
+          activeServerId: server.id,
+          activeServer: server,
+        };
+      });
+      localStorage.setItem(LAST_SERVER_KEY, server.id);
+      return { server };
+    }
+    return { server: null, error: res.error };
+  },
+
+  joinServer: async (inviteCode) => {
+    const res = await serversApi.joinServer(inviteCode);
+    if (!res.success || !res.data) return { status: "error" };
+    // Approval-required server → a request was queued, no membership yet.
+    if (res.data.pending) return { status: "pending" };
+    const server = res.data.server;
+    if (!server) return { status: "error" };
+    // Add to list + set active (WS event will also come)
+    set((state) => {
+      const servers = state.servers.some((s) => s.id === server.id)
+        ? state.servers
+        : [...state.servers, toServerListItem(server)];
+      return {
+        servers,
+        activeServerId: server.id,
+        activeServer: server,
+      };
+    });
+    localStorage.setItem(LAST_SERVER_KEY, server.id);
+    return { status: "joined", server };
+  },
+
+  leaveServer: async (serverId) => {
+    const res = await serversApi.leaveServer(serverId);
+    if (res.success) {
+      // Delegate to handleServerDelete for full cleanup (voice + server-scoped stores).
+      // The matching WS server_delete event is idempotent against this call.
+      get().handleServerDelete(serverId);
+      return true;
+    }
+    return false;
+  },
+
+  deleteServer: async (serverId) => {
+    const res = await serversApi.deleteServer(serverId);
+    if (res.success) {
+      get().handleServerDelete(serverId);
+      return true;
+    }
+    return false;
+  },
+
+  reorderServers: async (items) => {
+    // Save for rollback
+    const prevServers = get().servers;
+
+    // Optimistic update: sort by new positions
+    const positionMap = new Map(items.map((item) => [item.id, item.position]));
+    const sorted = [...prevServers].sort((a, b) => {
+      const posA = positionMap.get(a.id) ?? 9999;
+      const posB = positionMap.get(b.id) ?? 9999;
+      return posA - posB;
+    });
+    set({ servers: sorted });
+
+    const res = await serversApi.reorderServers(items);
+    if (!res.success) {
+      // Rollback
+      set({ servers: prevServers });
+      return false;
+    }
+
+    return true;
+  },
+
+  // ─── WS Event Handlers ───
+
+  // ─── Mutations ───
+
+  updateServer: async (serverId, data) => {
+    const res = await serversApi.updateServer(serverId, data);
+    if (!res.success || !res.data) return { server: null, error: res.error };
+
+    get().handleServerUpdate(res.data);
+    return { server: res.data };
+  },
+
+  uploadServerIcon: async (serverId, file) => {
+    const res = await serversApi.uploadServerIcon(serverId, file);
+    if (!res.success || !res.data) return { server: null, error: res.error };
+
+    get().handleServerUpdate(res.data);
+    return { server: res.data };
+  },
+
+  uploadServerBanner: async (serverId, file) => {
+    const res = await serversApi.uploadServerBanner(serverId, file);
+    if (!res.success || !res.data) return { server: null, error: res.error };
+
+    get().handleServerUpdate(res.data);
+    return { server: res.data };
+  },
+
+  handleServerUpdate: (server) => {
+    set((state) => {
+      // Update sidebar list entry
+      const servers = state.servers.map((s) =>
+        s.id === server.id
+          ? toServerListItem(server)
+          : s
+      );
+      // Update active server detail if applicable
+      const activeServer =
+        state.activeServer?.id === server.id ? server : state.activeServer;
+      return { servers, activeServer };
+    });
+  },
+
+  handleServerCreate: (server) => {
+    set((state) => {
+      if (state.servers.some((s) => s.id === server.id)) return state;
+      return { servers: [...state.servers, server] };
+    });
+  },
+
+  handleServerDelete: (serverId) => {
+    // Leave voice first if we were in a voice channel of this server.
+    // Notify backend so other members see us drop out immediately — otherwise
+    // orphan cleanup (35s grace) would leave a ghost participant in the sidebar.
+    const voiceState = useVoiceStore.getState();
+    if (voiceState.currentVoiceServerId === serverId) {
+      voiceState._wsSend?.("voice_leave", {});
+      voiceState.leaveVoiceChannel();
+    }
+
+    // Close any open tabs (text / voice / screen) that belong to this server.
+    useUIStore.getState().closeTabsForServer(serverId);
+
+    const prevActive = get().activeServerId;
+
+    set((state) => {
+      const servers = state.servers.filter((s) => s.id !== serverId);
+      let activeServerId = state.activeServerId;
+      if (activeServerId === serverId) {
+        activeServerId = servers[0]?.id ?? null;
+        if (activeServerId) {
+          localStorage.setItem(LAST_SERVER_KEY, activeServerId);
+        } else {
+          localStorage.removeItem(LAST_SERVER_KEY);
+        }
+      }
+      return { servers, activeServerId, activeServer: null };
+    });
+
+    // The server is gone — drop its cached channel tree so the cache can't grow unbounded.
+    useChannelStore.getState().evictServerCache(serverId);
+
+    // If we were viewing the deleted server, cascade-clear server-scoped stores
+    // so the open channel/messages UI doesn't linger with stale data.
+    if (prevActive === serverId) {
+      useChannelStore.getState().clearForServerSwitch();
+      useReadStateStore.getState().clearForServerSwitch();
+    }
+  },
+
+  // ─── Mute Actions ───
+
+  setMutedServersFromReady: (ids) => {
+    set({ mutedServerIds: new Set(ids) });
+  },
+
+  muteServer: async (serverId, duration) => {
+    const res = await serversApi.muteServer(serverId, duration);
+    if (res.success) {
+      set((state) => {
+        const next = new Set(state.mutedServerIds);
+        next.add(serverId);
+        return { mutedServerIds: next };
+      });
+      return true;
+    }
+    return false;
+  },
+
+  unmuteServer: async (serverId) => {
+    const res = await serversApi.unmuteServer(serverId);
+    if (res.success) {
+      set((state) => {
+        const next = new Set(state.mutedServerIds);
+        next.delete(serverId);
+        return { mutedServerIds: next };
+      });
+      return true;
+    }
+    return false;
+  },
+
+  isServerMuted: (serverId) => {
+    return get().mutedServerIds.has(serverId);
+  },
+
+  toggleE2EE: async (serverId, enabled) => {
+    const res = await serversApi.updateServer(serverId, { e2ee_enabled: enabled });
+    // server_update WS event will trigger handleServerUpdate automatically
+    if (res.success && enabled) {
+      useE2EEStore.getState().checkAndPromptRecovery();
+    }
+    return res.success;
+  },
+}));

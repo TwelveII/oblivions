@@ -1,0 +1,187 @@
+import { useEffect } from "react";
+import { Routes, Route, Navigate } from "react-router-dom";
+import { useAuthStore } from "./stores/authStore";
+import { useSettingsStore } from "./stores/settingsStore";
+import LoginPage from "./components/auth/LoginPage";
+import RegisterPage from "./components/auth/RegisterPage";
+import ConnectingScreen from "./components/auth/ConnectingScreen";
+import AppLayout from "./components/layout/AppLayout";
+import LandingPage from "./components/landing/LandingPage";
+import PrivacyPage from "./components/landing/PrivacyPage";
+import TermsPage from "./components/landing/TermsPage";
+import DeleteAccountPage from "./components/landing/DeleteAccountPage";
+import InviteJoinPage from "./components/servers/InviteJoinPage";
+import UpdateNotification from "./components/shared/UpdateNotification";
+import CustomTitleBar from "./components/layout/CustomTitleBar";
+import FileViewerOverlay from "./components/viewers/FileViewerOverlay";
+import MobileUpdatePrompt from "./components/shared/MobileUpdatePrompt";
+import ConfirmDialog from "./components/shared/ConfirmDialog";
+import ToastContainer from "./components/shared/ToastContainer";
+import { useUpdateChecker } from "./hooks/useUpdateChecker";
+import { useDeepLinks } from "./hooks/useDeepLinks";
+import { useFileTokenFreshness } from "./hooks/useFileTokenFreshness";
+import { useResetOnSignOut } from "./hooks/useResetOnSignOut";
+import { isElectron, isNativeApp, publicAsset } from "./utils/constants";
+import { restoreFromCache } from "./cache/cacheBoot";
+
+/**
+ * App — Root component. Handles routing and auth initialization.
+ * Shows loading spinner until auth state is resolved, then routes
+ * to /channels (authenticated) or /login (unauthenticated).
+ */
+function App() {
+  const initialize = useAuthStore((s) => s.initialize);
+  const isInitialized = useAuthStore((s) => s.isInitialized);
+  const user = useAuthStore((s) => s.user);
+  const isServerUnreachable = useAuthStore((s) => s.isServerUnreachable);
+  const updater = useUpdateChecker();
+  const blurEnabled = useSettingsStore((s) => s.blurEnabled);
+  const transparentBackground = useSettingsStore((s) => s.transparentBackground);
+
+  // Safe to fire before auth resolves: no route renders until isInitialized, so an invite link
+  // opened while logged out lands on /invite and is bounced to login with its returnUrl intact.
+  useDeepLinks();
+
+  useEffect(() => {
+    // On a native app with a warm cache this opens the app before any network response;
+    // initialize then confirms the session in the background.
+    void restoreFromCache().then(() => initialize());
+  }, [initialize]);
+
+  useFileTokenFreshness(user !== null);
+  // Logout, forced logout and an abandoned session all end at user → null.
+  useResetOnSignOut();
+
+  // Apply blur + transparent classes at root level so they also affect
+  // pre-auth pages (login, register, landing).
+  useEffect(() => {
+    document.body.classList.toggle("blur-enabled", blurEnabled);
+    document.body.classList.toggle("blur-disabled", !blurEnabled);
+  }, [blurEnabled]);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("transparent-bg", transparentBackground);
+    document.body.classList.toggle("transparent-bg", transparentBackground);
+  }, [transparentBackground]);
+
+  if (!isInitialized) {
+    // Mirrors #app-loader in index.html so React mounting over it is invisible.
+    const spinner = (
+      <div className="app-loading">
+        <img src={publicAsset("oblivions-icon-128.png")} alt="" className="app-loading-logo" />
+        <div className="app-loading-spinner" />
+      </div>
+    );
+
+    if (isElectron()) {
+      return (
+        <div className="electron-app-wrapper">
+          <CustomTitleBar />
+          {spinner}
+        </div>
+      );
+    }
+
+    return spinner;
+  }
+
+  // A stored session the server could not confirm yet: never show login for it.
+  if (isServerUnreachable) {
+    if (isElectron()) {
+      return (
+        <div className="electron-app-wrapper">
+          <CustomTitleBar />
+          <ConnectingScreen />
+        </div>
+      );
+    }
+    return <ConnectingScreen />;
+  }
+
+  const updateBanner =
+    (updater.status === "downloading" || updater.status === "ready") ? (
+      <UpdateNotification
+        status={updater.status}
+        version={updater.update?.version ?? ""}
+        progress={updater.progress}
+        onRestart={updater.restartAndInstall}
+        onDismiss={updater.dismiss}
+      />
+    ) : null;
+
+  const routes = (
+    <Routes>
+      {/* Landing — native apps (Electron/Capacitor) skip to login directly */}
+      <Route
+        path="/"
+        element={
+          user ? (
+            <Navigate to="/channels" replace />
+          ) : isNativeApp() ? (
+            <Navigate to="/login" replace />
+          ) : (
+            <LandingPage />
+          )
+        }
+      />
+
+      {/* Auth pages — unauthenticated only */}
+      <Route
+        path="/login"
+        element={user ? <Navigate to="/channels" replace /> : <LoginPage />}
+      />
+      <Route
+        path="/register"
+        element={user ? <Navigate to="/channels" replace /> : <RegisterPage />}
+ />
+      {/* Legal pages — public */}
+      <Route path="/privacy" element={<PrivacyPage />} />
+      <Route path="/terms" element={<TermsPage />} />
+      <Route path="/policies" element={<Navigate to="/privacy" replace />} />
+      <Route path="/delete-account" element={<DeleteAccountPage />} />
+
+      {/* Invite join — auth check is handled inside InviteJoinPage */}
+      <Route path="/invite/:code" element={<InviteJoinPage />} />
+
+      {/* Main app — authenticated only */}
+      <Route
+        path="/channels/*"
+        element={user ? <AppLayout /> : <Navigate to="/login" replace />}
+      />
+
+      {/* Default redirect — unknown routes */}
+      <Route
+        path="*"
+        element={
+          <Navigate to={user ? "/channels" : isNativeApp() ? "/login" : "/"} replace />
+        }
+      />
+    </Routes>
+  );
+
+  if (isElectron()) {
+    return (
+      <div className="electron-app-wrapper">
+        <CustomTitleBar />
+        {updateBanner}
+        {routes}
+        <FileViewerOverlay />
+        <ConfirmDialog />
+        <ToastContainer />
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {routes}
+      <FileViewerOverlay />
+      {/* At the root, not in AppLayout: the pre-auth pages (login's connection switcher) need them too. */}
+      <ConfirmDialog />
+      <ToastContainer />
+      <MobileUpdatePrompt />
+    </>
+  );
+}
+
+export default App;

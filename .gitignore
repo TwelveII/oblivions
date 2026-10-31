@@ -1,0 +1,216 @@
+# ========================
+# Go Backend
+# ========================
+server/mqvi
+server/mqvi.exe
+server/tmp/
+server/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ========================
+# Node / Frontend
+# ========================
+client/node_modules/
+client/dist/
+client/.vite/
+client/.tsbuildinfo
+
+# ========================
+# Electron
+# ========================
+dist-electron/
+release/
+
+# ========================
+# Native (WASAPI audio capture)
+# ========================
+native/*.exe
+native/*.obj
+# macOS helper binaries, staged here for packaging only (CI copies the release builds in; dev runs
+# native/game-capture/target/debug directly). Must be real files: a link would ship dangling.
+native/mqvi-game-capture
+native/mqvi-audio-capture
+*.obj
+
+# Builds native/games-list.json. The list it produces is committed; this is not — it names the
+# upstream endpoint, which is the one part of this that carries any provenance. The generated file
+# is plain fact (exe -> name) and carries none.
+scripts/build-games-list.mjs
+
+# ========================
+# Root node_modules (Electron + build tools)
+# ========================
+/node_modules/
+
+# ========================
+# Environment & Secrets
+# ========================
+.env
+.env.local
+.env.production
+*.pem
+*.key
+
+# Push notifications / Firebase secrets (NEVER commit)
+*.p8
+firebase-service-account*.json
+server/firebase-service-account.json
+# Firebase client config — git-ignored because the repo is public. Not strict
+# secrets (package-restricted, shipped inside the app) but exposing a real
+# project's config publicly invites abuse. Keep locally; inject via CI secret
+# when Android/iOS CI builds are set up.
+client/android/app/google-services.json
+client/ios/App/App/GoogleService-Info.plist
+
+# ========================
+# IDE
+# ========================
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ========================
+# OS
+# ========================
+.DS_Store
+Icon?
+Thumbs.db
+desktop.ini
+
+# ========================
+# Server runtime data
+# ========================
+/server/data/
+/uploads/
+
+# ========================
+# Documents (private)
+# ========================
+documents/
+# ========================
+# MD files (private)
+# ========================
+docs/
+
+# ========================
+# Deploy build output (contains compiled binary + real configs)
+# ========================
+deploy/package/
+deploy/COMMANDS.md
+deploy/REDEPLOY.md
+
+# ========================
+# Deploy scripts with real server IP (use .example versions)
+# ========================
+deploy/redeploy.sh
+deploy/redeploy.ps1
+# ========================
+# Deploy scripts with real server IP (use .example versions)
+# ========================
+deploy/redeploy-prod.sh
+deploy/redeploy-prod.ps1
+
+# ========================
+# Pre-edit backups of the real (IP-bearing) deploy scripts — kept so edits to the
+# untracked scripts can be diffed against their originals; never committed.
+# ========================
+deploy/backup/
+
+# ========================
+# Embedded frontend build
+# ========================
+server/static/dist/*
+!server/static/dist/.gitkeep
+
+# ========================
+# One-time migration tools
+# ========================
+server/cmd/
+server/migrate-uploads.exe
+deploy/migrate-uploads
+deploy/migrate-uploads.ps1
+
+# ========================
+# Misc
+# ========================
+*.log
+*.tmp
+coverage/
+deploy.md
+
+
+# ========================
+# claude
+# ========================
+*.claude
+CLAUDE.md
+DECISIONS.md
+
+# ========================
+# Codex instructions and working knowledge (private, synced manually)
+# ========================
+/AGENTS.md
+/codex/
+
+# ========================
+# Store listing (private ASO strategy)
+# ========================
+STORE-LISTING.md
+
+# Additional local secrets and runtime data
+.env.*
+!.env.example
+!.env.*.example
+*.db
+*.sqlite
+*.sqlite3
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa
+
+# Local backup copies
+*.bak
+*.bak-*
+*.backup
+*.backup-*
+
+# Compiled server binaries
+/server/mqvi-server
+/server/mqvi-server.exe
+/server/server.exe
+
+# Local backup copies
+*.bak
+*.bak-*
+*.backup
+*.backup-*
+*.old
+*.orig
+*.rej
+
+# Local compiled server binaries
+/server/mqvi-server
+/server/mqvi-server.exe
+/server/server.exe
+
+# Additional secrets and runtime databases
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.sqlite
+*.sqlite3

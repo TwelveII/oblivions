@@ -1,0 +1,640 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/joho/godotenv"
+)
+
+type Config struct {
+	Server          ServerConfig
+	Database        DatabaseConfig
+	JWT             JWTConfig
+	LiveKit         LiveKitConfig
+	Upload          UploadConfig
+	Antivirus       AntivirusConfig
+	FileRateLimit   FileRateLimitConfig
+	WSLimits        WSLimitsConfig
+	Email           EmailConfig
+	Klipy           KlipyConfig
+	TURN            TURNConfig
+	// CallGraceWindow is how long a live call survives the death of the socket carrying it. Media
+	// is peer-to-peer, so a WebSocket blip is not a hang-up — the owner gets this long to
+	// reconnect and reclaim it before the call is torn down.
+	CallGraceWindow time.Duration
+	Push            PushConfig
+	AppLinks        AppLinksConfig
+	ClientVersions  ClientVersionConfig
+	EncryptionKey   string // AES-256 key (64 hex chars = 32 bytes) for LiveKit credential encryption
+	HetznerAPIToken string // Hetzner Cloud API token (read-only) — optional
+	// PasswordBreachCheck queries Have I Been Pwned when a password is set. Needs no key or
+	// account; turn it off only for a self-host with no route out. Failures allow the password.
+	PasswordBreachCheck bool
+	// GeoIPDir holds the DB-IP city database behind the devices screen's locations.
+	GeoIPDir string
+	// GeoIPAutoUpdate downloads the database monthly from DB-IP. Off: only a copy placed in
+	// GeoIPDir by hand is used, and without one locations are blank.
+	GeoIPAutoUpdate bool
+}
+
+// PushConfig — optional. If CredentialsFile is missing or invalid, push is disabled
+// and the server still starts (same pattern as Email/Klipy).
+type PushConfig struct {
+	// CredentialsFile is the path to the Firebase service-account JSON used by the
+	// Admin SDK to send FCM messages.
+	CredentialsFile string
+	// APNs — optional iOS VoIP (PushKit/CallKit) push via direct APNs.
+	APNs APNsConfig
+	// How long a DM push waits for the read watermark to prove the user is reading it. Only
+	// applies when they have a live socket. Too short and the phone buzzes for a message being
+	// read on the desktop; too long costs a backgrounded phone a second. 0 disables the wait.
+	DMDelay time.Duration
+	// Pull a delivered DM notification back off the tray once it is read elsewhere.
+	ReadRetraction bool
+	// Push goroutines in flight. Each holds a database connection and the pool has four.
+	MaxConcurrent int
+	// After this many failures inside CircuitWindow, stop calling the provider for CircuitOpen —
+	// including the token lookup that precedes the call.
+	CircuitFailureThreshold int
+	CircuitWindow           time.Duration
+	CircuitOpen             time.Duration
+}
+
+// APNsConfig holds token-based (.p8) APNs auth for iOS VoIP pushes. Disabled if any
+// of KeyPath/KeyID/TeamID is unset. The same .p8 uploaded to Firebase for FCM works.
+type APNsConfig struct {
+	KeyPath    string // path to the AuthKey_XXXX.p8
+	KeyID      string
+	TeamID     string
+	BundleID   string // voip topic = BundleID + ".voip"
+	Production bool   // false => APNs sandbox (Xcode dev builds); true => production
+}
+
+// AppLinksConfig drives /.well-known/assetlinks.json, the statement Android reads to decide
+// whether a tapped mqvi.net link may open the app instead of the browser. Android fetches it
+// when the app is installed or updated; if it is missing or the fingerprint is wrong the link
+// just stays in the browser, with no error anywhere.
+type AppLinksConfig struct {
+	// AndroidPackage is the installed package name — the applicationId in build.gradle,
+	// which is not the same as the Capacitor appId.
+	AndroidPackage string
+	// AndroidFingerprints are SHA-256 signing-certificate fingerprints. Under Play App Signing
+	// this is Play's app signing key, NOT the upload key: Play re-signs the APK it ships, so the
+	// upload key never reaches the device. Empty disables the endpoint.
+	AndroidFingerprints []string
+	// IOSAppID drives /.well-known/apple-app-site-association (Universal Links).
+	// Format "<TeamID>.<BundleID>", e.g. "WQ54PPL5VQ.net.mqvi.app". Empty disables the endpoint.
+	IOSAppID string
+}
+
+// ClientVersionConfig sets the oldest mobile app version this server still serves. An app below
+// it shows a blocking "update to continue" screen; empty means no minimum. Raise it when an API
+// change would break older apps.
+type ClientVersionConfig struct {
+	MinAndroid string
+	MinIOS     string
+}
+
+// clientVersionPattern accepts "1", "1.2" or "1.2.3"; the app compares part by part.
+var clientVersionPattern = regexp.MustCompile(`^\d+(\.\d+){0,2}$`)
+
+func parseClientVersion(key string) (string, error) {
+	v := strings.TrimSpace(getEnv(key, ""))
+	if v != "" && !clientVersionPattern.MatchString(v) {
+		return "", fmt.Errorf("invalid %s %q: expected a version like 1.2.0", key, v)
+	}
+	return v, nil
+}
+
+// TURNConfig holds the STUN/TURN servers handed to P2P call clients.
+// P2P 1-on-1 calls are central and friendship-scoped, so a single TURN
+// surface serves every call.
+type TURNConfig struct {
+	// Secret is the shared HMAC secret matching coturn's use-auth-secret.
+	// Empty => TURN disabled, clients get STUN-only (P2P still works on
+	// non-restrictive networks, just no relay fallback).
+	Secret string
+	// URLs are the TURN server URLs given to clients,
+	// e.g. "turn:turn.mqvi.app:3478?transport=udp".
+	URLs []string
+	// STUNURLs are STUN-only servers (no credentials).
+	STUNURLs []string
+	// CredentialTTLSeconds is how long a minted TURN credential stays valid.
+	CredentialTTLSeconds int
+}
+
+// defaultSTUNURLs — public Google STUN, used when STUN_URLS is unset.
+const defaultSTUNURLs = "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302"
+
+// EmailConfig — optional. If RESEND_API_KEY is empty, password reset is disabled.
+type EmailConfig struct {
+	ResendAPIKey string
+	FromEmail    string // e.g. noreply@mqvi.app
+	AppURL       string // e.g. https://app.mqvi.app — used in reset links
+}
+
+// KlipyConfig — optional. If KLIPY_API_KEY is empty, GIF search is disabled.
+type KlipyConfig struct {
+	APIKey string
+}
+
+type ServerConfig struct {
+	Host string
+	Port int
+	// ReadinessAddr is a SEPARATE listener for /health/ready. It must stay on loopback: the
+	// endpoint hits the database on every request and reports pool and goroutine internals, and
+	// behind a reverse proxy a RemoteAddr check cannot tell the internet from localhost.
+	ReadinessAddr string
+}
+
+type DatabaseConfig struct {
+	Path string
+}
+
+type JWTConfig struct {
+	Secret             string
+	AccessTokenExpiry  int // minutes (default: 15)
+	RefreshTokenExpiry int // days (default: 90), sliding: every refresh restarts it
+	FileTokenExpiry    int // hours (default: 24); must outlive the 1h signed URLs
+}
+
+type LiveKitConfig struct {
+	URL       string
+	APIKey    string
+	APISecret string
+}
+
+type UploadConfig struct {
+	Dir               string
+	MaxSize           int64 // bytes (default: 100MB — Cloudflare body limit)
+	DefaultQuotaBytes int64 // per-user storage quota (default: 500MiB)
+	// PublicURL is the absolute base URL prepended to file URLs when they need
+	// to be served cross-origin or via CDN, e.g. "https://files.mqvi.net".
+	// Empty means file URLs are returned as relative paths (current behaviour).
+	PublicURL string
+	// SignedURLSecret is the HMAC-SHA256 key for signing file URLs (32 bytes, base64-encoded).
+	// Required in production. If empty, server refuses to start.
+	SignedURLSecret string
+	// SignedURLSecretPrev is the previous signing key, still accepted for verification
+	// during key rotation. URLs are only signed with the active key.
+	SignedURLSecretPrev string
+}
+
+type AntivirusConfig struct {
+	Enabled                 bool
+	ClamAVAddr              string
+	TimeoutSeconds          int
+	MaxScanSizeBytes        int64
+	UnavailablePolicy       string
+	TooLargePolicy          string
+	CleanCacheTTLHours      int
+	InfectedCacheTTLDays    int
+	CircuitFailureThreshold int
+	CircuitWindowSeconds    int
+	CircuitOpenSeconds      int
+}
+
+type FileRateLimitConfig struct {
+	UserPerMin int
+	IPPerMin   int
+}
+
+// WSLimitsConfig bounds what one account can cost at the WebSocket door.
+//
+// Both are per-user, not per-IP: a shared NAT puts a whole office behind one address, and the
+// thing being protected — handshake DB work and the per-connection event budget — is charged to
+// an account either way.
+type WSLimitsConfig struct {
+	// MaxConnectionsPerUser caps concurrent sockets for one account. Every open socket carries its
+	// own inbound event budget, so N sockets is N times the intended rate. Must sit well above a
+	// real device count: desktop, phone, web, Electron, a second tab, plus a reconnect that
+	// overlaps a socket the server has not reaped yet.
+	MaxConnectionsPerUser int
+
+	// ConnectsPerMinute throttles handshakes. Each one costs six DB queries before the socket is
+	// even open, so an unthrottled connect/disconnect loop is a database amplifier. Must sit above
+	// what a redeploy produces: Hub.Shutdown tells every connection to reconnect at once, so a
+	// user with several devices spends several handshakes in one second through no fault of theirs.
+	ConnectsPerMinute int
+}
+
+// Load reads configuration from environment variables.
+// Falls back to .env file in development.
+func Load() (*Config, error) {
+	// Having no .env is fine — the environment alone is a valid setup, and that is how the
+	// container runs. Having a broken one is not: godotenv parses the whole file or none of it, so
+	// a single line missing its `KEY=` drops every variable, and the boot then fails on whichever
+	// one happens to be checked first. It blames JWT_SECRET for a typo three lines below it.
+	if err := godotenv.Load(); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("loading .env: %w", err)
+	}
+
+	port, err := strconv.Atoi(getEnv("SERVER_PORT", "9090"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid SERVER_PORT: %w", err)
+	}
+
+	accessExpiry, err := strconv.Atoi(getEnv("JWT_ACCESS_EXPIRY_MINUTES", "15"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid JWT_ACCESS_EXPIRY_MINUTES: %w", err)
+	}
+
+	refreshExpiry, err := strconv.Atoi(getEnv("JWT_REFRESH_EXPIRY_DAYS", "90"))
+	if err != nil || refreshExpiry < 1 {
+		return nil, fmt.Errorf("invalid JWT_REFRESH_EXPIRY_DAYS %q: must be a whole number of days, at least 1", getEnv("JWT_REFRESH_EXPIRY_DAYS", "90"))
+	}
+
+	fileExpiry, err := strconv.Atoi(getEnv("JWT_FILE_EXPIRY_HOURS", "24"))
+	if err != nil || fileExpiry < 2 {
+		return nil, fmt.Errorf("invalid JWT_FILE_EXPIRY_HOURS %q: must be a whole number of hours, at least 2 (it has to outlive a 1h signed URL)", getEnv("JWT_FILE_EXPIRY_HOURS", "24"))
+	}
+
+	maxSize, err := strconv.ParseInt(getEnv("UPLOAD_MAX_SIZE", "104857600"), 10, 64) // 100 MB — Cloudflare body limit
+	if err != nil {
+		return nil, fmt.Errorf("invalid UPLOAD_MAX_SIZE: %w", err)
+	}
+
+	defaultQuota, err := strconv.ParseInt(getEnv("MQVI_DEFAULT_QUOTA_BYTES", "524288000"), 10, 64) // 500 MiB
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_DEFAULT_QUOTA_BYTES: %w", err)
+	}
+
+	fileRateUser, err := strconv.Atoi(getEnv("MQVI_FILE_RATE_USER_PER_MIN", "600"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_FILE_RATE_USER_PER_MIN: %w", err)
+	}
+
+	// 10 covers desktop + phone + web + Electron with room for extra tabs and a reconnect that
+	// overlaps a socket the server has not reaped yet (a dropped one lingers up to pongWait).
+	wsMaxConns, err := strconv.Atoi(getEnv("MQVI_WS_MAX_CONNECTIONS_PER_USER", "10"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_WS_MAX_CONNECTIONS_PER_USER: %w", err)
+	}
+	if wsMaxConns < 1 {
+		return nil, fmt.Errorf("MQVI_WS_MAX_CONNECTIONS_PER_USER must be at least 1, got %d", wsMaxConns)
+	}
+
+	// 60/min. The number is set by the worst case the client itself can produce, not by what looks
+	// tidy: the reconnect backoff resets on `onopen`, so a socket that opens and dies immediately —
+	// a captive portal, a proxy that completes the handshake then drops, a network switch mid-flight
+	// — restarts at the 1.5s floor every time and lands around 40 attempts a minute. A limit under
+	// that would throttle the user whose connection is already failing.
+	wsConnectsPerMin, err := strconv.Atoi(getEnv("MQVI_WS_CONNECTS_PER_MINUTE", "60"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_WS_CONNECTS_PER_MINUTE: %w", err)
+	}
+	if wsConnectsPerMin < 1 {
+		return nil, fmt.Errorf("MQVI_WS_CONNECTS_PER_MINUTE must be at least 1, got %d", wsConnectsPerMin)
+	}
+
+	fileRateIP, err := strconv.Atoi(getEnv("MQVI_FILE_RATE_IP_PER_MIN", "2000"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_FILE_RATE_IP_PER_MIN: %w", err)
+	}
+
+	avEnabled, err := strconv.ParseBool(getEnv("MQVI_ANTIVIRUS_ENABLED", "true"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_ENABLED: %w", err)
+	}
+
+	breachCheck, err := strconv.ParseBool(getEnv("MQVI_PASSWORD_BREACH_CHECK", "true"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_PASSWORD_BREACH_CHECK: %w", err)
+	}
+	geoAutoUpdate, err := strconv.ParseBool(getEnv("MQVI_GEOIP_AUTO_UPDATE", "true"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_GEOIP_AUTO_UPDATE: %w", err)
+	}
+	avTimeout, err := strconv.Atoi(getEnv("MQVI_ANTIVIRUS_TIMEOUT_SECONDS", "10"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_TIMEOUT_SECONDS: %w", err)
+	}
+	avMaxScanMB, err := strconv.ParseInt(getEnv("MQVI_ANTIVIRUS_MAX_SCAN_SIZE_MB", "25"), 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_MAX_SCAN_SIZE_MB: %w", err)
+	}
+	avCleanTTL, err := strconv.Atoi(getEnv("MQVI_ANTIVIRUS_CLEAN_CACHE_TTL_HOURS", "24"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_CLEAN_CACHE_TTL_HOURS: %w", err)
+	}
+	avInfectedTTL, err := strconv.Atoi(getEnv("MQVI_ANTIVIRUS_INFECTED_CACHE_TTL_DAYS", "30"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_INFECTED_CACHE_TTL_DAYS: %w", err)
+	}
+	avCircuitFailures, err := strconv.Atoi(getEnv("MQVI_ANTIVIRUS_CIRCUIT_FAILURE_THRESHOLD", "3"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_CIRCUIT_FAILURE_THRESHOLD: %w", err)
+	}
+	avCircuitWindow, err := strconv.Atoi(getEnv("MQVI_ANTIVIRUS_CIRCUIT_WINDOW_SECONDS", "30"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_CIRCUIT_WINDOW_SECONDS: %w", err)
+	}
+	avCircuitOpen, err := strconv.Atoi(getEnv("MQVI_ANTIVIRUS_CIRCUIT_OPEN_SECONDS", "10"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_CIRCUIT_OPEN_SECONDS: %w", err)
+	}
+	avUnavailablePolicy := strings.ToLower(strings.TrimSpace(getEnv("MQVI_ANTIVIRUS_UNAVAILABLE_POLICY", "allow_with_log")))
+	if avUnavailablePolicy != "allow_with_log" && avUnavailablePolicy != "reject" {
+		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_UNAVAILABLE_POLICY: %s", avUnavailablePolicy)
+	}
+	avTooLargePolicy := strings.ToLower(strings.TrimSpace(getEnv("MQVI_ANTIVIRUS_TOO_LARGE_POLICY", "skip_with_log")))
+	if avTooLargePolicy != "skip_with_log" && avTooLargePolicy != "reject" {
+		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_TOO_LARGE_POLICY: %s", avTooLargePolicy)
+	}
+	if avTimeout <= 0 {
+		return nil, fmt.Errorf("MQVI_ANTIVIRUS_TIMEOUT_SECONDS must be positive")
+	}
+	if avMaxScanMB < 0 || avCleanTTL < 0 || avInfectedTTL < 0 || avCircuitFailures < 0 || avCircuitWindow < 0 || avCircuitOpen < 0 {
+		return nil, fmt.Errorf("antivirus TTL and circuit values must not be negative")
+	}
+
+	jwtSecret := getEnv("JWT_SECRET", "")
+	if jwtSecret == "" {
+		return nil, fmt.Errorf("JWT_SECRET environment variable is required")
+	}
+
+	encKey := getEnv("ENCRYPTION_KEY", "")
+	if encKey == "" {
+		return nil, fmt.Errorf("ENCRYPTION_KEY environment variable is required (64 hex chars = 32 byte AES-256 key)")
+	}
+
+	// Default 24h: a TURN credential must outlast any single call, otherwise a
+	// relayed call drops when coturn rejects the next allocation refresh.
+	turnTTL, err := strconv.Atoi(getEnv("TURN_CREDENTIAL_TTL_SECONDS", "86400"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid TURN_CREDENTIAL_TTL_SECONDS: %w", err)
+	}
+	// Fail fast on an invalid TTL — single source of truth, no silent fallback.
+	// Upper bound (7 days) also prevents int64 nanosecond overflow downstream.
+	if turnTTL <= 0 || turnTTL > 604800 {
+		return nil, fmt.Errorf("TURN_CREDENTIAL_TTL_SECONDS must be between 1 and 604800 (7 days), got %d", turnTTL)
+	}
+
+	turnSecret := strings.TrimSpace(getEnv("TURN_SECRET", ""))
+	turnURLs := splitCSV(getEnv("TURN_URLS", ""))
+	stunURLs := splitCSV(getEnv("STUN_URLS", defaultSTUNURLs))
+	if err := validateICEServers(turnSecret, turnURLs, stunURLs); err != nil {
+		return nil, err
+	}
+
+	// Optional iOS VoIP push flag — invalid value defaults to sandbox (push is optional).
+	apnsProduction, _ := strconv.ParseBool(getEnv("APNS_PRODUCTION", "false"))
+	pushReadRetraction, err := strconv.ParseBool(getEnv("MQVI_PUSH_DM_READ_RETRACTION", "true"))
+	if err != nil {
+		return nil, fmt.Errorf("MQVI_PUSH_DM_READ_RETRACTION must be a boolean: %w", err)
+	}
+	pushDMDelay, err := getEnvDuration("MQVI_PUSH_DM_DELAY", 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	pushMaxConcurrent, err := getEnvInt("MQVI_PUSH_MAX_CONCURRENT", 16)
+	if err != nil {
+		return nil, err
+	}
+	pushCircuitThreshold, err := getEnvInt("MQVI_PUSH_CIRCUIT_FAILURE_THRESHOLD", 5)
+	if err != nil {
+		return nil, err
+	}
+	pushCircuitWindow, err := getEnvDuration("MQVI_PUSH_CIRCUIT_WINDOW", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	pushCircuitOpen, err := getEnvDuration("MQVI_PUSH_CIRCUIT_OPEN", 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	callGraceWindow, err := getEnvDuration("MQVI_P2P_CALL_GRACE", 20*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	androidFingerprints, err := normalizeCertFingerprints(splitCSV(getEnv("ANDROID_CERT_FINGERPRINTS", "")))
+	if err != nil {
+		return nil, err
+	}
+
+	minAndroid, err := parseClientVersion("MIN_APP_VERSION_ANDROID")
+	if err != nil {
+		return nil, err
+	}
+	minIOS, err := parseClientVersion("MIN_APP_VERSION_IOS")
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := &Config{
+		Server: ServerConfig{
+			Host:          getEnv("SERVER_HOST", "0.0.0.0"),
+			Port:          port,
+			ReadinessAddr: getEnv("MQVI_READINESS_ADDR", "127.0.0.1:9091"),
+		},
+		Database: DatabaseConfig{
+			Path: getEnv("DATABASE_PATH", "./data/mqvi.db"),
+		},
+		JWT: JWTConfig{
+			Secret:             jwtSecret,
+			AccessTokenExpiry:  accessExpiry,
+			RefreshTokenExpiry: refreshExpiry,
+			FileTokenExpiry:    fileExpiry,
+		},
+		LiveKit: LiveKitConfig{
+			URL:       getEnv("LIVEKIT_URL", "ws://localhost:7880"),
+			APIKey:    getEnv("LIVEKIT_API_KEY", ""),
+			APISecret: getEnv("LIVEKIT_API_SECRET", ""),
+		},
+		Upload: UploadConfig{
+			Dir:                 getEnv("UPLOAD_DIR", "./data/uploads"),
+			MaxSize:             maxSize,
+			DefaultQuotaBytes:   defaultQuota,
+			PublicURL:           getEnv("MQVI_PUBLIC_FILE_URL", ""),
+			SignedURLSecret:     getEnv("MQVI_SIGNED_URL_SECRET", ""),
+			SignedURLSecretPrev: getEnv("MQVI_SIGNED_URL_SECRET_PREV", ""),
+		},
+		Antivirus: AntivirusConfig{
+			Enabled:                 avEnabled,
+			ClamAVAddr:              getEnv("MQVI_CLAMAV_ADDR", "unix:/run/clamav/clamd.ctl"),
+			TimeoutSeconds:          avTimeout,
+			MaxScanSizeBytes:        avMaxScanMB * 1024 * 1024,
+			UnavailablePolicy:       avUnavailablePolicy,
+			TooLargePolicy:          avTooLargePolicy,
+			CleanCacheTTLHours:      avCleanTTL,
+			InfectedCacheTTLDays:    avInfectedTTL,
+			CircuitFailureThreshold: avCircuitFailures,
+			CircuitWindowSeconds:    avCircuitWindow,
+			CircuitOpenSeconds:      avCircuitOpen,
+		},
+		FileRateLimit: FileRateLimitConfig{
+			UserPerMin: fileRateUser,
+			IPPerMin:   fileRateIP,
+		},
+		WSLimits: WSLimitsConfig{
+			MaxConnectionsPerUser: wsMaxConns,
+			ConnectsPerMinute:     wsConnectsPerMin,
+		},
+		Email: EmailConfig{
+			ResendAPIKey: getEnv("RESEND_API_KEY", ""),
+			FromEmail:    getEnv("RESEND_FROM", ""),
+			AppURL:       getEnv("APP_URL", ""),
+		},
+		Klipy: KlipyConfig{
+			APIKey: getEnv("KLIPY_API_KEY", ""),
+		},
+		TURN: TURNConfig{
+			Secret:               turnSecret,
+			URLs:                 turnURLs,
+			STUNURLs:             stunURLs,
+			CredentialTTLSeconds: turnTTL,
+		},
+		Push: PushConfig{
+			CredentialsFile:         getEnv("FCM_CREDENTIALS_FILE", "./firebase-service-account.json"),
+			DMDelay:                 pushDMDelay,
+			ReadRetraction:          pushReadRetraction,
+			MaxConcurrent:           pushMaxConcurrent,
+			CircuitFailureThreshold: pushCircuitThreshold,
+			CircuitWindow:           pushCircuitWindow,
+			CircuitOpen:             pushCircuitOpen,
+			APNs: APNsConfig{
+				KeyPath:    getEnv("APNS_KEY_FILE", "./apns-key.p8"),
+				KeyID:      getEnv("APNS_KEY_ID", ""),
+				TeamID:     getEnv("APNS_TEAM_ID", ""),
+				BundleID:   getEnv("APNS_BUNDLE_ID", "net.mqvi.app"),
+				Production: apnsProduction,
+			},
+		},
+		AppLinks: AppLinksConfig{
+			AndroidPackage:      getEnv("ANDROID_APP_PACKAGE", "com.akinalpfdn.mqvi"),
+			AndroidFingerprints: androidFingerprints,
+			IOSAppID:            getEnv("IOS_APP_ID", ""),
+		},
+		ClientVersions: ClientVersionConfig{
+			MinAndroid: minAndroid,
+			MinIOS:     minIOS,
+		},
+		CallGraceWindow:     callGraceWindow,
+		EncryptionKey:       encKey,
+		HetznerAPIToken:     getEnv("HETZNER_API_TOKEN", ""),
+		PasswordBreachCheck: breachCheck,
+		GeoIPDir:            getEnv("MQVI_GEOIP_DIR", filepath.Join(filepath.Dir(getEnv("DATABASE_PATH", "./data/mqvi.db")), "geoip")),
+		GeoIPAutoUpdate:     geoAutoUpdate,
+	}
+
+	return cfg, nil
+}
+
+// Addr returns the listen address (e.g. "0.0.0.0:8080").
+func (c *ServerConfig) Addr() string {
+	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+}
+
+func getEnv(key, fallback string) string {
+	if val, ok := os.LookupEnv(key); ok {
+		return val
+	}
+	return fallback
+}
+
+// validateICEServers fails fast on misconfigured STUN/TURN values so a bad
+// config surfaces at startup, not on the first restrictive-NAT call (where it
+// would silently degrade to STUN-only and break the relay).
+func validateICEServers(turnSecret string, turnURLs, stunURLs []string) error {
+	for _, u := range stunURLs {
+		if !strings.HasPrefix(u, "stun:") && !strings.HasPrefix(u, "stuns:") {
+			return fmt.Errorf("invalid STUN URL %q: must start with stun: or stuns:", u)
+		}
+	}
+	// TURN is "enabled" only when URLs are present; then it needs a strong shared
+	// secret and valid turn:/turns: schemes (the dangerous misconfig: relay
+	// advertised but broken). A leftover secret without URLs is harmless — it just
+	// means no relay (STUN-only), so it's ignored rather than failed (avoids a
+	// deploy footgun where the setup script writes the secret before the URLs).
+	if len(turnURLs) > 0 {
+		if len(turnSecret) < 16 {
+			return fmt.Errorf("TURN_SECRET must be at least 16 chars when TURN_URLS is set")
+		}
+		for _, u := range turnURLs {
+			if !strings.HasPrefix(u, "turn:") && !strings.HasPrefix(u, "turns:") {
+				return fmt.Errorf("invalid TURN URL %q: must start with turn: or turns:", u)
+			}
+		}
+	}
+	return nil
+}
+
+// certFingerprintPattern — SHA-256 as keytool and Play Console print it: 32 hex bytes
+// separated by colons.
+var certFingerprintPattern = regexp.MustCompile(`^[0-9A-F]{2}(:[0-9A-F]{2}){31}$`)
+
+// normalizeCertFingerprints uppercases and validates each fingerprint. A malformed one is
+// rejected at startup rather than served: Android would read the statement, fail to match it
+// against the installed APK, and fall back to opening links in the browser — a failure with no
+// symptom anywhere except users saying "the link doesn't open the app".
+func normalizeCertFingerprints(raw []string) ([]string, error) {
+	out := make([]string, 0, len(raw))
+	for _, f := range raw {
+		norm := strings.ToUpper(strings.TrimSpace(f))
+		if !certFingerprintPattern.MatchString(norm) {
+			return nil, fmt.Errorf("invalid ANDROID_CERT_FINGERPRINTS entry %q: want a SHA-256 as 32 colon-separated hex bytes", f)
+		}
+		out = append(out, norm)
+	}
+	return out, nil
+}
+
+// splitCSV splits a comma-separated env value, trimming whitespace and
+// dropping empty entries.
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// getEnvInt and getEnvDuration REFUSE a value they cannot parse rather than quietly falling back
+// to the default.
+//
+// The earlier version fell back, reasoning that a mistyped knob must not take the server down.
+// That is backwards for a kill switch. It is 3am, push is storming, you set MQVI_PUSH_DM_DELAY=0x
+// meaning to disable the wait — and the server silently keeps the 3s default while telling you
+// nothing. You would be debugging a switch you believe you already flipped. A boot that stops and
+// names the bad variable costs one restart; a switch that lies costs the outage.
+func getEnvInt(key string, fallback int) (int, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer: %w", key, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got %d", key, n)
+	}
+	return n, nil
+}
+
+func getEnvDuration(key string, fallback time.Duration) (time.Duration, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf(`%s must be a duration such as "3s" or "500ms": %w`, key, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s must not be negative, got %s", key, d)
+	}
+	return d, nil
+}

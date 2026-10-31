@@ -1,0 +1,62 @@
+import UIKit
+import WebKit
+import AVFoundation
+import Capacitor
+
+class MqviViewController: CAPBridgeViewController {
+
+    override open func capacitorDidLoad() {
+        bridge?.registerPluginInstance(VoiceCallPlugin())
+        bridge?.registerPluginInstance(ScreenSharePlugin())
+        bridge?.registerPluginInstance(NativeVoicePlugin())
+        bridge?.registerPluginInstance(P2PCallPlugin())
+        bridge?.registerPluginInstance(NativeP2PCallPlugin())
+        bridge?.registerPluginInstance(MediaPosterPlugin())
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        if let webView = self.webView {
+            webView.configuration.mediaTypesRequiringUserActionForPlayback = []
+
+            if #available(iOS 16.4, *) {
+                webView.isInspectable = true
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+    }
+
+    // No setActive here: channel voice and calls own the session natively. Activating it on every
+    // transition stopped other apps' audio, and a pre-activated session silences CallKit calls.
+    @objc private func appDidEnterBackground() {
+        // iOS 15+: Tell WKWebView NOT to suspend media playback.
+        // This is the key API — without it, WebRTC audio freezes when backgrounded.
+        if #available(iOS 15.0, *) {
+            webView?.setAllMediaPlaybackSuspended(false, completionHandler: nil)
+        }
+    }
+
+    @objc private func appWillEnterForeground() {
+        // Resume media in case it was partially suspended
+        if #available(iOS 15.0, *) {
+            webView?.setAllMediaPlaybackSuspended(false, completionHandler: nil)
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+}
