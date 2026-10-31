@@ -113,6 +113,11 @@ func TestSQLiteUserRepo_HardDeleteShouldRemoveThePushTokens(t *testing.T) {
 	if left != 0 {
 		t.Fatal("push token survived the account's hard delete")
 	}
+	var userRows int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE id = 'u1'`).Scan(&userRows); err != nil {
+		t.Fatalf("count deleted user rows: %v", err)
+	}
+	if userRows != 0 { t.Fatalf("permanently deleted account row remains: %d", userRows) }
 }
 
 // Signup invite references must not block physical account deletion.
