@@ -7,9 +7,6 @@ import i18n from "../i18n";
 import * as messageApi from "../api/messages";
 import * as reactionApi from "../api/reactions";
 import type { UploadOptions } from "../api/client";
-import { buildAttachmentPreview } from "../utils/attachmentPreview";
-import { mapWithConcurrency } from "../utils/concurrency";
-import { PREVIEW_CONCURRENCY } from "../utils/constants";
 import { useServerStore, selectServerE2EE } from "./serverStore";
 import { useE2EEStore, canEncrypt } from "./e2eeStore";
 import { useAuthStore } from "./authStore";
@@ -147,12 +144,9 @@ const staleChannels = new Set<string>();
  * channel of a non-active server. Unknown state fails closed — guessing "not encrypted" would send
  * plaintext to a server that mandates encryption.
  */
-function channelSendMode(serverId: string): "plaintext" | "e2ee" | { refusal: string } {
+function channelSendMode(serverId: string): "e2ee" | { refusal: string } {
   const e2ee = selectServerE2EE(serverId)(useServerStore.getState());
-  if (e2ee === undefined) return { refusal: "chat:encryptionStateUnknown" };
-  if (!e2ee) return "plaintext";
-  // Encrypted target, device not ready: refuse rather than fall through to plaintext. The server
-  // would reject it anyway, but with the wrong reason.
+  if (e2ee !== true) return { refusal: "chat:encryptionStateUnknown" };
   if (!canEncrypt(useE2EEStore.getState()) || !useAuthStore.getState().user?.id) {
     return { refusal: "chat:encryptionRequired" };
   }
@@ -160,21 +154,11 @@ function channelSendMode(serverId: string): "plaintext" | "e2ee" | { refusal: st
 }
 
 async function prepareChannelSend(
-  mode: "plaintext" | "e2ee",
   channelId: string,
   content: string,
   files: File[],
   signal: AbortSignal
 ): Promise<PreparedSend> {
-  if (mode === "plaintext") {
-    // Previews are generated here, not in the api layer, so both paths produce them the same way.
-    // Non-images and already-small files come back null.
-    const thumbs = files.length > 0
-      ? await mapWithConcurrency(files, PREVIEW_CONCURRENCY, (file) => buildAttachmentPreview(file, signal))
-      : undefined;
-    return { thumbs };
-  }
-
   const { localDeviceId } = useE2EEStore.getState();
   const userId = useAuthStore.getState().user?.id;
   // channelSendMode checked both moments ago; they can only have gone with a sign-out.
@@ -214,7 +198,7 @@ function channelAttempt(nonce: string): SendAttempt {
         return "rejected";
       }
       try {
-        prepared = await prepareChannelSend(mode, entry.conversationId, entry.content, entry.files, signal);
+        prepared = await prepareChannelSend(entry.conversationId, entry.content, entry.files, signal);
       } catch (err) {
         return encryptionFailureOutcome(err, "messageStore");
       }
@@ -224,19 +208,19 @@ function channelAttempt(nonce: string): SendAttempt {
 
     const replyToId = entry.replyToId ?? undefined;
     const sealed = prepared.encrypted;
-    const res = sealed
-      ? await messageApi.sendEncryptedMessage(
-          entry.serverId, entry.conversationId, sealed.ciphertext, sealed.deviceId, sealed.metadata,
-          sealed.files, replyToId, upload, prepared.thumbs, nonce
-        )
-      : await messageApi.sendMessage(
-          entry.serverId, entry.conversationId, entry.content, entry.files, replyToId, upload, prepared.thumbs, nonce
-        );
+    if (!sealed) {
+      useToastStore.getState().addToast("error", i18n.t("chat:encryptionRequired"));
+      return "rejected";
+    }
+    const res = await messageApi.sendEncryptedMessage(
+      entry.serverId, entry.conversationId, sealed.ciphertext, sealed.deviceId, sealed.metadata,
+      sealed.files, replyToId, upload, prepared.thumbs, nonce
+    );
 
     if (!res.success) return sendFailureOutcome(res);
     if (res.data) {
       // The response carries the ciphertext; the sender already has what it says.
-      const stored = sealed ? { ...res.data, content: entry.content, e2ee_file_keys: sealed.fileMetas } : res.data;
+      const stored = { ...res.data, content: entry.content, e2ee_file_keys: sealed.fileMetas };
       useMessageStore.getState().handleMessageCreate({ ...stored, client_nonce: nonce });
     }
     // Without a body the echo delivers it; the pending copy must not outlive the send either way.
