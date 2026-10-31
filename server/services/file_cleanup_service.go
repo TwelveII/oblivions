@@ -227,11 +227,12 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 	plan.refs = append(plan.refs, voiceRefs...)
 
 	// ─── DM attachments ───
-	dmRefs, err := s.queryOwnedRefs(ctx, userID, true, `
-		SELECT da.file_url, COALESCE(da.file_size, 0), da.thumb_url, COALESCE(da.thumb_size, 0)
+	dmRefs, err := s.queryFileRefs(ctx, true, `
+		SELECT da.file_url, COALESCE(da.file_size, 0), dm.user_id, da.thumb_url, COALESCE(da.thumb_size, 0)
 		FROM dm_attachments da
 		JOIN dm_messages dm ON da.dm_message_id = dm.id
-		WHERE dm.user_id = ?`, userID)
+		JOIN dm_channels dc ON dc.id = dm.dm_channel_id
+		WHERE dc.user1_id = ? OR dc.user2_id = ?`, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("collect user DM files: %w", err)
 	}
