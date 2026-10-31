@@ -96,35 +96,18 @@ func NewMessageService(
 // message in the clear on an encrypted server — or unreadable ciphertext on a plaintext one. The
 // server has to be the one that says no.
 func (s *messageService) enforceServerEncryptionPolicy(ctx context.Context, serverID string, encryptionVersion int) error {
-	serverEncrypted, err := s.serverReader.IsE2EEEnabled(ctx, serverID)
-	if err != nil {
-		// A missing server maps to 404, and 4xx bodies carry the error text verbatim — wrapping it
-		// would show the caller this function's name. Anything else is internal and becomes a 500.
-		if errors.Is(err, pkg.ErrNotFound) {
-			return err
-		}
+	if _, err := s.serverReader.IsE2EEEnabled(ctx, serverID); err != nil {
+		if errors.Is(err, pkg.ErrNotFound) { return err }
 		return fmt.Errorf("resolve server encryption policy: %w", err)
 	}
-
-	if serverEncrypted && encryptionVersion != 1 {
+	if encryptionVersion != 1 {
 		return pkg.WithCode(
-			fmt.Errorf("%w: this server requires end-to-end encrypted messages", pkg.ErrBadRequest),
+			fmt.Errorf("%w: all channel messages require end-to-end encryption", pkg.ErrBadRequest),
 			pkg.CodeEncryptionRequired,
-		)
-	}
-	// The other direction matters just as much. Nothing validates a ciphertext, so on a plaintext
-	// server anyone could post encryption_version=1 with an arbitrary string: unreadable by every
-	// member, absent from search, and beyond moderation. Since an edit now converts the row, it
-	// would also let someone turn their own quoted message into permanent noise.
-	if !serverEncrypted && encryptionVersion == 1 {
-		return pkg.WithCode(
-			fmt.Errorf("%w: this server does not use end-to-end encryption", pkg.ErrBadRequest),
-			pkg.CodeEncryptionNotAvailable,
 		)
 	}
 	return nil
 }
-
 // GetByChannelID returns messages with cursor-based pagination.
 // Checks per-channel ReadMessages permission (override-aware).
 func (s *messageService) GetByChannelID(ctx context.Context, channelID string, userID string, beforeID string, limit int) (*models.MessagePage, error) {
