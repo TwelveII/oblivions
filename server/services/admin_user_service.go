@@ -27,7 +27,7 @@ type AdminUserService interface {
 	PlatformUnbanUser(ctx context.Context, adminUserID, targetUserID string) error
 	// SoftDeleteUser marks the user soft-deleted (recoverable for 30 days).
 	SoftDeleteUser(ctx context.Context, adminUserID, targetUserID, reason string) error
-	// HardDeleteUser anonymizes the user (tombstone). Files cleaned, quota released.
+	// HardDeleteUser permanently removes the account and its associated content. Files are cleaned and quota released.
 	HardDeleteUser(ctx context.Context, adminUserID, targetUserID, reason string) error
 	// RestoreUser un-soft-deletes a user (admin override).
 	RestoreUser(ctx context.Context, adminUserID, targetUserID string) error
@@ -232,8 +232,7 @@ func (s *adminUserService) SoftDeleteUser(ctx context.Context, adminUserID, targ
 	return nil
 }
 
-// RestoreUser un-soft-deletes a user (admin override). Tombstones (is_hard_deleted=1)
-// are not restorable.
+// RestoreUser un-soft-deletes an account during its recovery window.
 func (s *adminUserService) RestoreUser(ctx context.Context, adminUserID, targetUserID string) error {
 	if adminUserID == targetUserID {
 		return fmt.Errorf("%w: cannot restore yourself", pkg.ErrBadRequest)
@@ -318,7 +317,7 @@ func (s *adminUserService) HardDeleteUser(ctx context.Context, adminUserID, targ
 	return nil
 }
 
-// ExpireSoftDeletedUser is the worker-driven path. Reuses the same collect →
+// ExpireSoftDeletedUser is the worker-driven permanent-deletion path. Reuses the same collect →
 // broadcast → repo.HardDeleteUser → execute sequence as the admin variant but
 // skips admin actor checks, email notification (already sent at soft-delete),
 // and the platform-admin guard (a platform admin cannot reach this path because
@@ -333,7 +332,7 @@ func (s *adminUserService) ExpireSoftDeletedUser(ctx context.Context, targetUser
 		return fmt.Errorf("%w: user is not soft-deleted", pkg.ErrBadRequest)
 	}
 	if target.IsHardDeleted {
-		return fmt.Errorf("%w: user is already a tombstone", pkg.ErrBadRequest)
+		return fmt.Errorf("%w: account is already permanently deleted", pkg.ErrBadRequest)
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -models.SoftDeleteTTLDays)
 	if target.DeletedAt.After(cutoff) {
@@ -362,7 +361,7 @@ func (s *adminUserService) ExpireSoftDeletedUser(ctx context.Context, targetUser
 	s.hub.DisconnectUser(targetUserID)
 
 	if err := s.userRepo.HardDeleteUser(ctx, targetUserID, target.DeletedByAdmin); err != nil {
-		return fmt.Errorf("tombstone user: %w", err)
+		return fmt.Errorf("permanently delete user: %w", err)
 	}
 
 	s.fileCleanup.Execute(plan)
