@@ -842,7 +842,7 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 		// Apply explicit SET NULL behavior for optional attribution references. Required
 		// relationships are deleted below or allowed to cascade from the user row.
 		//
-		// CASCADE → DELETE (pin record only — the pinned message itself stays)
+		// Delete pin metadata authored by the account; pinned messages authored by the account are removed below.
 		if _, err := tx.ExecContext(ctx, `DELETE FROM pinned_messages WHERE pinned_by = ?`, userID); err != nil {
 			return fmt.Errorf("failed to delete user pinned_messages: %w", err)
 		}
