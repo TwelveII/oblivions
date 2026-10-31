@@ -224,7 +224,12 @@ func TestSQLiteUserRepo_HardDeleteCleansDMDeliveries(t *testing.T) {
 	).Scan(&channels); err != nil {
 		t.Fatalf("count DM channels: %v", err)
 	}
-	if channels != 1 {
-		t.Fatalf("DM channel count got %d want 1", channels)
+	if channels != 0 {
+		t.Fatalf("DM channel count got %d want 0 after permanent account deletion", channels)
 	}
+	var userRows int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE id = 'u1'`).Scan(&userRows); err != nil {
+		t.Fatalf("count deleted account: %v", err)
+	}
+	if userRows != 0 { t.Fatalf("deleted account row remains: %d", userRows) }
 }
