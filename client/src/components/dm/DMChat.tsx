@@ -13,7 +13,6 @@ import { useToastStore } from "../../stores/toastStore";
 import { useBlockStore } from "../../stores/blockStore";
 import { useP2PCallStore } from "../../stores/p2pCallStore";
 import { useChatContext } from "../../hooks/useChatContext";
-import { useConfirm } from "../../hooks/useConfirm";
 import { useFileDrop } from "../../hooks/useFileDrop";
 import { useNarrowChat } from "../../hooks/useNarrowChat";
 import { useContextMenu } from "../../hooks/useContextMenu";
@@ -77,18 +76,16 @@ function DMChatContent({
   const { t: tCommon } = useTranslation("common");
   const { t: tE2EE } = useTranslation("e2ee");
   const { addFilesRef } = useChatContext();
-  const confirm = useConfirm();
   const isNarrow = useNarrowChat();
   const { menuState, openMenuAt, closeMenu } = useContextMenu();
   const selectDM = useDMStore((s) => s.selectDM);
   const markDMReadUpTo = useDMStore((s) => s.markDMReadUpTo);
   const heldMessages = useDMStore((s) => s.messagesByChannel[channelId]);
   const isForeground = useAppFocusStore((s) => s.isForeground);
-  const toggleE2EE = useDMStore((s) => s.toggleE2EE);
   // Boolean, not the raw status: this must not re-run on uninitialized -> initializing.
   const e2eeReady = useE2EEStore((s) => s.initStatus === "ready");
   const channels = useDMStore((s) => s.channels);
-  const dmE2EEEnabled = channels.find((ch) => ch.id === channelId)?.e2ee_enabled ?? false;
+  const dmE2EEEnabled = channels.find((ch) => ch.id === channelId)?.e2ee_enabled ?? true;
   const addToast = useToastStore((s) => s.addToast);
   const currentUserId = useAuthStore((s) => s.user?.id);
   const acceptDMRequest = useDMStore((s) => s.acceptDMRequest);
@@ -173,35 +170,14 @@ function DMChatContent({
     setShowSearch((prev) => !prev);
   }, []);
 
-  const e2eeLabel = dmE2EEEnabled ? tE2EE("disableE2EE") : tE2EE("enableE2EE");
-
-  const handleToggleE2EE = useCallback(async () => {
-    const newState = !dmE2EEEnabled;
-    const confirmed = await confirm({
-      title: newState ? tE2EE("enableE2EE") : tE2EE("disableE2EE"),
-      message: newState ? tE2EE("enableE2EEConfirmDM") : tE2EE("disableE2EEConfirmDM"),
-      confirmLabel: newState ? tE2EE("enableE2EE") : tE2EE("disableE2EE"),
-      danger: !newState,
-    });
-    if (!confirmed) return;
-
-    const ok = await toggleE2EE(channelId, newState);
-    addToast(ok ? "success" : "error", ok
-      ? (newState ? tE2EE("e2eeEnabled") : tE2EE("e2eeDisabled"))
-      : tE2EE("e2eeToggleFailed"));
-  }, [dmE2EEEnabled, confirm, tE2EE, toggleE2EE, channelId, addToast]);
-
   const handleOpenOverflow = useCallback(
     (e: React.MouseEvent<HTMLElement>) => {
       openMenuAt(e, [
         { label: t("pinnedMessages"), onClick: handleTogglePins },
         { label: t("searchMessages"), onClick: handleToggleSearch },
-        ...(otherUserDeleted
-          ? []
-          : [{ label: e2eeLabel, onClick: () => void handleToggleE2EE(), separator: true }]),
       ]);
     },
-    [openMenuAt, t, handleTogglePins, handleToggleSearch, otherUserDeleted, e2eeLabel, handleToggleE2EE]
+    [openMenuAt, t, handleTogglePins, handleToggleSearch]
   );
 
   // ─── Drag-drop ───
@@ -227,28 +203,9 @@ function DMChatContent({
         />
         <span className="dm-header-name">{channelName}</span>
 
-        {/* Header actions — e2ee, pin, search */}
+        {/* Encryption is mandatory; expose its status without a disable control. */}
         <div className="ch-actions">
-          {/* E2EE toggle — hidden when recipient is deleted (no negotiation possible). */}
-          {!otherUserDeleted && !isNarrow && (
-            <button
-              className={dmE2EEEnabled ? "active" : ""}
-              onClick={handleToggleE2EE}
-              title={e2eeLabel}
-            >
-              {dmE2EEEnabled ? (
-                <svg style={{ width: 16, height: 16 }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-                  <path d="M7 11V7a5 5 0 0110 0v4" />
-                </svg>
-              ) : (
-                <svg style={{ width: 16, height: 16 }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-                  <path d="M7 11V7a5 5 0 019.9-1" />
-                </svg>
-              )}
-            </button>
-          )}
+          <span className="dm-e2ee-indicator" title={tE2EE("encryptionActive")} aria-label={tE2EE("encryptionActive")}>🔒</span>
           {/* Voice + video call — hidden if other party is deleted (cannot be reached). */}
           {!otherUserDeleted && (
             <>
