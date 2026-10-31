@@ -8,6 +8,7 @@
  */
 
 import { create } from "zustand";
+import i18n from "../i18n";
 import * as voiceMessageApi from "../api/voiceMessages";
 import type { UploadOptions } from "../api/client";
 import type { VoiceMessage, Message } from "../types";
@@ -145,7 +146,7 @@ export const useVoiceMessageStore = create<VoiceMessageState>((set, get) => ({
     const e2ee = useE2EEStore.getState();
     const userId = useAuthStore.getState().user?.id;
     if (!canEncrypt(e2ee) || !userId || !e2ee.localDeviceId) {
-      useToastStore.getState().addToast("error", "Encryption is still setting up. Try again shortly.");
+      useToastStore.getState().addToast("error", i18n.t("chat:encryptionRequired"));
       return false;
     }
     try {
@@ -160,7 +161,7 @@ export const useVoiceMessageStore = create<VoiceMessageState>((set, get) => ({
       return true;
     } catch (error) {
       console.error("[voiceMessageStore] encrypted send failed:", error);
-      useToastStore.getState().addToast("error", "Could not encrypt this voice chat message.");
+      useToastStore.getState().addToast("error", i18n.t("e2ee:encryptionFailed"));
       return false;
     }
   },
@@ -176,7 +177,7 @@ export const useVoiceMessageStore = create<VoiceMessageState>((set, get) => ({
     if (!held) return false;
     const payload = encryptedEditPayload(content, held);
     if (payload === null) {
-      useToastStore.getState().addToast("error", "Attachment encryption keys are unavailable.");
+      useToastStore.getState().addToast("error", i18n.t("e2ee:editAttachmentKeysMissing"));
       return false;
     }
     try {
@@ -189,7 +190,7 @@ export const useVoiceMessageStore = create<VoiceMessageState>((set, get) => ({
       return true;
     } catch (error) {
       console.error("[voiceMessageStore] encrypted edit failed:", error);
-      useToastStore.getState().addToast("error", "Could not encrypt this voice chat edit.");
+      useToastStore.getState().addToast("error", i18n.t("e2ee:encryptionFailed"));
       return false;
     }
   },
