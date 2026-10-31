@@ -68,7 +68,7 @@ func (r *sqliteVoiceMessageRepo) GetByChannelID(ctx context.Context, channelID s
 		limit = 100
 	}
 	query := `
-		SELECT vm.id, vm.channel_id, vm.user_id, vm.content, vm.edited_at, vm.created_at,
+		SELECT vm.id, vm.channel_id, vm.user_id, vm.content, vm.encryption_version, vm.ciphertext, vm.sender_device_id, vm.e2ee_metadata, vm.edited_at, vm.created_at,
 		       u.id, u.username, u.display_name, u.avatar_url, u.status, u.deleted_at, u.is_hard_deleted
 		FROM voice_messages vm
 		LEFT JOIN users u ON vm.user_id = u.id
