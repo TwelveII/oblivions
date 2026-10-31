@@ -82,10 +82,10 @@ func TestDMEncryptionPolicy_IsEnforcedOnSendAndEdit(t *testing.T) {
 		version  int
 		wantCode string // "" means the message must be allowed through to the write
 	}{
-		{"plaintext in a plaintext conversation", false, 0, ""},
+		{"plaintext in a legacy plaintext conversation", false, 0, pkg.CodeEncryptionRequired},
 		{"encrypted in an encrypted conversation", true, 1, ""},
 		{"plaintext in an encrypted conversation", true, 0, pkg.CodeEncryptionRequired},
-		{"encrypted in a plaintext conversation", false, 1, pkg.CodeEncryptionNotAvailable},
+		{"encrypted in a legacy plaintext conversation", false, 1, ""},
 	}
 
 	for _, tc := range cases {
