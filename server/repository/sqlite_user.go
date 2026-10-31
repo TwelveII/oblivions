@@ -800,10 +800,7 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 		return fmt.Errorf("hard delete requires *sql.DB (got nested tx)")
 	}
 
-	byAdminInt := 0
-	if byAdmin {
-		byAdminInt = 1
-	}
+	_ = byAdmin // retained for repository interface compatibility
 
 	return database.WithTx(ctx, db, func(tx *sql.Tx) error {
 		// ─── Manual cleanup of CASCADE-on-user tables (CASCADE won't fire — user row stays) ───
