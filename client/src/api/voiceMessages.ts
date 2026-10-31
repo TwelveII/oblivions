@@ -18,31 +18,39 @@ export async function listVoiceMessages(channelId: string) {
 
 export async function sendVoiceMessage(
   channelId: string,
-  content: string,
+  ciphertext: string,
+  senderDeviceId: string,
+  metadata: string,
   files?: File[],
   upload?: UploadOptions
 ) {
   if (files && files.length > 0) {
     const formData = new FormData();
-    formData.append("content", content);
-    for (const file of files) {
-      formData.append("files", file);
-    }
+    formData.append("encryption_version", "1");
+    formData.append("ciphertext", ciphertext);
+    formData.append("sender_device_id", senderDeviceId);
+    formData.append("e2ee_metadata", metadata);
+    for (const file of files) formData.append("files", file);
     return uploadRequest<VoiceMessage>(`/voice-channels/${channelId}/messages`, formData, upload);
   }
   return apiClient<VoiceMessage>(`/voice-channels/${channelId}/messages`, {
     method: "POST",
-    body: { content },
+    body: { encryption_version: 1, ciphertext, sender_device_id: senderDeviceId, e2ee_metadata: metadata },
+    signal: upload?.signal,
   });
 }
-
-export async function editVoiceMessage(channelId: string, messageId: string, content: string) {
+export async function editVoiceMessage(
+  channelId: string,
+  messageId: string,
+  ciphertext: string,
+  senderDeviceId: string,
+  metadata: string
+) {
   return apiClient<VoiceMessage>(`/voice-channels/${channelId}/messages/${messageId}`, {
     method: "PATCH",
-    body: { content },
+    body: { encryption_version: 1, ciphertext, sender_device_id: senderDeviceId, e2ee_metadata: metadata },
   });
 }
-
 export async function deleteVoiceMessage(channelId: string, messageId: string) {
   return apiClient<void>(`/voice-channels/${channelId}/messages/${messageId}`, {
     method: "DELETE",
