@@ -127,9 +127,8 @@ export type DMStore = DMCoreState & DMSettingsSlice & DMWsSlice;
  * Whether a DM goes out encrypted, or why it cannot go out. Fails closed like the channel path: an
  * unknown state must not default to plaintext on a conversation that mandates encryption.
  */
-function dmSendMode(channel: DMChannelWithUser | undefined): "plaintext" | "e2ee" | { refusal: string } {
-  if (typeof channel?.e2ee_enabled !== "boolean") return { refusal: "chat:encryptionStateUnknown" };
-  if (!channel.e2ee_enabled) return "plaintext";
+function dmSendMode(channel: DMChannelWithUser | undefined): "e2ee" | { refusal: string } {
+  if (!channel) return { refusal: "chat:encryptionStateUnknown" };
   if (!canEncrypt(useE2EEStore.getState()) || !useAuthStore.getState().user?.id) {
     return { refusal: "chat:encryptionRequired" };
   }
@@ -508,12 +507,12 @@ export const useDMStore = create<DMStore>((set, get, store) => ({
       return false;
     }
 
-    if (editChannelE2EE && !canEncrypt(e2eeState)) {
+    if (!canEncrypt(e2eeState)) {
       useToastStore.getState().addToast("error", i18n.t("chat:encryptionRequired"));
       return false;
     }
 
-    if (editChannelE2EE && e2eeState.initStatus === "ready" && e2eeState.localDeviceId) {
+    if (e2eeState.initStatus === "ready" && e2eeState.localDeviceId) {
       const currentUserId = useAuthStore.getState().user?.id;
 
       if (recipientUserId && currentUserId) {
@@ -562,8 +561,8 @@ export const useDMStore = create<DMStore>((set, get, store) => ({
       }
     }
 
-    const res = await dmApi.editDMMessage(messageId, content);
-    return res.success;
+    useToastStore.getState().addToast("error", i18n.t("chat:encryptionRequired"));
+    return false;
   },
 
   deleteMessage: async (messageId) => {
