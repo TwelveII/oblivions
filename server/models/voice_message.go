@@ -2,9 +2,7 @@ package models
 
 import (
 	"fmt"
-	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // VoiceMessage is ephemeral chat tied to an active voice channel session.
@@ -42,16 +40,8 @@ type CreateVoiceMessageRequest struct {
 }
 
 func (r *CreateVoiceMessageRequest) Validate() error {
-	r.Content = strings.TrimSpace(r.Content)
-	contentLen := utf8.RuneCountInString(r.Content)
 	if r.EncryptionVersion != 1 || r.Ciphertext == nil || *r.Ciphertext == "" || r.SenderDeviceID == nil || *r.SenderDeviceID == "" {
 		return fmt.Errorf("voice chat messages require end-to-end encryption")
-	}
-	if contentLen == 0 && !r.HasFiles {
-		return fmt.Errorf("content or attachment required")
-	}
-	if contentLen > MaxMessageLength {
-		return fmt.Errorf("content exceeds %d characters", MaxMessageLength)
 	}
 	return nil
 }
@@ -65,16 +55,8 @@ type UpdateVoiceMessageRequest struct {
 }
 
 func (r *UpdateVoiceMessageRequest) Validate() error {
-	r.Content = strings.TrimSpace(r.Content)
-	contentLen := utf8.RuneCountInString(r.Content)
 	if r.EncryptionVersion != 1 || r.Ciphertext == nil || *r.Ciphertext == "" || r.SenderDeviceID == nil || *r.SenderDeviceID == "" {
 		return fmt.Errorf("voice chat edits require end-to-end encryption")
-	}
-	if contentLen == 0 {
-		return fmt.Errorf("content required")
-	}
-	if contentLen > MaxMessageLength {
-		return fmt.Errorf("content exceeds %d characters", MaxMessageLength)
 	}
 	return nil
 }
