@@ -805,6 +805,7 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 		// Clean account-specific rows that either lack a cascading FK or need explicit SET NULL
 		// behavior before the final DELETE. Remaining ON DELETE CASCADE relations are handled by SQLite.
 		manualCascadeDeletes := []string{
+			`DELETE FROM voice_messages WHERE user_id = ?`,
 			`DELETE FROM user_roles WHERE user_id = ?`,
 			`DELETE FROM sessions WHERE user_id = ?`,
 			`DELETE FROM channel_reads WHERE user_id = ?`,
