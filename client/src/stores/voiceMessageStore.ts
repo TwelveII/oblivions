@@ -10,18 +10,24 @@
 import { create } from "zustand";
 import * as voiceMessageApi from "../api/voiceMessages";
 import type { UploadOptions } from "../api/client";
-import type { VoiceMessage } from "../types";
+import type { VoiceMessage, Message } from "../types";
+import { useE2EEStore, canEncrypt } from "./e2eeStore";
+import { useAuthStore } from "./authStore";
+import { useToastStore } from "./toastStore";
+import { encryptChannelMessage, decryptChannelMessages } from "../crypto/channelEncryption";
+import { encodePayload } from "../crypto/e2eePayload";
+import { encryptFilesForE2EE, encryptedEditPayload } from "./shared/messageUtils";
 
 type VoiceMessageState = {
   /** channelId -> messages (chronological asc) */
   messagesByChannel: Record<string, VoiceMessage[]>;
 
   /** Replace the entire list for a channel (used after listVoiceMessages). */
-  setForChannel: (channelId: string, messages: VoiceMessage[]) => void;
+  setForChannel: (channelId: string, messages: VoiceMessage[]) => Promise<void>;
   /** Append a single message from WS create event (dedup by id). */
-  append: (message: VoiceMessage) => void;
+  append: (message: VoiceMessage) => Promise<void>;
   /** Replace an existing message in place after edit. */
-  update: (message: VoiceMessage) => void;
+  update: (message: VoiceMessage) => Promise<void>;
   /** Remove a deleted message. */
   remove: (channelId: string, messageId: string) => void;
   /** Wipe all messages for a channel (fired when channel goes empty). */
@@ -41,43 +47,73 @@ type VoiceMessageState = {
   del: (channelId: string, messageId: string) => Promise<boolean>;
 };
 
+async function decryptVoiceMessage(message: VoiceMessage): Promise<VoiceMessage> {
+  const asMessage: Message = {
+    id: message.id,
+    channel_id: message.channel_id,
+    user_id: message.user_id,
+    content: message.content,
+    edited_at: message.edited_at,
+    created_at: message.created_at,
+    reply_to_id: null,
+    referenced_message: null,
+    author: message.author,
+    attachments: (message.attachments ?? []).map((a) => ({
+      id: a.id, message_id: a.voice_message_id, filename: a.filename,
+      file_url: a.file_url, file_size: a.file_size, mime_type: a.mime_type,
+    })),
+    mentions: [],
+    role_mentions: [],
+    reactions: [],
+    encryption_version: message.encryption_version ?? 0,
+    ciphertext: message.ciphertext,
+    sender_device_id: message.sender_device_id,
+    e2ee_metadata: message.e2ee_metadata,
+  };
+  const [decrypted] = await decryptChannelMessages([asMessage]);
+  return { ...message, content: decrypted.content, e2ee_file_keys: decrypted.e2ee_file_keys };
+}
+
 export const useVoiceMessageStore = create<VoiceMessageState>((set, get) => ({
   messagesByChannel: {},
 
-  setForChannel: (channelId, messages) => {
+  setForChannel: async (channelId, messages) => {
+    const decrypted = await Promise.all(messages.map(decryptVoiceMessage));
     set((state) => ({
-      messagesByChannel: { ...state.messagesByChannel, [channelId]: messages },
+      messagesByChannel: { ...state.messagesByChannel, [channelId]: decrypted },
     }));
   },
 
-  append: (message) => {
+  append: async (message) => {
+    const decrypted = await decryptVoiceMessage(message);
     set((state) => {
-      const existing = state.messagesByChannel[message.channel_id] ?? [];
-      if (existing.some((m) => m.id === message.id)) return state;
+      const existing = state.messagesByChannel[decrypted.channel_id] ?? [];
+      if (existing.some((m) => m.id === decrypted.id)) return state;
       return {
         messagesByChannel: {
           ...state.messagesByChannel,
-          [message.channel_id]: [...existing, message],
+          [decrypted.channel_id]: [...existing, decrypted],
         },
       };
     });
   },
 
-  update: (message) => {
+  update: async (message) => {
+    const decrypted = await decryptVoiceMessage(message);
     set((state) => {
-      const list = state.messagesByChannel[message.channel_id];
+      const list = state.messagesByChannel[decrypted.channel_id];
       if (!list) return state;
       let changed = false;
       const next = list.map((m) => {
-        if (m.id === message.id) {
+        if (m.id === decrypted.id) {
           changed = true;
-          return message;
+          return decrypted;
         }
         return m;
       });
       if (!changed) return state;
       return {
-        messagesByChannel: { ...state.messagesByChannel, [message.channel_id]: next },
+        messagesByChannel: { ...state.messagesByChannel, [decrypted.channel_id]: next },
       };
     });
   },
@@ -106,19 +142,56 @@ export const useVoiceMessageStore = create<VoiceMessageState>((set, get) => ({
   // ─── Mutations ───
 
   send: async (channelId, content, files, upload) => {
-    const res = await voiceMessageApi.sendVoiceMessage(channelId, content, files, upload);
-    if (!res.success || !res.data) return false;
-
-    get().append(res.data);
-    return true;
+    const e2ee = useE2EEStore.getState();
+    const userId = useAuthStore.getState().user?.id;
+    if (!canEncrypt(e2ee) || !userId || !e2ee.localDeviceId) {
+      useToastStore.getState().addToast("error", "Encryption is still setting up. Try again shortly.");
+      return false;
+    }
+    try {
+      const encrypted = files?.length ? await encryptFilesForE2EE(files, upload?.signal) : undefined;
+      const payload = encodePayload(content, encrypted?.metas);
+      const senderKeyMessage = await encryptChannelMessage(channelId, userId, e2ee.localDeviceId, payload);
+      const res = await voiceMessageApi.sendVoiceMessage(
+        channelId, JSON.stringify(senderKeyMessage), e2ee.localDeviceId, JSON.stringify({}), encrypted?.files, upload
+      );
+      if (!res.success || !res.data) return false;
+      await get().append({ ...res.data, content, e2ee_file_keys: encrypted?.metas });
+      return true;
+    } catch (error) {
+      console.error("[voiceMessageStore] encrypted send failed:", error);
+      useToastStore.getState().addToast("error", "Could not encrypt this voice chat message.");
+      return false;
+    }
   },
 
   edit: async (channelId, messageId, content) => {
-    const res = await voiceMessageApi.editVoiceMessage(channelId, messageId, content);
-    if (!res.success || !res.data) return false;
-
-    get().update(res.data);
-    return true;
+    const e2ee = useE2EEStore.getState();
+    const userId = useAuthStore.getState().user?.id;
+    if (!canEncrypt(e2ee) || !userId || !e2ee.localDeviceId) {
+      useToastStore.getState().addToast("error", "Encryption is still setting up. Try again shortly.");
+      return false;
+    }
+    const held = (get().messagesByChannel[channelId] ?? []).find((message) => message.id === messageId);
+    if (!held) return false;
+    const payload = encryptedEditPayload(content, held);
+    if (payload === null) {
+      useToastStore.getState().addToast("error", "Attachment encryption keys are unavailable.");
+      return false;
+    }
+    try {
+      const senderKeyMessage = await encryptChannelMessage(channelId, userId, e2ee.localDeviceId, payload);
+      const res = await voiceMessageApi.editVoiceMessage(
+        channelId, messageId, JSON.stringify(senderKeyMessage), e2ee.localDeviceId, JSON.stringify({})
+      );
+      if (!res.success || !res.data) return false;
+      await get().update({ ...res.data, content, e2ee_file_keys: held.e2ee_file_keys });
+      return true;
+    } catch (error) {
+      console.error("[voiceMessageStore] encrypted edit failed:", error);
+      useToastStore.getState().addToast("error", "Could not encrypt this voice chat edit.");
+      return false;
+    }
   },
 
   del: async (channelId, messageId) => {
