@@ -167,6 +167,11 @@ export type VoiceMessage = {
   created_at: string;
   author: User;
   attachments: VoiceMessageAttachment[];
+  encryption_version: EncryptionVersion;
+  ciphertext?: string | null;
+  sender_device_id?: string | null;
+  e2ee_metadata?: string | null;
+  e2ee_file_keys?: import("../crypto/fileEncryption").EncryptedFileMeta[];
 };
 
 export type VoiceMessageAttachment = {
