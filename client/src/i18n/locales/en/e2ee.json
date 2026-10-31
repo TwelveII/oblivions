@@ -1,6 +1,6 @@
 {
   "title": "Encryption",
-  "description": "End-to-end encryption protects your messages so that only you and the recipient can read them.",
+  "description": "End-to-end encryption is always on for direct messages, channel messages, and voice-channel chat. Only conversation members with their keys can read the content.",
 
   "setupTitle": "Set Up Encryption",
   "setupDescription": "This device needs to be set up for end-to-end encryption. You can generate new keys or restore from a recovery password.",
@@ -57,9 +57,9 @@
   "fileDecryptFailed": "Failed to decrypt file",
   "clientSearchNote": "Searching locally (E2EE)",
 
-  "voiceE2eeEnabled": "Voice calls are end-to-end encrypted",
+  "voiceE2eeEnabled": "Voice calls and voice-channel chat are end-to-end encrypted",
   "voiceE2eeError": "Voice encryption error",
-  "encryptionActive": "Encryption is active",
+  "encryptionActive": "End-to-end encryption is always on",
   "encryptionNotSetup": "Encryption not set up",
   "fingerprintLabel": "Your key fingerprint",
   "fingerprintCopied": "Fingerprint copied to clipboard",
@@ -71,16 +71,16 @@
   "setupBackToChoice": "Back",
   "recipientNoKeys": "This user hasn't set up encryption yet. They need to log in first.",
 
-  "enableE2EE": "Enable End-to-End Encryption",
-  "disableE2EE": "Disable End-to-End Encryption",
-  "e2eeEnabled": "End-to-end encryption enabled",
-  "e2eeDisabled": "End-to-end encryption disabled",
-  "e2eeToggleFailed": "Failed to change encryption setting",
+  "enableE2EE": "End-to-End Encryption Is Always On",
+  "disableE2EE": "Encryption Cannot Be Disabled",
+  "e2eeEnabled": "End-to-end encryption is always active",
+  "e2eeDisabled": "End-to-end encryption cannot be disabled",
+  "e2eeToggleFailed": "Encryption settings cannot be changed",
 
   "enableE2EEConfirmDM": "Messages will be encrypted end-to-end. Only you and the other person will be able to read them. Both users need to have encryption keys set up for this to work.",
-  "disableE2EEConfirmDM": "New messages will no longer be encrypted. Previously encrypted messages will remain encrypted but new messages will be sent as plain text.",
+  "disableE2EEConfirmDM": "End-to-end encryption is mandatory and cannot be disabled.",
   "enableE2EEConfirmServer": "All new messages in this server will be encrypted end-to-end. Only members with encryption keys set up will be able to read them. Members without keys will see encrypted messages they cannot decrypt.",
-  "disableE2EEConfirmServer": "New messages will no longer be encrypted. Previously encrypted messages will remain encrypted but new messages will be sent as plain text. This affects all channels in this server.",
+  "disableE2EEConfirmServer": "End-to-end encryption is mandatory and cannot be disabled.",
 
   "mandatoryRecoveryDescription": "Your encryption keys have been generated. Set a recovery password to protect them. If you lose access to all your devices, this password will be the only way to recover your encrypted messages.",
   "mandatoryRecoveryHint": "You can change this password anytime from Settings > Encryption.",
