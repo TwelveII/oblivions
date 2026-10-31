@@ -68,12 +68,15 @@ function VoiceChatProvider({ channelId, channelName, children }: Props) {
   useEffect(() => {
     let cancelled = false;
     setIsLoading(true);
-    listVoiceMessages(channelId).then((res) => {
+    listVoiceMessages(channelId).then(async (res) => {
       if (cancelled) return;
       if (res.success && res.data) {
         await setForChannel(channelId, res.data);
       }
-      setIsLoading(false);
+      if (!cancelled) setIsLoading(false);
+    }).catch((error) => {
+      console.error("[VoiceChatProvider] failed to load voice chat", error);
+      if (!cancelled) setIsLoading(false);
     });
     return () => { cancelled = true; };
   }, [channelId, setForChannel]);
