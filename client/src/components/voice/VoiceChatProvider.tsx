@@ -42,6 +42,8 @@ function VoiceChatProvider({ channelId, channelName, children }: Props) {
         user_id: m.user_id,
         content: m.content,
         edited_at: m.edited_at,
+        encryption_version: m.encryption_version,
+        e2ee_file_keys: m.e2ee_file_keys,
         created_at: m.created_at,
         reply_to_id: null,
         is_pinned: false,
