@@ -9,7 +9,6 @@ import { useDMStore } from "../../stores/dmStore";
 import { useE2EEStore } from "../../stores/e2eeStore";
 import { useAppFocusStore } from "../../stores/appFocusStore";
 import { authorDisplayName, authorAvatarURL, isAuthorDeleted } from "../../utils/deletedUser";
-import { useToastStore } from "../../stores/toastStore";
 import { useBlockStore } from "../../stores/blockStore";
 import { useP2PCallStore } from "../../stores/p2pCallStore";
 import { useChatContext } from "../../hooks/useChatContext";
@@ -86,7 +85,6 @@ function DMChatContent({
   const e2eeReady = useE2EEStore((s) => s.initStatus === "ready");
   const channels = useDMStore((s) => s.channels);
   const dmE2EEEnabled = channels.find((ch) => ch.id === channelId)?.e2ee_enabled ?? true;
-  const addToast = useToastStore((s) => s.addToast);
   const currentUserId = useAuthStore((s) => s.user?.id);
   const acceptDMRequest = useDMStore((s) => s.acceptDMRequest);
   const declineDMRequest = useDMStore((s) => s.declineDMRequest);
