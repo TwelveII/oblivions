@@ -110,7 +110,6 @@ type DMCoreState = {
   acceptDMRequest: (channelId: string) => Promise<void>;
   declineDMRequest: (channelId: string) => Promise<void>;
 
-  toggleE2EE: (channelId: string, enabled: boolean) => Promise<boolean>;
 
   getMessagesForChannel: (channelId: string) => DMMessage[];
   getTypingUsers: (channelId: string) => string[];
@@ -621,21 +620,6 @@ export const useDMStore = create<DMStore>((set, get, store) => ({
         selectedDMId: state.selectedDMId === channelId ? null : state.selectedDMId,
       }));
     }
-  },
-
-  toggleE2EE: async (channelId, enabled) => {
-    const res = await dmApi.toggleDME2EE(channelId, enabled);
-    if (res.success && res.data) {
-      set((state) => ({
-        channels: state.channels.map((ch) =>
-          ch.id === channelId ? { ...ch, e2ee_enabled: enabled } : ch
-        ),
-      }));
-      if (enabled) {
-        useE2EEStore.getState().checkAndPromptRecovery();
-      }
-    }
-    return res.success;
   },
 
   getMessagesForChannel: (channelId) => {
