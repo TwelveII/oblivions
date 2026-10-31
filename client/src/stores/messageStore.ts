@@ -469,15 +469,15 @@ export const useMessageStore = create<MessageState>((set, get) => ({
     // Same rules as sendMessage: the flag comes from the server being edited in, and an unknown
     // state refuses rather than rewriting an encrypted message as plaintext.
     const editServerE2EE = selectServerE2EE(serverId)(useServerStore.getState());
-    if (editServerE2EE === undefined) {
+    if (editServerE2EE !== true) {
       useToastStore.getState().addToast("error", i18n.t("chat:encryptionStateUnknown"));
       return false;
     }
-    if (editServerE2EE && !canEncrypt(e2eeState)) {
+    if (!canEncrypt(e2eeState)) {
       useToastStore.getState().addToast("error", i18n.t("chat:encryptionRequired"));
       return false;
     }
-    if (editServerE2EE && e2eeState.initStatus === "ready" && e2eeState.localDeviceId) {
+    if (e2eeState.initStatus === "ready" && e2eeState.localDeviceId) {
       const currentUserId = useAuthStore.getState().user?.id;
       // Find which channel this message belongs to
       const allChannels = get().messagesByChannel;
@@ -525,9 +525,8 @@ export const useMessageStore = create<MessageState>((set, get) => ({
       }
     }
 
-    // Plaintext fallback
-    const res = await messageApi.editMessage(serverId, messageId, content);
-    return res.success;
+    useToastStore.getState().addToast("error", i18n.t("chat:encryptionRequired"));
+    return false;
   },
 
   deleteMessage: async (messageId, explicitServerId?) => {
