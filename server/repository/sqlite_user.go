@@ -769,10 +769,9 @@ func (r *sqliteUserRepo) DeleteAllMessagesByUser(ctx context.Context, userID str
 	return nil
 }
 
-// HardDeleteUser anonymizes the user (tombstone): username renamed to deleted_<id>,
-// personal data wiped, password cleared, all relationships removed. The users row
-// itself is NOT deleted — messages.user_id, dm_messages.user_id, and similar refs
-// keep referential integrity so historical messages survive as "[deleted user]".
+// HardDeleteUser permanently removes the account and all account-owned data.
+// Authored messages and every DM conversation are deleted; owned servers cascade too.
+// The caller collects file references before this transaction and deletes files afterward.
 //
 // Runs in a transaction so partial deletes cannot occur.
 //
@@ -803,10 +802,8 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 	_ = byAdmin // retained for repository interface compatibility
 
 	return database.WithTx(ctx, db, func(tx *sql.Tx) error {
-		// ─── Manual cleanup of CASCADE-on-user tables (CASCADE won't fire — user row stays) ───
-		// Table names verified against migrations 001-060.
-		// device_one_time_prekeys cascades via user_devices composite FK; soundboard_attachments
-		// cascade via messages on the FK we leave intact (messages stay tombstoned).
+		// Clean account-specific rows that either lack a cascading FK or need explicit SET NULL
+		// behavior before the final DELETE. Remaining ON DELETE CASCADE relations are handled by SQLite.
 		manualCascadeDeletes := []string{
 			`DELETE FROM user_roles WHERE user_id = ?`,
 			`DELETE FROM sessions WHERE user_id = ?`,
@@ -842,10 +839,8 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 			}
 		}
 
-		// ─── Manually replicate ON DELETE behavior for tables that reference users.id ───
-		// User row is preserved (tombstone), so CASCADE/SET NULL never fires on its own.
-		// We replicate the semantics manually so a hard-deleted user leaves no audit
-		// trail (deleted_<id> references) on their non-message relationships.
+		// Apply explicit SET NULL behavior for optional attribution references. Required
+		// relationships are deleted below or allowed to cascade from the user row.
 		//
 		// CASCADE → DELETE (pin record only — the pinned message itself stays)
 		if _, err := tx.ExecContext(ctx, `DELETE FROM pinned_messages WHERE pinned_by = ?`, userID); err != nil {
@@ -870,11 +865,7 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 		if _, err := tx.ExecContext(ctx, `DELETE FROM bans WHERE user_id = ?`, userID); err != nil {
 			return fmt.Errorf("failed to clean up bans: %w", err)
 		}
-		// Owned servers: hard-delete cascades channels/messages/etc.
-		if _, err := tx.ExecContext(ctx, `DELETE FROM servers WHERE owner_id = ?`, userID); err != nil {
-			return fmt.Errorf("failed to delete owned servers: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM reports WHERE reporter_id = ? OR reported_user_id = ?`, userID, userID); err != nil {
+				if _, err := tx.ExecContext(ctx, `DELETE FROM reports WHERE reporter_id = ? OR reported_user_id = ?`, userID, userID); err != nil {
 			return fmt.Errorf("failed to delete user reports: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE reports SET resolved_by = NULL WHERE resolved_by = ?`, userID); err != nil {
