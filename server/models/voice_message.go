@@ -7,22 +7,20 @@ import (
 	"unicode/utf8"
 )
 
-// VoiceMessage — ephemeral chat tied to an active voice channel session.
-// All rows for a channel are deleted when the last participant leaves.
+// VoiceMessage is ephemeral chat tied to an active voice channel session.
 type VoiceMessage struct {
-	ID          string                   `json:"id"`
-	ChannelID   string                   `json:"channel_id"`
-	UserID      string                   `json:"user_id"`
+	ID                string                   `json:"id"`
+	ChannelID         string                   `json:"channel_id"`
+	UserID            string                   `json:"user_id"`
 	Content           *string                  `json:"content"`
 	EncryptionVersion int                      `json:"encryption_version"`
 	Ciphertext        *string                  `json:"ciphertext,omitempty"`
 	SenderDeviceID    *string                  `json:"sender_device_id,omitempty"`
 	E2EEMetadata      *string                  `json:"e2ee_metadata,omitempty"`
 	EditedAt          *time.Time               `json:"edited_at"`
-	E2EEFileKeys      []EncryptedFileMeta      `json:"e2ee_file_keys,omitempty"
-	CreatedAt   time.Time                `json:"created_at"`
-	Author      *User                    `json:"author,omitempty"`
-	Attachments []VoiceMessageAttachment `json:"attachments,omitempty"`
+	CreatedAt         time.Time                `json:"created_at"`
+	Author            *User                    `json:"author,omitempty"`
+	Attachments       []VoiceMessageAttachment `json:"attachments,omitempty"`
 }
 
 type VoiceMessageAttachment struct {
@@ -35,8 +33,12 @@ type VoiceMessageAttachment struct {
 }
 
 type CreateVoiceMessageRequest struct {
-	Content  string `json:"content"`
-	HasFiles bool   `json:"-"`
+	Content           string  `json:"content"`
+	EncryptionVersion int     `json:"encryption_version"`
+	Ciphertext        *string `json:"ciphertext,omitempty"`
+	SenderDeviceID    *string `json:"sender_device_id,omitempty"`
+	E2EEMetadata      *string `json:"e2ee_metadata,omitempty"`
+	HasFiles          bool    `json:"-"`
 }
 
 func (r *CreateVoiceMessageRequest) Validate() error {
@@ -59,7 +61,7 @@ type UpdateVoiceMessageRequest struct {
 	EncryptionVersion int     `json:"encryption_version"`
 	Ciphertext        *string `json:"ciphertext,omitempty"`
 	SenderDeviceID    *string `json:"sender_device_id,omitempty"`
-	E2EEMetadata      *string `json:"e2ee_metadata,omitempty"
+	E2EEMetadata      *string `json:"e2ee_metadata,omitempty"`
 }
 
 func (r *UpdateVoiceMessageRequest) Validate() error {
