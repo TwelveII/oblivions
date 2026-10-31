@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
 	"github.com/akinalp/mqvi/ws"
 )
 
