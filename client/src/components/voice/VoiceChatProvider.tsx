@@ -71,7 +71,7 @@ function VoiceChatProvider({ channelId, channelName, children }: Props) {
     listVoiceMessages(channelId).then((res) => {
       if (cancelled) return;
       if (res.success && res.data) {
-        setForChannel(channelId, res.data);
+        await setForChannel(channelId, res.data);
       }
       setIsLoading(false);
     });
@@ -97,7 +97,7 @@ function VoiceChatProvider({ channelId, channelName, children }: Props) {
   const fetchMessages = useCallback(async () => {
     const res = await listVoiceMessages(channelId);
     if (res.success && res.data) {
-      setForChannel(channelId, res.data);
+      await setForChannel(channelId, res.data);
     }
   }, [channelId, setForChannel]);
 
