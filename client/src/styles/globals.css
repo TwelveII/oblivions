@@ -5205,3 +5205,34 @@ button.ch-tree-vu-stream svg { width:21px;height:21px; }
 .guide-spot-next { height:30px;padding:0 14px;border:none;border-radius:6px;background:var(--primary);color:#fff;font-size:13px;font-weight:600;cursor:pointer; }
 .guide-spot-next:hover { background:var(--primary-h); }
 
+
+
+/* MQVI interaction polish: consistent focus, controls, and motion preferences. */
+:where(button, a, input, select, textarea, [role="button"], [tabindex]):focus-visible {
+  outline: 2px solid var(--primary-h, var(--primary));
+  outline-offset: 2px;
+}
+:where(button, input, select, textarea) {
+  accent-color: var(--primary);
+}
+:where(button, [role="button"]) {
+  -webkit-tap-highlight-color: transparent;
+}
+:where(button:not(:disabled), [role="button"]:not([aria-disabled="true"])) {
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+:where(button:disabled, input:disabled, select:disabled, textarea:disabled) {
+  cursor: not-allowed;
+}
+::selection {
+  background: var(--primary-m, rgba(59, 130, 246, .25));
+  color: var(--t0, inherit);
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}
