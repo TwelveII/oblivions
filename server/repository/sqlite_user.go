@@ -968,14 +968,13 @@ func (r *sqliteUserRepo) Restore(ctx context.Context, userID string) error {
 	return nil
 }
 
-// ListSoftDeletedExpired returns soft-deleted users (not yet tombstone) past TTL.
-// Used by cleanup worker to identify users ready for tombstone hard-delete.
+// ListSoftDeletedExpired returns recoverable soft-deletes past TTL and legacy tombstone rows.
+// The cleanup worker permanently removes both; legacy tombstones are eligible immediately.
 func (r *sqliteUserRepo) ListSoftDeletedExpired(ctx context.Context, ttlDays int) ([]models.User, error) {
 	query := `SELECT ` + userColumns + `
 		FROM users
 		WHERE deleted_at IS NOT NULL
-		  AND is_hard_deleted = 0
-		  AND deleted_at < datetime('now', ?)
+		  AND (is_hard_deleted = 1 OR (is_hard_deleted = 0 AND deleted_at < datetime('now', ?)))
 		ORDER BY deleted_at ASC`
 	rows, err := r.db.QueryContext(ctx, query, fmt.Sprintf("-%d days", ttlDays))
 	if err != nil {
