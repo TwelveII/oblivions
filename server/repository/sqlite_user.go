@@ -832,6 +832,7 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 			`DELETE FROM user_preferences WHERE user_id = ?`,
 			`DELETE FROM soundboard_sounds WHERE uploaded_by = ?`,
 			`DELETE FROM user_storage WHERE user_id = ?`,
+			`DELETE FROM signup_invite_codes WHERE inviter_user_id = ?`,
 		}
 		for _, q := range manualCascadeDeletes {
 			args := []any{userID}
@@ -892,128 +893,58 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 			return fmt.Errorf("failed to delete user dm settings: %w", err)
 		}
 
-		// ─── Anonymize the user row (tombstone) ───
-		// Username renamed to deleted_<id> so original is freed for re-registration.
-		// Email/password cleared so user cannot log in. Personal data wiped.
-		// is_platform_banned + platform ban fields preserved if applicable (separate flow).
-		result, err := tx.ExecContext(ctx, `
-			UPDATE users SET
-				username = 'deleted_' || id,
-				email = NULL,
-				display_name = NULL,
-				avatar_url = NULL,
-				wallpaper_url = NULL,
-				custom_status = NULL,
-				password_hash = '',
-				status = 'offline',
-				pref_status = 'offline',
-				language = 'en',
-				dm_privacy = 'everyone',
-				is_platform_admin = 0,
-				has_seen_download_prompt = 0,
-				has_seen_welcome = 0,
-				guide_hidden = 0,
-				guide_done = 0,
-				deleted_at = CURRENT_TIMESTAMP,
-				deleted_by_admin = ?,
-				is_hard_deleted = 1,
-				token_version = token_version + 1
-			WHERE id = ?`,
-			byAdminInt, userID,
-		)
-		if err != nil {
-			return fmt.Errorf("failed to anonymize user (tombstone): %w", err)
+		// Delete authored content and every DM conversation involving this account.
+		// The DM channel cascade removes both participants' history in that conversation.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE user_id = ?`, userID); err != nil {
+			return fmt.Errorf("failed to delete authored channel messages: %w", err)
 		}
-
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("failed to check rows affected: %w", err)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM dm_channels WHERE user1_id = ? OR user2_id = ?`, userID, userID); err != nil {
+			return fmt.Errorf("failed to delete DM conversations: %w", err)
 		}
-		if affected == 0 {
-			return pkg.ErrNotFound
+		if _, err := tx.ExecContext(ctx, `DELETE FROM servers WHERE owner_id = ?`, userID); err != nil {
+			return fmt.Errorf("failed to delete owned servers: %w", err)
 		}
-
-		// ─── Post-condition: dynamic FK residual-reference check ───
-		// Enumerate all FKs pointing to users(id) via sqlite_master + pragma_foreign_key_list,
-		// then verify no non-allowlisted (table, column) still references this user. If a future
-		// migration adds a new FK to users without updating cleanup logic above, this check
-		// rolls back the tx instead of leaving silent orphan refs.
-		if err := assertNoResidualUserRefs(ctx, tx, userID); err != nil {
-			return err
+		if _, err := tx.ExecContext(ctx, `DELETE FROM reports WHERE reporter_id = ? OR reported_user_id = ?`, userID, userID); err != nil {
+			return fmt.Errorf("failed to delete user reports: %w", err)
 		}
+		if _, err := tx.ExecContext(ctx, `UPDATE reports SET resolved_by = NULL WHERE resolved_by = ?`, userID); err != nil {
+			return fmt.Errorf("failed to clear report resolver: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM feedback_replies WHERE user_id = ?`, userID); err != nil {
+			return fmt.Errorf("failed to delete feedback replies: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM feedback_tickets WHERE user_id = ?`, userID); err != nil {
+			return fmt.Errorf("failed to delete feedback tickets: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM user_dm_settings WHERE user_id = ?`, userID); err != nil {
+			return fmt.Errorf("failed to delete DM settings: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, userID); err != nil {
+			return fmt.Errorf("failed to permanently delete user row: %w", err)
+		}
+		if err := assertNoResidualUserRefs(ctx, tx, userID); err != nil { return err }
 
 		return nil
 	})
 }
 
-// allowedTombstoneUserRefs lists (table.column) FKs to users(id) that are INTENTIONALLY
-// preserved after HardDeleteUser. Adding a new entry here is a deliberate design choice
-// (tombstone-visible authorship, durable platform ban audit, etc) — every other FK to
-// users(id) MUST be cleaned up inside the HardDeleteUser tx.
-var allowedTombstoneUserRefs = map[string]struct{}{
-	// Author tombstones — historical message visibility ("[deleted user]").
-	"messages.user_id":     {},
-	"dm_messages.user_id":  {},
-	"dm_channels.user1_id": {},
-	"dm_channels.user2_id": {},
-	// Durable platform ban — survives hard delete by design (user_repository.go docstring).
-	// platform_bans currently has NO foreign keys (migration 060: user_id and banned_by are
-	// plain TEXT columns), so these entries are inert today. Listed as forward-looking
-	// insurance: if a future migration converts user_id or banned_by to FK REFERENCES users(id),
-	// the residual check must continue to allow them — otherwise hard-delete would wipe
-	// the ban audit trail this table exists to preserve.
-	"platform_bans.user_id":   {},
-	"platform_bans.banned_by": {},
-}
-
-// assertNoResidualUserRefs runs inside the HardDeleteUser tx. It enumerates every FK
-// to users(id) currently in the schema and verifies that no row outside the
-// allowedTombstoneUserRefs set still references userID. Failure rolls back the tx.
+// assertNoResidualUserRefs verifies no foreign key still points to a permanently deleted account.
 func assertNoResidualUserRefs(ctx context.Context, tx *sql.Tx, userID string) error {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT m.name, fk."from"
 		FROM sqlite_master m, pragma_foreign_key_list(m.name) fk
 		WHERE m.type = 'table' AND fk."table" = 'users'`)
-	if err != nil {
-		return fmt.Errorf("FK enumeration failed: %w", err)
-	}
+	if err != nil { return fmt.Errorf("FK enumeration failed: %w", err) }
 	defer rows.Close()
-
-	type fkRef struct {
-		table  string
-		column string
-	}
+	type fkRef struct { table, column string }
 	var refs []fkRef
-	for rows.Next() {
-		var r fkRef
-		if err := rows.Scan(&r.table, &r.column); err != nil {
-			return fmt.Errorf("FK scan: %w", err)
-		}
-		refs = append(refs, r)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("FK iteration: %w", err)
-	}
-
-	for _, r := range refs {
-		key := r.table + "." + r.column
-		if _, ok := allowedTombstoneUserRefs[key]; ok {
-			continue
-		}
-		// %q quotes identifiers; values from sqlite_master are trustworthy schema names.
-		q := fmt.Sprintf(`SELECT COUNT(*) FROM %q WHERE %q = ?`, r.table, r.column)
+	for rows.Next() { var ref fkRef; if err := rows.Scan(&ref.table,&ref.column); err != nil { return fmt.Errorf("FK scan: %w",err) }; refs=append(refs,ref) }
+	if err := rows.Err(); err != nil { return fmt.Errorf("FK iteration: %w",err) }
+	for _, ref := range refs {
+		query := fmt.Sprintf(`SELECT COUNT(*) FROM %q WHERE %q = ?`,ref.table,ref.column)
 		var count int
-		if err := tx.QueryRowContext(ctx, q, userID).Scan(&count); err != nil {
-			return fmt.Errorf("residual ref check %s: %w", key, err)
-		}
-		if count > 0 {
-			return fmt.Errorf(
-				"hard delete left %d residual reference(s) in %s for user %s — "+
-					"either add cleanup to HardDeleteUser or, if intentional, "+
-					"add %q to allowedTombstoneUserRefs",
-				count, key, userID, key,
-			)
-		}
+		if err := tx.QueryRowContext(ctx,query,userID).Scan(&count); err != nil { return fmt.Errorf("residual reference check %s.%s: %w",ref.table,ref.column,err) }
+		if count != 0 { return fmt.Errorf("permanent deletion left %d reference(s) in %s.%s",count,ref.table,ref.column) }
 	}
 	return nil
 }
