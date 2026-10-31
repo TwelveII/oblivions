@@ -865,6 +865,9 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 		if _, err := tx.ExecContext(ctx, `DELETE FROM bans WHERE user_id = ?`, userID); err != nil {
 			return fmt.Errorf("failed to clean up bans: %w", err)
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM platform_bans WHERE user_id = ? OR banned_by = ?`, userID, userID); err != nil {
+			return fmt.Errorf("failed to delete platform ban records: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM reports WHERE reporter_id = ? OR reported_user_id = ?`, userID, userID); err != nil {
 			return fmt.Errorf("failed to delete user reports: %w", err)
 		}
