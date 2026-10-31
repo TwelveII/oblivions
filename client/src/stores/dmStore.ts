@@ -135,19 +135,11 @@ function dmSendMode(channel: DMChannelWithUser | undefined): "e2ee" | { refusal:
 }
 
 async function prepareDMSend(
-  mode: "plaintext" | "e2ee",
   recipientUserId: string,
   content: string,
   files: File[],
   signal: AbortSignal
 ): Promise<PreparedSend> {
-  if (mode === "plaintext") {
-    const thumbs = files.length > 0
-      ? await mapWithConcurrency(files, PREVIEW_CONCURRENCY, (file) => buildAttachmentPreview(file, signal))
-      : undefined;
-    return { thumbs };
-  }
-
   const { localDeviceId } = useE2EEStore.getState();
   const userId = useAuthStore.getState().user?.id;
   if (!localDeviceId || !userId) throw new Error("E2EE device not ready");
@@ -185,7 +177,7 @@ function dmAttempt(nonce: string): SendAttempt {
       }
       try {
         // dmSendMode answers "e2ee" only for a channel it found.
-        prepared = await prepareDMSend(mode, channel?.other_user.id ?? "", entry.content, entry.files, signal);
+        prepared = await prepareDMSend(channel?.other_user.id ?? "", entry.content, entry.files, signal);
       } catch (err) {
         return encryptionFailureOutcome(err, "dmStore");
       }
@@ -195,12 +187,14 @@ function dmAttempt(nonce: string): SendAttempt {
 
     const replyToId = entry.replyToId ?? undefined;
     const sealed = prepared.encrypted;
-    const res = sealed
-      ? await dmApi.sendEncryptedDMMessage(
-          channelId, sealed.ciphertext, sealed.deviceId, sealed.metadata,
-          sealed.files, replyToId, upload, prepared.thumbs, nonce
-        )
-      : await dmApi.sendDMMessage(channelId, entry.content, entry.files, replyToId, upload, prepared.thumbs, nonce);
+    if (!sealed) {
+      useToastStore.getState().addToast("error", i18n.t("chat:encryptionRequired"));
+      return "rejected";
+    }
+    const res = await dmApi.sendEncryptedDMMessage(
+      channelId, sealed.ciphertext, sealed.deviceId, sealed.metadata,
+      sealed.files, replyToId, upload, prepared.thumbs, nonce
+    );
 
     if (!res.success) return sendFailureOutcome(res);
     if (res.data) {
