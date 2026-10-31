@@ -331,11 +331,10 @@ func (s *adminUserService) ExpireSoftDeletedUser(ctx context.Context, targetUser
 	if target.DeletedAt == nil {
 		return fmt.Errorf("%w: user is not soft-deleted", pkg.ErrBadRequest)
 	}
-	if target.IsHardDeleted {
-		return fmt.Errorf("%w: account is already permanently deleted", pkg.ErrBadRequest)
-	}
+	// Legacy tombstones from older releases are purged immediately; recoverable
+	// soft-deletes still honor the 30-day restoration window.
 	cutoff := time.Now().UTC().AddDate(0, 0, -models.SoftDeleteTTLDays)
-	if target.DeletedAt.After(cutoff) {
+	if !target.IsHardDeleted && target.DeletedAt.After(cutoff) {
 		return fmt.Errorf("%w: soft-delete TTL not yet elapsed (deleted_at=%s)", pkg.ErrBadRequest, target.DeletedAt.Format(time.RFC3339))
 	}
 
