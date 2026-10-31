@@ -90,8 +90,7 @@ func TestSQLiteUserRepo_ResetPasswordWithTokenClearsSiblingTokensAndSessions(t *
 	}
 }
 
-// The tombstone keeps the user row, so push_tokens' ON DELETE CASCADE never fires; without the
-// explicit delete a deleted account's phone keeps its registration.
+// A permanent account deletion must remove push tokens as well as the account row.
 func TestSQLiteUserRepo_HardDeleteShouldRemoveThePushTokens(t *testing.T) {
 	ctx := context.Background()
 	db := newUserRepoTestDB(t)
@@ -116,7 +115,7 @@ func TestSQLiteUserRepo_HardDeleteShouldRemoveThePushTokens(t *testing.T) {
 	}
 }
 
-// Signup invite references must not block account tombstoning.
+// Signup invite references must not block physical account deletion.
 func TestSQLiteUserRepo_HardDeleteCleansSignupInviteReferences(t *testing.T) {
 	ctx := context.Background()
 	db := newUserRepoTestDB(t)
