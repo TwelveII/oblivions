@@ -22,7 +22,7 @@ func newTestMessageService(
 	reactionRepo *testutil.MockReactionRepo,
 	hub *testutil.MockBroadcastAndOnline,
 	permResolver *testutil.MockChannelPermResolver,
-	// Defaults to a plaintext server; pass one to exercise an encrypted one.
+	// Pass false to verify that plaintext is still rejected on legacy/unmigrated server state.
 	encryption ...stubServerEncryption,
 ) MessageService {
 	stub := stubServerEncryption{}
@@ -42,7 +42,7 @@ func newTestMessageService(
 }
 
 // stubServerEncryption answers the one question the message path asks about a server. Defaults to
-// an unencrypted server so the existing plaintext cases behave as before.
+// an unencrypted server so legacy state is covered by mandatory-encryption tests.
 type stubServerEncryption struct{ e2ee bool }
 
 func (s stubServerEncryption) IsE2EEEnabled(_ context.Context, _ string) (bool, error) {
@@ -573,27 +573,20 @@ func TestCreate_RejectsPlaintextOnEncryptedServer(t *testing.T) {
 		}
 	})
 
-	t.Run("should accept a plaintext message when the server does not require encryption", func(t *testing.T) {
-		if _, _, err := newSvc(false).Create(context.Background(), "ch1", "u1", &models.CreateMessageRequest{Content: "hello"}); err != nil {
-			t.Fatalf("plaintext on an unencrypted server should be allowed: %v", err)
+	t.Run("should reject a plaintext message even when legacy server state is disabled", func(t *testing.T) {
+		_, _, err := newSvc(false).Create(context.Background(), "ch1", "u1", &models.CreateMessageRequest{Content: "hello"})
+		if !errors.Is(err, pkg.ErrBadRequest) || pkg.CodeOf(err) != pkg.CodeEncryptionRequired {
+			t.Fatalf("want mandatory-encryption rejection, got %v", err)
 		}
 	})
 
 	// Nothing validates a ciphertext, so without this anyone could post an encrypted message to a
 	// plaintext server: unreadable by every member, missing from search, beyond moderation.
-	t.Run("should reject an encrypted message when the server does not use encryption", func(t *testing.T) {
+	t.Run("should accept encrypted messages when legacy server state is disabled", func(t *testing.T) {
 		cipher, device := "blob", "dev1"
-		_, _, err := newSvc(false).Create(context.Background(), "ch1", "u1", &models.CreateMessageRequest{
-			EncryptionVersion: 1,
-			Ciphertext:        &cipher,
-			SenderDeviceID:    &device,
-		})
-		if !errors.Is(err, pkg.ErrBadRequest) {
-			t.Fatalf("want ErrBadRequest, got %v", err)
-		}
-		if pkg.CodeOf(err) != pkg.CodeEncryptionNotAvailable {
-			t.Errorf("want code %q, got %q", pkg.CodeEncryptionNotAvailable, pkg.CodeOf(err))
-		}
+		if _, _, err := newSvc(false).Create(context.Background(), "ch1", "u1", &models.CreateMessageRequest{
+			EncryptionVersion: 1, Ciphertext: &cipher, SenderDeviceID: &device,
+		}); err != nil { t.Fatalf("encrypted message should be accepted: %v", err) }
 	})
 }
 
@@ -646,9 +639,10 @@ func TestUpdate_RejectsPlaintextOnEncryptedServer(t *testing.T) {
 		}
 	})
 
-	t.Run("should allow a plaintext edit when the server does not require encryption", func(t *testing.T) {
-		if _, err := newSvc(false).Update(context.Background(), "m1", "u1", &models.UpdateMessageRequest{Content: "fine"}); err != nil {
-			t.Fatalf("plaintext edit on an unencrypted server should be allowed: %v", err)
+	t.Run("should reject a plaintext edit even when legacy server state is disabled", func(t *testing.T) {
+		_, err := newSvc(false).Update(context.Background(), "m1", "u1", &models.UpdateMessageRequest{Content: "fine"})
+		if !errors.Is(err, pkg.ErrBadRequest) || pkg.CodeOf(err) != pkg.CodeEncryptionRequired {
+			t.Fatalf("want mandatory-encryption rejection, got %v", err)
 		}
 	})
 }
