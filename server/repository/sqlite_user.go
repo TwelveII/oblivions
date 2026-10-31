@@ -812,7 +812,7 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 			`DELETE FROM reactions WHERE user_id = ?`,
 			`DELETE FROM dm_reactions WHERE user_id = ?`,
 			`DELETE FROM dm_reads WHERE user_id = ?`,
-					`DELETE FROM dm_deliveries WHERE user_id = ?`,
+			`DELETE FROM dm_deliveries WHERE user_id = ?`,
 			`DELETE FROM friendships WHERE user_id = ? OR friend_id = ?`,
 			`DELETE FROM server_members WHERE user_id = ?`,
 			`DELETE FROM password_reset_tokens WHERE user_id = ?`,
@@ -852,8 +852,8 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 			`UPDATE badges SET created_by = NULL WHERE created_by = ?`,
 			`UPDATE user_badges SET assigned_by = NULL WHERE assigned_by = ?`,
 			`UPDATE servers SET deleted_by = NULL WHERE deleted_by = ?`,
-                        `UPDATE signup_invite_codes SET used_by_user_id = NULL WHERE used_by_user_id = ?`,
-                        `UPDATE users SET invited_by_user_id = NULL WHERE invited_by_user_id = ?`,
+            `UPDATE signup_invite_codes SET used_by_user_id = NULL WHERE used_by_user_id = ?`,
+            `UPDATE users SET invited_by_user_id = NULL WHERE invited_by_user_id = ?`,
 		}
 		for _, q := range setNullUpdates {
 			if _, err := tx.ExecContext(ctx, q, userID); err != nil {
@@ -865,7 +865,7 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 		if _, err := tx.ExecContext(ctx, `DELETE FROM bans WHERE user_id = ?`, userID); err != nil {
 			return fmt.Errorf("failed to clean up bans: %w", err)
 		}
-				if _, err := tx.ExecContext(ctx, `DELETE FROM reports WHERE reporter_id = ? OR reported_user_id = ?`, userID, userID); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM reports WHERE reporter_id = ? OR reported_user_id = ?`, userID, userID); err != nil {
 			return fmt.Errorf("failed to delete user reports: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE reports SET resolved_by = NULL WHERE resolved_by = ?`, userID); err != nil {
@@ -891,21 +891,6 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM servers WHERE owner_id = ?`, userID); err != nil {
 			return fmt.Errorf("failed to delete owned servers: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM reports WHERE reporter_id = ? OR reported_user_id = ?`, userID, userID); err != nil {
-			return fmt.Errorf("failed to delete user reports: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE reports SET resolved_by = NULL WHERE resolved_by = ?`, userID); err != nil {
-			return fmt.Errorf("failed to clear report resolver: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM feedback_replies WHERE user_id = ?`, userID); err != nil {
-			return fmt.Errorf("failed to delete feedback replies: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM feedback_tickets WHERE user_id = ?`, userID); err != nil {
-			return fmt.Errorf("failed to delete feedback tickets: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM user_dm_settings WHERE user_id = ?`, userID); err != nil {
-			return fmt.Errorf("failed to delete DM settings: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, userID); err != nil {
 			return fmt.Errorf("failed to permanently delete user row: %w", err)
