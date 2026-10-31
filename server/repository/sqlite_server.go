@@ -54,7 +54,7 @@ func (r *sqliteServerRepo) Create(ctx context.Context, server *models.Server) er
 
 	err := r.db.QueryRowContext(ctx, query,
 		server.Name, server.IconURL, server.OwnerID,
-		server.IsPublic, server.E2EEEnabled, server.ApprovalRequired, server.LiveKitInstanceID,
+		server.IsPublic, true, server.ApprovalRequired, server.LiveKitInstanceID,
 	).Scan(&server.ID, &server.CreatedAt)
 
 	if err != nil {
@@ -85,7 +85,7 @@ func (r *sqliteServerRepo) Update(ctx context.Context, server *models.Server) er
 
 	result, err := r.db.ExecContext(ctx, query,
 		server.Name, server.IconURL, server.BannerURL, server.IsPublic,
-		server.E2EEEnabled, server.ApprovalRequired, server.Description, server.Category, server.LiveKitInstanceID, server.AFKTimeoutMinutes, server.ID,
+		true, server.ApprovalRequired, server.Description, server.Category, server.LiveKitInstanceID, server.AFKTimeoutMinutes, server.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update server: %w", err)
@@ -151,19 +151,14 @@ func (r *sqliteServerRepo) Delete(ctx context.Context, serverID string) error {
 }
 
 func (r *sqliteServerRepo) IsE2EEEnabled(ctx context.Context, serverID string) (bool, error) {
-	var enabled bool
+	var exists int
 	err := r.db.QueryRowContext(ctx,
-		`SELECT e2ee_enabled FROM servers WHERE id = ? AND deleted_at IS NULL`, serverID,
-	).Scan(&enabled)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, pkg.ErrNotFound
-	}
-	if err != nil {
-		return false, fmt.Errorf("failed to read server encryption flag: %w", err)
-	}
-	return enabled, nil
+		`SELECT 1 FROM servers WHERE id = ? AND deleted_at IS NULL`, serverID,
+	).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) { return false, pkg.ErrNotFound }
+	if err != nil { return false, fmt.Errorf("failed to resolve server encryption policy: %w", err) }
+	return true, nil
 }
-
 func (r *sqliteServerRepo) GetActiveByID(ctx context.Context, serverID string) (*models.Server, error) {
 	query := `SELECT ` + serverColumns + ` FROM servers WHERE id = ? AND deleted_at IS NULL`
 
