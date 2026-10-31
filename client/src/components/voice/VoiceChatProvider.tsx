@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ChatContext, type ChatContextValue, type ChatMessage } from "../../hooks/useChatContext";
 import { useVoiceMessageStore } from "../../stores/voiceMessageStore";
+import { useE2EEStore } from "../../stores/e2eeStore";
 import { listVoiceMessages } from "../../api/voiceMessages";
 import type { MemberWithRoles, VoiceMessage } from "../../types";
 import type { UploadOptions } from "../../api/client";
@@ -32,6 +33,7 @@ function VoiceChatProvider({ channelId, channelName, children }: Props) {
   const send = useVoiceMessageStore((s) => s.send);
   const edit = useVoiceMessageStore((s) => s.edit);
   const del = useVoiceMessageStore((s) => s.del);
+  const e2eeReady = useE2EEStore((s) => s.initStatus === "ready");
 
   // Adapt VoiceMessage → ChatMessage shape with safe defaults for the fields
   // shared components might read (reply/pin/reactions) — voice chat has none.
@@ -79,7 +81,7 @@ function VoiceChatProvider({ channelId, channelName, children }: Props) {
       if (!cancelled) setIsLoading(false);
     });
     return () => { cancelled = true; };
-  }, [channelId, setForChannel]);
+  }, [channelId, setForChannel, e2eeReady]);
 
   const sendMessage = useCallback(
     (content: string, files?: File[], _replyToId?: string, upload?: UploadOptions) =>
