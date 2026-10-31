@@ -769,30 +769,14 @@ func (r *sqliteUserRepo) DeleteAllMessagesByUser(ctx context.Context, userID str
 	return nil
 }
 
-// HardDeleteUser permanently removes the account and all account-owned data.
-// Authored messages and every DM conversation are deleted; owned servers cascade too.
-// The caller collects file references before this transaction and deletes files afterward.
+// HardDeleteUser physically removes the account, its authored messages, all DM
+// conversations involving it, voice-channel chat, owned servers, and associated data.
+// The caller collects disk files before the transaction and deletes them after commit.
 //
-// Runs in a transaction so partial deletes cannot occur.
-//
-// Tables manually deleted (would have CASCADEd if user row was deleted):
-//
-//	user_roles, sessions, channel_reads, message_mentions, reactions, dm_reactions,
-//	friendships, server_members, password_reset_tokens, server_mutes, channel_mutes,
-//	e2ee_devices, e2ee_sessions_backup, e2ee_backups, user_badges, user_preferences,
-//	soundboard, user_storage.
-//
-// Tables NOT deleted (tombstone-preserved via the user row):
-//
-//	messages, dm_messages, dm_channels, pinned_messages, attachments — caller
-//	sees "[deleted user]" via deleted_at flag in JSON response.
-//
-// Tables manually deleted (non-CASCADE FK or no FK):
-//
-//	bans, servers (owned, full cascade including channels/messages/etc),
-//	reports, feedback_tickets, feedback_replies, user_dm_settings.
-//
-// platform_bans is NOT deleted — durable ban survives hard delete.
+// All database work is transactional. Explicit cleanup handles non-cascading relations;
+// SQLite foreign-key actions remove the remaining dependent rows. A postcondition checks
+// that no foreign key still references the deleted user.
+
 func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAdmin bool) error {
 	db, ok := r.db.(*sql.DB)
 	if !ok {
