@@ -112,3 +112,9 @@ export async function adminUpdateFeedbackStatus(ticketId: string, status: string
     body: { status },
   });
 }
+
+
+/** Permanently deletes a feedback ticket (platform admins only). */
+export async function adminDeleteFeedbackTicket(id: string) {
+  return apiClient<{ message: string }>(`/admin/feedback/${id}`, { method: "DELETE" });
+}
