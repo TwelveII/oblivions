@@ -218,14 +218,12 @@ func TestDMSendStopsWhenPendingRequestCannotBePersisted(t *testing.T) {
 		channel: &models.DMChannel{ID: "c1", User1ID: "alice", User2ID: "bob", Status: models.DMStatusAccepted},
 		pendingErr: writeErr,
 	}
-	users := &policyUserRepo{}
 	// Override recipient privacy while keeping the sender lookup successful.
 	svc := &dmService{
 		dmRepo: dmRepo,
 		userRepo: privacyRequestUserRepo{},
 		friendChecker: policyFriendChecker{friends: false},
 	}
-	_ = users
 	_, _, err := svc.SendMessage(context.Background(), "alice", "c1", &models.CreateDMMessageRequest{
 		Content: "hello", EncryptionVersion: 1,
 		Ciphertext: encryptedField(1, "CIPHER"), SenderDeviceID: encryptedField(1, "dev1"),
