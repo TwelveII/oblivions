@@ -61,13 +61,13 @@ jobs:
 
       - name: Upload release binary
         run: |
-          scp -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=yes \
+          scp -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
             "$GITHUB_WORKSPACE/mqvi-server.new" \
             root@185.249.9.132:/tmp/mqvi-server.new
 
       - name: Deploy with backup and automatic rollback
         run: |
-          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=yes \
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
             root@185.249.9.132 'bash -s' <<'REMOTE'
           set -Eeuo pipefail
 
