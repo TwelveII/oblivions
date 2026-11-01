@@ -1,4 +1,4 @@
-/** BlockConfirmDialog — Block confirmation. DM reporting is intentionally unavailable. */
+/** BlockConfirmDialog — Block confirmation with an optional report follow-up. */
 
 import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
@@ -6,12 +6,14 @@ import { useTranslation } from "react-i18next";
 
 type BlockConfirmDialogProps = {
   username: string;
+  /** Hide the optional report step in private conversations. */
+  allowReporting?: boolean;
   /** Buttons remain disabled until the block request settles. */
-  onConfirm: () => void | Promise<void>;
+  onConfirm: (alsoReport: boolean) => void | Promise<void>;
   onClose: () => void;
 };
 
-function BlockConfirmDialog({ username, onConfirm, onClose }: BlockConfirmDialogProps) {
+function BlockConfirmDialog({ username, allowReporting = true, onConfirm, onClose }: BlockConfirmDialogProps) {
   const { t } = useTranslation("dm");
   const { t: tCommon } = useTranslation("common");
   const [isBusy, setIsBusy] = useState(false);
@@ -20,7 +22,7 @@ function BlockConfirmDialog({ username, onConfirm, onClose }: BlockConfirmDialog
     if (isBusy) return;
     setIsBusy(true);
     try {
-      await onConfirm();
+      await onConfirm(allowReporting && alsoReport);
     } finally {
       setIsBusy(false);
     }
@@ -48,6 +50,20 @@ function BlockConfirmDialog({ username, onConfirm, onClose }: BlockConfirmDialog
 
         <p className="modal-text">{t("blockConfirmMessage")}</p>
 
+
+        {allowReporting && (
+          <label className="block-confirm-check">
+            <input
+              type="checkbox"
+              checked={alsoReport}
+              onChange={(e) => setAlsoReport(e.target.checked)}
+            />
+            <span>
+              {t("blockAlsoReport")}
+              <span className="block-confirm-hint">{t("blockAlsoReportHint")}</span>
+            </span>
+          </label>
+        )}
 
         <div className="modal-actions">
           <button className="settings-btn settings-btn-secondary" onClick={close} disabled={isBusy}>
