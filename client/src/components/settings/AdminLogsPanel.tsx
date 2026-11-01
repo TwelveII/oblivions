@@ -30,6 +30,7 @@ const CATEGORY_OPTIONS: { value: string; labelKey: string }[] = [
   { value: "ws", labelKey: "platformLogsCategoryWs" },
   { value: "auth", labelKey: "platformLogsCategoryAuth" },
   { value: "general", labelKey: "platformLogsCategoryGeneral" },
+  { value: "audit", labelKey: "platformLogsCategoryAudit" },
   { value: "feedback", labelKey: "platformLogsCategoryFeedback" },
   { value: "cleaner", labelKey: "platformLogsCategoryCleaner" },
   { value: "client", labelKey: "platformLogsCategoryClient" },
