@@ -178,7 +178,7 @@ func (s *adminUserService) PlatformUnbanUser(ctx context.Context, adminUserID, t
 	}
 
 	// Atomic: clear user flag (if user exists) + remove durable ban record
-	return database.WithTx(ctx, s.db, func(tx *sql.Tx) error {
+	err := database.WithTx(ctx, s.db, func(tx *sql.Tx) error {
 		txRepo := repository.NewSQLiteUserRepo(tx)
 		if userExists {
 			if err := txRepo.PlatformUnban(ctx, targetUserID); err != nil {
@@ -190,8 +190,9 @@ func (s *adminUserService) PlatformUnbanUser(ctx context.Context, adminUserID, t
 		}
 		return nil
 	})
-	if err == nil { recordAuditLog(ctx, s.db, adminUserID, targetUserID, "", "Platform user unbanned", nil) }
-	return err
+	if err != nil { return err }
+	recordAuditLog(ctx, s.db, adminUserID, targetUserID, "", "Platform user unbanned", nil)
+	return nil
 }
 
 // SoftDeleteUser marks the user soft-deleted (recoverable for 30 days).
