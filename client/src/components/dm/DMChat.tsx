@@ -25,7 +25,6 @@ import DMSearchPanel from "./DMSearchPanel";
 import FileDropOverlay from "../shared/FileDropOverlay";
 import Avatar from "../shared/Avatar";
 import BlockConfirmDialog from "../shared/BlockConfirmDialog";
-import ReportModal from "../shared/ReportModal";
 import * as e2eeApi from "../../api/e2ee";
 import { useAuthStore } from "../../stores/authStore";
 import type { User } from "../../types";
@@ -101,7 +100,6 @@ function DMChatContent({
   const [showPins, setShowPins] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [blockConfirmOpen, setBlockConfirmOpen] = useState(false);
-  const [reportAfterBlockOpen, setReportAfterBlockOpen] = useState(false);
   const [recipientHasKeys, setRecipientHasKeys] = useState(true); // default true — assume ok until checked
   const pendingSearchChannelId = useDMStore((s) => s.pendingSearchChannelId);
   const setPendingSearchChannelId = useDMStore((s) => s.setPendingSearchChannelId);
@@ -307,28 +305,14 @@ function DMChatContent({
         <BlockConfirmDialog
           username={channelName}
           onClose={() => setBlockConfirmOpen(false)}
-          onConfirm={async (alsoReport) => {
+          onConfirm={async () => {
             const ok = await blockUser(otherUser.id);
             setBlockConfirmOpen(false);
-            if (!ok) return;
-            // Declining closes this tab and unmounts this component, so the report modal
-            // has to run first; the decline follows once it closes.
-            if (alsoReport) setReportAfterBlockOpen(true);
-            else declineDMRequest(channelId);
+            if (ok) declineDMRequest(channelId);
           }}
         />
       )}
 
-      {reportAfterBlockOpen && otherUser && (
-        <ReportModal
-          userId={otherUser.id}
-          username={channelName}
-          onClose={() => {
-            setReportAfterBlockOpen(false);
-            declineDMRequest(channelId);
-          }}
-        />
-      )}
       {/* "Waiting" banner skipped if recipient is deleted — they can't accept. */}
       {isInitiator && !otherUserDeleted && (
         <div className="dm-request-banner dm-request-banner--waiting">
