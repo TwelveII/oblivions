@@ -35,16 +35,25 @@ type CrisisModeService interface {
 	CleanNow(ctx context.Context) (*CrisisModeCleanResult, error)
 }
 
+type UserConnectionRevoker interface {
+	DisconnectUser(userID string)
+}
+
 type crisisModeService struct {
-	db         *sql.DB
+	db          *sql.DB
 	fileCleanup FileCleanupService
+	connections UserConnectionRevoker
 	mu         sync.Mutex
 	cancel     context.CancelFunc
 	done       chan struct{}
 }
 
-func NewCrisisModeService(db *sql.DB, fileCleanup FileCleanupService) CrisisModeService {
-	return &crisisModeService{db: db, fileCleanup: fileCleanup}
+func NewCrisisModeService(db *sql.DB, fileCleanup FileCleanupService, connections ...UserConnectionRevoker) CrisisModeService {
+	var revoker UserConnectionRevoker
+	if len(connections) > 0 {
+		revoker = connections[0]
+	}
+	return &crisisModeService{db: db, fileCleanup: fileCleanup, connections: revoker}
 }
 
 func (s *crisisModeService) Start() {
@@ -154,6 +163,29 @@ func (s *crisisModeService) SetSiteEnabled(ctx context.Context, enabled bool) er
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit site availability update: %w", err)
+	}
+	if !enabled && s.connections != nil {
+		rows, err := s.db.QueryContext(ctx, `SELECT id FROM users WHERE is_platform_admin = 0`)
+		if err != nil {
+			return fmt.Errorf("list ordinary users for websocket revocation: %w", err)
+		}
+		var userIDs []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan ordinary user for websocket revocation: %w", err)
+			}
+			userIDs = append(userIDs, id)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate ordinary users for websocket revocation: %w", err)
+		}
+		rows.Close()
+		for _, userID := range userIDs {
+			s.connections.DisconnectUser(userID)
+		}
 	}
 	return nil
 }
