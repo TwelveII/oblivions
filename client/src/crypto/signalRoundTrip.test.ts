@@ -172,6 +172,23 @@ describe("Signal round-trip", () => {
     ).rejects.toThrow(/identity key changed/i);
   });
 
+  it("should not pin a first-seen identity until its first message authenticates", async () => {
+    const wire = await as(alice, () =>
+      establishAndEncrypt(BOB.userId, BOB.deviceId, bundleOf(bob), "authentic message")
+    );
+    const raw = atob(wire.ciphertext);
+    const bytes = Uint8Array.from(raw, (value) => value.charCodeAt(0));
+    bytes[bytes.length - 1] ^= 0xff;
+    const forged = { ...wire, ciphertext: btoa(String.fromCharCode(...bytes)) };
+
+    await expect(bobReceivesFirst(bob, forged)).rejects.toThrow();
+    expect(bob.trustedIdentities.has(`${ALICE.userId}:${ALICE.deviceId}`)).toBe(false);
+
+    // A failed first-contact attempt must not poison the pin for the real sender.
+    expect(await bobReceivesFirst(bob, wire)).toBe("authentic message");
+    expect(bob.trustedIdentities.has(`${ALICE.userId}:${ALICE.deviceId}`)).toBe(true);
+  });
+
   it("should refuse an incoming prekey message from a changed sender identity", async () => {
     const wire = await as(alice, () =>
       establishAndEncrypt(BOB.userId, BOB.deviceId, bundleOf(bob), "hello")
