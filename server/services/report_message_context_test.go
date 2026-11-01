@@ -104,11 +104,7 @@ func TestCreateReport_MessageContext(t *testing.T) {
 	const reporter, target, other = "u-reporter", "u-target", "u-other"
 	plainChannelMsg := &models.Message{ID: "m1", ChannelID: "c1", UserID: target, Content: strPtr("you suck")}
 	e2eeChannelMsg := &models.Message{ID: "m2", ChannelID: "c1", UserID: target, EncryptionVersion: 1}
-	plainDMMsg := &models.DMMessage{ID: "d1", DMChannelID: "dc1", UserID: target, Content: strPtr("buy now")}
-	e2eeDMMsg := &models.DMMessage{ID: "d2", DMChannelID: "dc1", UserID: target, EncryptionVersion: 1}
 	voiceMsg := &models.VoiceMessage{ID: "v1", ChannelID: "vc1", UserID: target, Content: strPtr("voice insult")}
-	dmChannel := &models.DMChannel{ID: "dc1", User1ID: target, User2ID: reporter}
-	foreignDMChannel := &models.DMChannel{ID: "dc1", User1ID: target, User2ID: other}
 	base := models.CreateReportRequest{Reason: "harassment", Description: "long enough text"}
 
 	tests := []struct {
