@@ -25,7 +25,7 @@ func TestSQLiteUserRepo_CreateRejectsReservedUsername(t *testing.T) {
 
 	user := &models.User{
 		Username: "heldname",
-		Status:   models.UserStatusOffline,
+		Status:   models.UserStatusOnline,
 		Language: "en",
 	}
 	err := repo.Create(ctx, user)
@@ -93,5 +93,44 @@ func TestSQLiteUserRepo_ExpiredUsernameReservationDoesNotBlock(t *testing.T) {
 	}
 	if reserved {
 		t.Fatal("expired reservation still blocks the username")
+	}
+}
+
+func TestSQLiteUserRepo_HardDeleteReservesUsernameFor24Hours(t *testing.T) {
+	ctx := context.Background()
+	db := dbtest.New(t).DB
+	repo := NewSQLiteUserRepo(db)
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO users (id, username, password_hash)
+		VALUES ('u1', 'OriginalName', 'hash')
+	`); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	before := time.Now().UTC()
+	if err := repo.HardDeleteUser(ctx, "u1", false); err != nil {
+		t.Fatalf("HardDeleteUser(): %v", err)
+	}
+	after := time.Now().UTC()
+
+	reserved, err := repo.IsUsernameReserved(ctx, "originalname")
+	if err != nil {
+		t.Fatalf("IsUsernameReserved(): %v", err)
+	}
+	if !reserved {
+		t.Fatal("deleted user's original username was not reserved")
+	}
+
+	var reservedUntil time.Time
+	if err := db.QueryRowContext(ctx, `
+		SELECT reserved_until FROM username_reservations
+		WHERE username = 'originalname' COLLATE NOCASE
+	`).Scan(&reservedUntil); err != nil {
+		t.Fatalf("read reservation expiry: %v", err)
+	}
+	if reservedUntil.Before(before.Add(23*time.Hour+59*time.Minute)) ||
+		reservedUntil.After(after.Add(24*time.Hour+time.Minute)) {
+		t.Fatalf("reservation expiry %v is not approximately 24 hours after deletion", reservedUntil)
 	}
 }
