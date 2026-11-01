@@ -164,11 +164,11 @@ func (s *adminUserService) PlatformBanUser(ctx context.Context, adminUserID, tar
 			log.Printf("[admin] failed to delete owned server %s during platform ban of %s: %v", sid, targetUserID, err)
 			return fmt.Errorf("failed to delete owned server %s: %w", sid, err)
 		}
-		s.fileCleanup.Execute(serverPlans[sid])
 	}
 
 	// Delete the banned user's messages everywhere, including DMs; server-owned
-	// content has already been cascaded away above.
+	// content has already been cascaded away above. Execute the deduplicated
+	// cleanup plan once so attachments shared by both queries don't release quota twice.
 	if err := s.userRepo.DeleteAllMessagesByUser(ctx, targetUserID); err != nil {
 		return fmt.Errorf("failed to delete user messages: %w", err)
 	}
@@ -426,4 +426,48 @@ func (s *adminUserService) SetPlatformAdmin(ctx context.Context, adminUserID, ta
 	}
 
 	return nil
+}
+
+
+ // mergeCleanupPlans combines pre-delete file plans and deduplicates shared file URLs,
+ // quota releases, standalone URLs, and LiveKit instances.
+func mergeCleanupPlans(base *CleanupPlan, others map[string]*CleanupPlan) *CleanupPlan {
+	if base == nil {
+		base = &CleanupPlan{}
+	}
+	refSeen := make(map[string]bool, len(base.refs))
+	for _, ref := range base.refs {
+		refSeen[ref.URL+"\x00"+ref.UserID] = true
+	}
+	urlSeen := make(map[string]bool, len(base.urls))
+	for _, url := range base.urls {
+		urlSeen[url] = true
+	}
+	livekitSeen := make(map[string]bool, len(base.livekit))
+	for _, entry := range base.livekit {
+		livekitSeen[entry.InstanceID] = true
+	}
+	for _, plan := range others {
+		if plan == nil { continue }
+		for _, ref := range plan.refs {
+			key := ref.URL+"\x00"+ref.UserID
+			if !refSeen[key] {
+				base.refs = append(base.refs, ref)
+				refSeen[key] = true
+			}
+		}
+		for _, url := range plan.urls {
+			if !urlSeen[url] {
+				base.urls = append(base.urls, url)
+				urlSeen[url] = true
+			}
+		}
+		for _, entry := range plan.livekit {
+			if !livekitSeen[entry.InstanceID] {
+				base.livekit = append(base.livekit, entry)
+				livekitSeen[entry.InstanceID] = true
+			}
+		}
+	}
+	return base
 }
