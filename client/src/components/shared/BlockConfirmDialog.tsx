@@ -1,4 +1,4 @@
-/** BlockConfirmDialog — Block confirmation with an opt-in "also report this user" step. */
+/** BlockConfirmDialog — Block confirmation. DM reporting is intentionally unavailable. */
 
 import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
@@ -6,30 +6,27 @@ import { useTranslation } from "react-i18next";
 
 type BlockConfirmDialogProps = {
   username: string;
-  /** Called with the checkbox value; the caller blocks, then opens ReportModal when asked.
-   *  Buttons are disabled until the returned promise settles. */
-  onConfirm: (alsoReport: boolean) => void | Promise<void>;
+  /** Buttons remain disabled until the block request settles. */
+  onConfirm: () => void | Promise<void>;
   onClose: () => void;
 };
 
 function BlockConfirmDialog({ username, onConfirm, onClose }: BlockConfirmDialogProps) {
   const { t } = useTranslation("dm");
   const { t: tCommon } = useTranslation("common");
-  const [alsoReport, setAlsoReport] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
 
   async function handleConfirm() {
     if (isBusy) return;
     setIsBusy(true);
     try {
-      await onConfirm(alsoReport);
+      await onConfirm();
     } finally {
       setIsBusy(false);
     }
   }
 
-  // While the block request runs the dialog must stay mounted: its host (MemberCard)
-  // relies on it to stay open for the follow-up report modal.
+  // Keep the dialog mounted while the block request runs.
   const close = useCallback(() => {
     if (!isBusy) onClose();
   }, [isBusy, onClose]);
@@ -51,17 +48,6 @@ function BlockConfirmDialog({ username, onConfirm, onClose }: BlockConfirmDialog
 
         <p className="modal-text">{t("blockConfirmMessage")}</p>
 
-        <label className="block-confirm-check">
-          <input
-            type="checkbox"
-            checked={alsoReport}
-            onChange={(e) => setAlsoReport(e.target.checked)}
-          />
-          <span>
-            {t("blockAlsoReport")}
-            <span className="block-confirm-hint">{t("blockAlsoReportHint")}</span>
-          </span>
-        </label>
 
         <div className="modal-actions">
           <button className="settings-btn settings-btn-secondary" onClick={close} disabled={isBusy}>
