@@ -164,12 +164,19 @@ describe("Signal round-trip", () => {
     // otherwise-valid signing key and signed prekey. The existing pin must win.
     const replacement = x25519.getPublicKey(x25519.utils.randomSecretKey());
     const forgedBundle = { ...bundleOf(bob), identityKey: toBase64(replacement) };
+    const sessionKey = `${BOB.userId}:${BOB.deviceId}`;
+    alice.sessions.set(sessionKey, { sentinel: "keep the last known-good session" });
 
     await expect(
       as(alice, () =>
-        establishAndEncrypt(BOB.userId, BOB.deviceId, forgedBundle, "must not send")
+        establishAndEncrypt(BOB.userId, BOB.deviceId, forgedBundle, "must not send", {
+          forceNewSession: true,
+        })
       )
     ).rejects.toThrow(/identity key changed/i);
+    expect(alice.sessions.get(sessionKey)).toEqual({
+      sentinel: "keep the last known-good session",
+    });
   });
 
   it("should not pin a first-seen identity until its first message authenticates", async () => {
