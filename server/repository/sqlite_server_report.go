@@ -108,6 +108,15 @@ func (r *sqliteServerReportRepo) UpdateStatus(ctx context.Context, reportID stri
 	return nil
 }
 
+func (r *sqliteServerReportRepo) Delete(ctx context.Context, reportID string) error {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM server_reports WHERE id = ?`, reportID)
+	if err != nil { return fmt.Errorf("failed to delete server report: %w", err) }
+	n, err := res.RowsAffected()
+	if err != nil { return fmt.Errorf("failed to check deleted server report: %w", err) }
+	if n == 0 { return pkg.ErrNotFound }
+	return nil
+}
+
 func (r *sqliteServerReportRepo) CreateAttachment(ctx context.Context, att *models.ServerReportAttachment) error {
 	err := r.db.QueryRowContext(ctx,
 		`INSERT INTO server_report_attachments (server_report_id, filename, file_url, file_size, mime_type)
