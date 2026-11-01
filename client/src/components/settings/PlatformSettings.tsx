@@ -12,6 +12,7 @@ import {
   deleteLiveKitInstance,
 } from "../../api/admin";
 import InstanceForm from "./InstanceForm";
+import CrisisModePanel from "./CrisisModePanel";
 import SettingsDetailBack from "./SettingsDetailBack";
 import { lazy, Suspense } from "react";
 
@@ -21,7 +22,12 @@ const MetricsPanel = lazy(() => import("./MetricsPanel"));
 import type { LiveKitInstanceAdmin } from "../../types";
 
 function PlatformSettings() {
-  return <LiveKitTab />;
+  return (
+    <>
+      <CrisisModePanel />
+      <LiveKitTab />
+    </>
+  );
 }
 
 

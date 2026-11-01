@@ -345,3 +345,40 @@ export async function setAdminUserInviteLimit(userId: string, inviteLimit: numbe
     body: { invite_limit: inviteLimit },
   });
 }
+
+
+export type CrisisModeState = {
+  enabled: boolean;
+  site_enabled: boolean;
+  last_run_at: string | null;
+};
+
+export type CrisisModeCleanResult = {
+  channel_messages: number;
+  dm_messages: number;
+  voice_messages: number;
+};
+
+export async function getCrisisModeState() {
+  return apiClient<CrisisModeState>("/admin/crisis-mode");
+}
+
+export async function setSiteEnabled(enabled: boolean) {
+  return apiClient<CrisisModeState>("/admin/site-availability", {
+    method: "PATCH",
+    body: { enabled },
+  });
+}
+
+export async function setCrisisModeEnabled(enabled: boolean) {
+  return apiClient<CrisisModeState>("/admin/crisis-mode", {
+    method: "PATCH",
+    body: { enabled },
+  });
+}
+
+export async function cleanConversationsNow() {
+  return apiClient<CrisisModeCleanResult>("/admin/crisis-mode/clean-now", {
+    method: "POST",
+  });
+}

@@ -104,11 +104,7 @@ func TestCreateReport_MessageContext(t *testing.T) {
 	const reporter, target, other = "u-reporter", "u-target", "u-other"
 	plainChannelMsg := &models.Message{ID: "m1", ChannelID: "c1", UserID: target, Content: strPtr("you suck")}
 	e2eeChannelMsg := &models.Message{ID: "m2", ChannelID: "c1", UserID: target, EncryptionVersion: 1}
-	plainDMMsg := &models.DMMessage{ID: "d1", DMChannelID: "dc1", UserID: target, Content: strPtr("buy now")}
-	e2eeDMMsg := &models.DMMessage{ID: "d2", DMChannelID: "dc1", UserID: target, EncryptionVersion: 1}
 	voiceMsg := &models.VoiceMessage{ID: "v1", ChannelID: "vc1", UserID: target, Content: strPtr("voice insult")}
-	dmChannel := &models.DMChannel{ID: "dc1", User1ID: target, User2ID: reporter}
-	foreignDMChannel := &models.DMChannel{ID: "dc1", User1ID: target, User2ID: other}
 	base := models.CreateReportRequest{Reason: "harassment", Description: "long enough text"}
 
 	tests := []struct {
@@ -174,32 +170,24 @@ func TestCreateReport_MessageContext(t *testing.T) {
 			wantErr: pkg.ErrNotFound,
 		},
 		{
-			name:        "should snapshot a plaintext DM message when the reporter is a participant",
-			req:         func() models.CreateReportRequest { r := base; r.DMMessageID = "d1"; return r },
-			dmMsg:       plainDMMsg,
-			dmCh:        dmChannel,
-			wantExcerpt: "buy now",
-			wantSource:  models.ExcerptSourceServer,
+			name:    "should reject a plaintext DM message report",
+			req:     func() models.CreateReportRequest { r := base; r.DMMessageID = "d1"; return r },
+			wantErr: pkg.ErrForbidden,
 		},
 		{
-			name: "should keep the client excerpt for an E2EE DM message",
+			name: "should reject an E2EE DM message report",
 			req: func() models.CreateReportRequest {
 				r := base
 				r.DMMessageID = "d2"
 				r.MessageExcerpt = "secret text"
 				return r
 			},
-			dmMsg:       e2eeDMMsg,
-			dmCh:        dmChannel,
-			wantExcerpt: "secret text",
-			wantSource:  models.ExcerptSourceClient,
+			wantErr: pkg.ErrForbidden,
 		},
 		{
-			name:    "should answer not-found for a DM message when the reporter is not a participant",
+			name:    "should reject DM message reports without revealing membership",
 			req:     func() models.CreateReportRequest { r := base; r.DMMessageID = "d1"; return r },
-			dmMsg:   plainDMMsg,
-			dmCh:    foreignDMChannel,
-			wantErr: pkg.ErrNotFound,
+			wantErr: pkg.ErrForbidden,
 		},
 		{
 			name:        "should snapshot a voice-chat message",

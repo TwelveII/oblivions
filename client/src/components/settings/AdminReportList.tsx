@@ -303,6 +303,14 @@ function AdminReportList() {
       onClick: () => handleSendDM(report.reported_user_id, report.reported_display_name ?? report.reported_username),
     });
 
+    if (report.dm_message_id && report.dm_channel_id) {
+      items.push({
+        label: "Jump to reported message",
+        separator: true,
+        onClick: () => handleJumpToReportedDM(report),
+      });
+    }
+
     if (refersToMessage(report)) {
       items.push({
         label: t("platformReportDeleteMessage"),
@@ -359,6 +367,17 @@ function AdminReportList() {
     } else {
       addToast("error", t("platformReportDeleteMessageError"));
     }
+  }
+
+  function handleJumpToReportedDM(report: AdminReportListItem) {
+    if (!report.dm_message_id || !report.dm_channel_id) return;
+    const channel = useDMStore.getState().channels.find((item) => item.id === report.dm_channel_id);
+    const name = channel?.other_user?.display_name || channel?.other_user?.username ||
+      report.reported_display_name || report.reported_username;
+    useUIStore.getState().openTab(report.dm_channel_id, "dm", name);
+    useSettingsStore.getState().closeSettings();
+    useDMStore.getState().selectDM(report.dm_channel_id);
+    useDMStore.getState().setScrollToMessageId(report.dm_message_id);
   }
 
   async function handleSendDM(userId: string, displayName: string) {

@@ -1122,3 +1122,14 @@ func (r *sqliteUserRepo) SetPlatformAdmin(ctx context.Context, userID string, is
 
 	return nil
 }
+
+
+// IsSiteEnabled reads the platform-wide site availability flag. It is intentionally not part of
+// UserRepository so existing repository fakes remain source-compatible.
+func (r *sqliteUserRepo) IsSiteEnabled(ctx context.Context) (bool, error) {
+	var enabled int
+	if err := r.db.QueryRowContext(ctx, `SELECT site_enabled FROM crisis_mode_state WHERE id = 1`).Scan(&enabled); err != nil {
+		return false, err
+	}
+	return enabled == 1, nil
+}

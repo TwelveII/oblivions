@@ -43,9 +43,11 @@ type MemberCardProps = {
   user?: User;
   position: { top: number; left: number };
   onClose: () => void;
+  /** Disable reporting actions when this card is opened from a DM conversation. */
+  allowReporting?: boolean;
 };
 
-function MemberCard({ member, user: userProp, position, onClose }: MemberCardProps) {
+function MemberCard({ member, user: userProp, position, onClose, allowReporting = true }: MemberCardProps) {
   const { t } = useTranslation("common");
   const { t: tSettings } = useTranslation("settings");
   const logout = useLogout();
@@ -385,7 +387,7 @@ function MemberCard({ member, user: userProp, position, onClose }: MemberCardPro
                   </svg>
                   <span>{isBlocked ? t("unblock") : t("block")}</span>
                 </button>
-                <button
+                {allowReporting && <button
                   className="mc-btn mc-btn-danger"
                   onClick={() => setShowReport(true)}
                 >
@@ -393,7 +395,7 @@ function MemberCard({ member, user: userProp, position, onClose }: MemberCardPro
                     <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z" /><line x1="4" y1="22" x2="4" y2="15" />
                   </svg>
                   <span>{t("report")}</span>
-                </button>
+                </button>}
               </div>
             </>
           )}
@@ -498,6 +500,7 @@ function MemberCard({ member, user: userProp, position, onClose }: MemberCardPro
 
       {showBlockConfirm && (
         <BlockConfirmDialog
+          allowReporting={allowReporting}
           username={displayName ?? username}
           onClose={() => setShowBlockConfirm(false)}
           onConfirm={async (alsoReport) => {
@@ -511,7 +514,7 @@ function MemberCard({ member, user: userProp, position, onClose }: MemberCardPro
         />
       )}
 
-      {showReport && (
+      {allowReporting && showReport && (
         <ReportModal
           userId={userId}
           username={displayName ?? username}

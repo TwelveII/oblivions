@@ -47,6 +47,7 @@ type Report struct {
 	// Message context — set for message-level reports, nil for profile reports.
 	MessageID      *string `json:"message_id"`
 	DMMessageID    *string `json:"dm_message_id"`
+	DMChannelID    *string `json:"dm_channel_id,omitempty"`
 	VoiceMessageID *string `json:"voice_message_id"`
 	// MessageExcerpt is a snapshot of the reported text that outlives the message.
 	// ExcerptSource says who took it: "server" (copied from stored plaintext) or

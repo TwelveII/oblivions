@@ -65,7 +65,7 @@ type Handlers struct {
 func initHandlers(svcs *Services, repos *Repositories, limiters *RateLimiters, hub *ws.Hub, cfg *config.Config, encryptionKey []byte, urlSigner services.FileURLSigner) *Handlers {
 	fileLocator := files.NewLocator(cfg.Upload.Dir, cfg.Upload.PublicURL)
 	h := &Handlers{
-		Auth:              handlers.NewAuthHandler(svcs.Auth, limiters.Login, limiters.Register, limiters.ForgotPwd, limiters.ResetPwd, urlSigner, time.Duration(cfg.JWT.FileTokenExpiry)*time.Hour, limiters.CredentialStore),
+		Auth:              handlers.NewAuthHandler(svcs.Auth, limiters.Login, limiters.Register, limiters.ForgotPwd, limiters.ResetPwd, urlSigner, time.Duration(cfg.JWT.FileTokenExpiry)*time.Hour, limiters.CredentialStore, svcs.CrisisMode),
 		Channel:           handlers.NewChannelHandler(svcs.Channel),
 		Category:          handlers.NewCategoryHandler(svcs.Category),
 		Message:           handlers.NewMessageHandler(svcs.Message, svcs.Upload, svcs.Storage, cfg.Upload.MaxSize, limiters.Message, urlSigner),
@@ -87,7 +87,7 @@ func initHandlers(svcs *Services, repos *Repositories, limiters *RateLimiters, h
 		Stats:             handlers.NewStatsHandler(repos.User),
 		ClientPolicy:      handlers.NewClientPolicyHandler(cfg.ClientVersions.MinAndroid, cfg.ClientVersions.MinIOS),
 		ClientError:       handlers.NewClientErrorHandler(svcs.ClientError, limiters.ClientError, limiters.ClientRenderCrash, limiters.ClientErrorDaily),
-		Admin:             handlers.NewAdminHandler(svcs.LiveKitAdmin, svcs.MetricsHistory, svcs.AdminUser, svcs.AdminServer, svcs.Report, svcs.ReportModeration, svcs.AppLog, svcs.SettingsBadge, svcs.Voice),
+		Admin:             handlers.NewAdminHandler(svcs.LiveKitAdmin, svcs.MetricsHistory, svcs.AdminUser, svcs.AdminServer, svcs.Report, svcs.ReportModeration, svcs.AppLog, svcs.SettingsBadge, svcs.Voice, svcs.CrisisMode),
 		ServerMute:        handlers.NewServerMuteHandler(svcs.ServerMute),
 		ChannelMute:       handlers.NewChannelMuteHandler(svcs.ChannelMute),
 		DMSettings:        handlers.NewDMSettingsHandler(svcs.DMSettings),
