@@ -7,7 +7,7 @@
 //	messages/<messageID>/<filename>
 //	dm/<dmMessageID>/<filename>
 //	avatars/<userID>/<filename>
-//	wallpapers/<userID>/<filename>
+//	legacy wallpapers/<userID>/<filename> (cleanup only)
 //	badges/global/<filename>
 //	soundboards/<serverID>/<filename>
 //	server-icons/<serverID>/<filename>
