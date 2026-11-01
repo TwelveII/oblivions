@@ -76,3 +76,37 @@ func TestSignupInviteExpiryOptions(t *testing.T) {
 		t.Fatal("expected unsupported expiry to fail")
 	}
 }
+
+
+func TestSignupInviteList_ShouldHideUsedCodesButKeepUnusedCodes(t *testing.T) {
+	ctx := context.Background()
+	fx := dbtest.New(t)
+	inviterID := fx.User("inviter")
+	svc := NewSignupInviteService(fx.DB)
+	if err := svc.AdminSetLimit(ctx, inviterID, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	used, err := svc.Create(ctx, inviterID, 0)
+	if err != nil {
+		t.Fatalf("create used invite: %v", err)
+	}
+	available, err := svc.Create(ctx, inviterID, 0)
+	if err != nil {
+		t.Fatalf("create available invite: %v", err)
+	}
+	if _, err := fx.DB.ExecContext(ctx, `
+		UPDATE signup_invite_codes SET used_at = CURRENT_TIMESTAMP, used_by_user_id = ?
+		WHERE id = ?
+	`, fx.User("invitee"), used.ID); err != nil {
+		t.Fatalf("mark invite used: %v", err)
+	}
+
+	listed, err := svc.List(ctx, inviterID)
+	if err != nil {
+		t.Fatalf("list invites: %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != available.ID {
+		t.Fatalf("listed invites = %+v; want only unused invite %s (used %s)", listed, available.ID, used.ID)
+	}
+}
