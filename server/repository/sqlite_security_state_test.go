@@ -8,53 +8,26 @@ import (
 	"github.com/akinalp/mqvi/testutil/dbtest"
 )
 
-// Some columns are settings; these are security state. A write that assigns the field on the struct
-// but leaves the column out of the UPDATE fails silently — the request succeeds, the response shows
-// the new value, and the database keeps the old one. The service layer above this is tested against
-// the stored state, so it would enforce the stale answer and look correct doing it.
-
-// e2ee_enabled decides whether the server refuses plaintext or refuses ciphertext. If an update
-// stops persisting it, turning encryption on appears to work and every later message is judged
-// against the old setting.
-func TestServerUpdate_PersistsTheEncryptionFlag(t *testing.T) {
+// E2EE is a mandatory security invariant. Legacy false values are upgraded to true,
+// repository writes cannot switch it off, and the database rejects direct attempts.
+func TestServerE2EEIsMandatory(t *testing.T) {
 	f := dbtest.New(t)
 	repo := NewSQLiteServerRepo(f.DB)
 	ctx := context.Background()
 
 	id := f.Server(dbtest.ServerSeed{E2EEEnabled: false})
-
 	server, err := repo.GetByID(ctx, id)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if server.E2EEEnabled {
-		t.Fatal("the fixture seeded an unencrypted server but it reads as encrypted")
-	}
+	if err != nil { t.Fatalf("read: %v", err) }
+	if !server.E2EEEnabled { t.Fatal("legacy server flag was not upgraded to mandatory E2EE") }
 
-	server.E2EEEnabled = true
-	if err := repo.Update(ctx, server); err != nil {
-		t.Fatalf("update: %v", err)
-	}
-
+	server.E2EEEnabled = false
+	if err := repo.Update(ctx, server); err != nil { t.Fatalf("update: %v", err) }
 	reloaded, err := repo.GetByID(ctx, id)
-	if err != nil {
-		t.Fatalf("read back: %v", err)
-	}
-	if !reloaded.E2EEEnabled {
-		t.Error("encryption was switched on and the row still says off — every message after this is judged against the old setting")
-	}
+	if err != nil { t.Fatalf("read back: %v", err) }
+	if !reloaded.E2EEEnabled { t.Fatal("repository update disabled mandatory encryption") }
 
-	// And back off again: a one-way write would pass the check above.
-	reloaded.E2EEEnabled = false
-	if err := repo.Update(ctx, reloaded); err != nil {
-		t.Fatalf("update back: %v", err)
-	}
-	final, err := repo.GetByID(ctx, id)
-	if err != nil {
-		t.Fatalf("read back: %v", err)
-	}
-	if final.E2EEEnabled {
-		t.Error("encryption was switched off and the row still says on")
+	if _, err := f.DB.ExecContext(ctx, `UPDATE servers SET e2ee_enabled = 0 WHERE id = ?`, id); err == nil {
+		t.Fatal("database allowed direct disabling of mandatory E2EE")
 	}
 }
 

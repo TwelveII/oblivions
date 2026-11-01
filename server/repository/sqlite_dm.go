@@ -478,23 +478,14 @@ func (r *sqliteDMRepo) DeleteChannel(ctx context.Context, channelID string) erro
 }
 
 func (r *sqliteDMRepo) SetE2EEEnabled(ctx context.Context, channelID string, enabled bool) error {
-	result, err := r.db.ExecContext(ctx,
-		"UPDATE dm_channels SET e2ee_enabled = ? WHERE id = ?",
-		enabled, channelID,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to update DM E2EE: %w", err)
-	}
+	if !enabled { return fmt.Errorf("%w: end-to-end encryption cannot be disabled", pkg.ErrForbidden) }
+	result, err := r.db.ExecContext(ctx, "UPDATE dm_channels SET e2ee_enabled = 1 WHERE id = ?", channelID)
+	if err != nil { return fmt.Errorf("failed to enforce DM E2EE: %w", err) }
 	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to check rows affected: %w", err)
-	}
-	if affected == 0 {
-		return pkg.ErrNotFound
-	}
+	if err != nil { return fmt.Errorf("failed to check rows affected: %w", err) }
+	if affected == 0 { return pkg.ErrNotFound }
 	return nil
 }
-
 // ─── Message Operations ───
 
 // GetMessages returns DM messages with cursor-based pagination (DESC order).

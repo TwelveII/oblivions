@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ChatContext, type ChatContextValue, type ChatMessage } from "../../hooks/useChatContext";
 import { useVoiceMessageStore } from "../../stores/voiceMessageStore";
+import { useE2EEStore } from "../../stores/e2eeStore";
 import { listVoiceMessages } from "../../api/voiceMessages";
 import type { MemberWithRoles, VoiceMessage } from "../../types";
 import type { UploadOptions } from "../../api/client";
@@ -32,6 +33,7 @@ function VoiceChatProvider({ channelId, channelName, children }: Props) {
   const send = useVoiceMessageStore((s) => s.send);
   const edit = useVoiceMessageStore((s) => s.edit);
   const del = useVoiceMessageStore((s) => s.del);
+  const e2eeReady = useE2EEStore((s) => s.initStatus === "ready");
 
   // Adapt VoiceMessage → ChatMessage shape with safe defaults for the fields
   // shared components might read (reply/pin/reactions) — voice chat has none.
@@ -42,6 +44,8 @@ function VoiceChatProvider({ channelId, channelName, children }: Props) {
         user_id: m.user_id,
         content: m.content,
         edited_at: m.edited_at,
+        encryption_version: m.encryption_version,
+        e2ee_file_keys: m.e2ee_file_keys,
         created_at: m.created_at,
         reply_to_id: null,
         is_pinned: false,
@@ -66,15 +70,18 @@ function VoiceChatProvider({ channelId, channelName, children }: Props) {
   useEffect(() => {
     let cancelled = false;
     setIsLoading(true);
-    listVoiceMessages(channelId).then((res) => {
+    listVoiceMessages(channelId).then(async (res) => {
       if (cancelled) return;
       if (res.success && res.data) {
-        setForChannel(channelId, res.data);
+        await setForChannel(channelId, res.data);
       }
-      setIsLoading(false);
+      if (!cancelled) setIsLoading(false);
+    }).catch((error) => {
+      console.error("[VoiceChatProvider] failed to load voice chat", error);
+      if (!cancelled) setIsLoading(false);
     });
     return () => { cancelled = true; };
-  }, [channelId, setForChannel]);
+  }, [channelId, setForChannel, e2eeReady]);
 
   const sendMessage = useCallback(
     (content: string, files?: File[], _replyToId?: string, upload?: UploadOptions) =>
@@ -95,7 +102,7 @@ function VoiceChatProvider({ channelId, channelName, children }: Props) {
   const fetchMessages = useCallback(async () => {
     const res = await listVoiceMessages(channelId);
     if (res.success && res.data) {
-      setForChannel(channelId, res.data);
+      await setForChannel(channelId, res.data);
     }
   }, [channelId, setForChannel]);
 

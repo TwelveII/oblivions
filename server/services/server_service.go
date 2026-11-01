@@ -219,6 +219,7 @@ func (s *serverService) CreateServer(ctx context.Context, ownerID string, req *m
 		Name:              req.Name,
 		OwnerID:           ownerID,
 		IsPublic:          false,
+		E2EEEnabled:       true,
 		LiveKitInstanceID: livekitInstanceID,
 	}
 
@@ -385,9 +386,7 @@ func (s *serverService) UpdateServer(ctx context.Context, serverID string, req *
 	if req.IsPublic != nil {
 		server.IsPublic = *req.IsPublic
 	}
-	if req.E2EEEnabled != nil {
-		server.E2EEEnabled = *req.E2EEEnabled
-	}
+	// Encryption is a platform invariant; ignore legacy attempts to toggle it.
 	if req.ApprovalRequired != nil {
 		server.ApprovalRequired = *req.ApprovalRequired
 	}

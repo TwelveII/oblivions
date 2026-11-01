@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
 	"github.com/akinalp/mqvi/ws"
 )
 
@@ -153,20 +154,14 @@ func (s *dmService) SearchMessages(ctx context.Context, userID, channelID, query
 
 func (s *dmService) ToggleE2EE(ctx context.Context, userID, channelID string, enabled bool) (*models.DMChannel, error) {
 	channel, err := s.verifyChannelMembership(ctx, userID, channelID)
-	if err != nil {
-		return nil, err
+	if err != nil { return nil, err }
+	if !enabled {
+		return nil, fmt.Errorf("%w: end-to-end encryption cannot be disabled", pkg.ErrForbidden)
 	}
-
-	if err := s.dmRepo.SetE2EEEnabled(ctx, channelID, enabled); err != nil {
-		return nil, fmt.Errorf("failed to toggle DM E2EE: %w", err)
+	if err := s.dmRepo.SetE2EEEnabled(ctx, channelID, true); err != nil {
+		return nil, fmt.Errorf("failed to enforce DM E2EE: %w", err)
 	}
-
-	channel.E2EEEnabled = enabled
-
-	s.broadcastToBothUsers(channel, ws.Event{
-		Op:   "dm_channel_update",
-		Data: channel,
-	})
-
+	channel.E2EEEnabled = true
+	s.broadcastToBothUsers(channel, ws.Event{Op: "dm_channel_update", Data: channel})
 	return channel, nil
 }

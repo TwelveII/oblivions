@@ -26,9 +26,9 @@ export type User = {
   has_seen_welcome: boolean;
   /** The user hid the onboarding guide conversation. */
   guide_hidden?: boolean;
-  /** Soft-delete or tombstone marker. Null when active. */
+  /** Recoverable soft-delete timestamp; permanently deleted accounts have no row. */
   deleted_at?: string | null;
-  /** True when the user is a tombstone (anonymized, irreversible). */
+  /** Legacy compatibility flag for old tombstone rows while the cleanup worker purges them. */
   is_hard_deleted?: boolean;
   created_at: string;
 };
@@ -167,6 +167,11 @@ export type VoiceMessage = {
   created_at: string;
   author: User;
   attachments: VoiceMessageAttachment[];
+  encryption_version: EncryptionVersion;
+  ciphertext?: string | null;
+  sender_device_id?: string | null;
+  e2ee_metadata?: string | null;
+  e2ee_file_keys?: import("../crypto/fileEncryption").EncryptedFileMeta[];
 };
 
 export type VoiceMessageAttachment = {

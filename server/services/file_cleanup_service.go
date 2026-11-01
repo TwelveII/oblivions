@@ -185,6 +185,18 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 		return nil, fmt.Errorf("collect owned servers: %w", err)
 	}
 	for _, sid := range serverIDs {
+		// Ownership is transferred when another member remains, so those servers and
+		// their shared assets must survive. Collect whole-server files only when the
+		// repository's deletion transaction will remove an empty server.
+		var otherMembers int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM server_members WHERE server_id = ? AND user_id <> ?`, sid, userID,
+		).Scan(&otherMembers); err != nil {
+			return nil, fmt.Errorf("count other members for owned server %s: %w", sid, err)
+		}
+		if otherMembers > 0 {
+			continue
+		}
 		serverPlan, err := s.CollectServerFiles(ctx, sid)
 		if err != nil {
 			return nil, fmt.Errorf("collect owned server %s files: %w", sid, err)
@@ -194,7 +206,7 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 		plan.livekit = append(plan.livekit, serverPlan.livekit...)
 	}
 
-	// ─── User's own message attachments (in servers they don't own) ───
+	// ─── User-authored message attachments not already collected with an empty server ───
 	msgRefs, err := s.queryFileRefs(ctx, true, `
 		SELECT a.file_url, COALESCE(a.file_size, 0), m.user_id, a.thumb_url, COALESCE(a.thumb_size, 0)
 		FROM attachments a
@@ -204,13 +216,17 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 		    SELECT c.id FROM channels c
 		    JOIN servers s ON c.server_id = s.id
 		    WHERE s.owner_id = ?
-		  )`, userID, userID)
+		      AND NOT EXISTS (
+		        SELECT 1 FROM server_members sm
+		        WHERE sm.server_id = s.id AND sm.user_id <> ?
+		      )
+		  )`, userID, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("collect user message files: %w", err)
 	}
 	plan.refs = append(plan.refs, msgRefs...)
 
-	// ─── User voice attachments outside owned servers ───
+	// ─── User voice attachments not already collected with an empty server ───
 	voiceRefs, err := s.queryOwnedRefs(ctx, userID, false, `
 		SELECT vma.file_url, COALESCE(vma.file_size, 0)
 		FROM voice_message_attachments vma
@@ -220,18 +236,23 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 			SELECT c.id FROM channels c
 			JOIN servers s ON c.server_id = s.id
 			WHERE s.owner_id = ?
-		)`, userID, userID)
+			  AND NOT EXISTS (
+			    SELECT 1 FROM server_members sm
+			    WHERE sm.server_id = s.id AND sm.user_id <> ?
+			  )
+		)`, userID, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("collect user voice files: %w", err)
 	}
 	plan.refs = append(plan.refs, voiceRefs...)
 
 	// ─── DM attachments ───
-	dmRefs, err := s.queryOwnedRefs(ctx, userID, true, `
-		SELECT da.file_url, COALESCE(da.file_size, 0), da.thumb_url, COALESCE(da.thumb_size, 0)
+	dmRefs, err := s.queryFileRefs(ctx, true, `
+		SELECT da.file_url, COALESCE(da.file_size, 0), dm.user_id, da.thumb_url, COALESCE(da.thumb_size, 0)
 		FROM dm_attachments da
 		JOIN dm_messages dm ON da.dm_message_id = dm.id
-		WHERE dm.user_id = ?`, userID)
+		JOIN dm_channels dc ON dc.id = dm.dm_channel_id
+		WHERE dc.user1_id = ? OR dc.user2_id = ?`, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("collect user DM files: %w", err)
 	}
@@ -242,7 +263,14 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 		SELECT file_url, COALESCE(file_size, 0)
 		FROM soundboard_sounds
 		WHERE uploaded_by = ?
-		  AND server_id NOT IN (SELECT id FROM servers WHERE owner_id = ?)`, userID, userID)
+		  AND server_id NOT IN (
+		    SELECT s.id FROM servers s
+		    WHERE s.owner_id = ?
+		      AND NOT EXISTS (
+		        SELECT 1 FROM server_members sm
+		        WHERE sm.server_id = s.id AND sm.user_id <> ?
+		      )
+		  )`, userID, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("collect user soundboard files: %w", err)
 	}

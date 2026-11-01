@@ -71,7 +71,7 @@ func TestMessageCreate_ClientNonce(t *testing.T) {
 	t.Run("a retry returns the stored message and creates nothing, even after losing the permission", func(t *testing.T) {
 		svc, repo := newNonceSvc(t, map[string][2]string{"nonce-0001": {"m9", "ch1"}}, 0, nil)
 
-		msg, repeat, err := svc.Create(ctx, "ch1", "u1", &models.CreateMessageRequest{Content: "first send", ClientNonce: "nonce-0001"})
+		msg, repeat, err := svc.Create(ctx, "ch1", "u1", &models.CreateMessageRequest{EncryptionVersion: 1, Ciphertext: ptr("ciphertext"), SenderDeviceID: ptr("device1"), Content: "first send", ClientNonce: "nonce-0001"})
 
 		if err != nil || !repeat || msg.ID != "m9" {
 			t.Fatalf("got (%v, repeat=%v, %v), want the stored m9 as a repeat", msg, repeat, err)
@@ -90,7 +90,7 @@ func TestMessageCreate_ClientNonce(t *testing.T) {
 	t.Run("a nonce used for another channel is refused", func(t *testing.T) {
 		svc, repo := newNonceSvc(t, map[string][2]string{"nonce-0001": {"m9", "other"}}, sendPerms, nil)
 
-		_, _, err := svc.Create(ctx, "ch1", "u1", &models.CreateMessageRequest{Content: "hi", ClientNonce: "nonce-0001"})
+		_, _, err := svc.Create(ctx, "ch1", "u1", &models.CreateMessageRequest{EncryptionVersion: 1, Ciphertext: ptr("ciphertext"), SenderDeviceID: ptr("device1"), Content: "hi", ClientNonce: "nonce-0001"})
 
 		if !errors.Is(err, pkg.ErrConflict) || repo.created != 0 {
 			t.Fatalf("err = %v, created %d; want ErrConflict and nothing created", err, repo.created)
@@ -106,7 +106,7 @@ func TestMessageCreate_ClientNonce(t *testing.T) {
 			return repository.ErrDuplicateClientNonce
 		}
 
-		msg, repeat, err := svc.Create(ctx, "ch1", "u1", &models.CreateMessageRequest{Content: "hi", ClientNonce: "nonce-race-1"})
+		msg, repeat, err := svc.Create(ctx, "ch1", "u1", &models.CreateMessageRequest{EncryptionVersion: 1, Ciphertext: ptr("ciphertext"), SenderDeviceID: ptr("device1"), Content: "hi", ClientNonce: "nonce-race-1"})
 
 		if err != nil || !repeat || msg.ID != "winner" {
 			t.Fatalf("got (%v, repeat=%v, %v), want the winner as a repeat", msg, repeat, err)
@@ -123,7 +123,7 @@ func TestMessageCreate_ClientNonce(t *testing.T) {
 			return nil
 		}
 
-		msg, repeat, err := svc.Create(ctx, "ch1", "u1", &models.CreateMessageRequest{Content: "hi", ClientNonce: "nonce-fresh"})
+		msg, repeat, err := svc.Create(ctx, "ch1", "u1", &models.CreateMessageRequest{EncryptionVersion: 1, Ciphertext: ptr("ciphertext"), SenderDeviceID: ptr("device1"), Content: "hi", ClientNonce: "nonce-fresh"})
 
 		if err != nil || repeat || msg.ID != "new" || repo.created != 1 {
 			t.Fatalf("got (%v, repeat=%v, %v), created %d; want one new message", msg, repeat, err, repo.created)
@@ -136,7 +136,7 @@ func TestMessageCreate_ClientNonce(t *testing.T) {
 	t.Run("a malformed nonce is a bad request", func(t *testing.T) {
 		svc, repo := newNonceSvc(t, nil, sendPerms, nil)
 
-		_, _, err := svc.Create(ctx, "ch1", "u1", &models.CreateMessageRequest{Content: "hi", ClientNonce: "bad nonce!"})
+		_, _, err := svc.Create(ctx, "ch1", "u1", &models.CreateMessageRequest{EncryptionVersion: 1, Ciphertext: ptr("ciphertext"), SenderDeviceID: ptr("device1"), Content: "hi", ClientNonce: "bad nonce!"})
 
 		if !errors.Is(err, pkg.ErrBadRequest) || repo.created != 0 {
 			t.Fatalf("err = %v, created %d; want ErrBadRequest", err, repo.created)

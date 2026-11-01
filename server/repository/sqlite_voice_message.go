@@ -22,10 +22,10 @@ func NewSQLiteVoiceMessageRepo(db database.TxQuerier) VoiceMessageRepository {
 
 func (r *sqliteVoiceMessageRepo) Create(ctx context.Context, m *models.VoiceMessage) error {
 	query := `
-		INSERT INTO voice_messages (id, channel_id, user_id, content)
-		VALUES (lower(hex(randomblob(8))), ?, ?, ?)
+		INSERT INTO voice_messages (id, channel_id, user_id, content, encryption_version, ciphertext, sender_device_id, e2ee_metadata)
+		VALUES (lower(hex(randomblob(8))), ?, ?, NULL, ?, ?, ?, ?)
 		RETURNING id, created_at`
-	err := r.db.QueryRowContext(ctx, query, m.ChannelID, m.UserID, m.Content).
+	err := r.db.QueryRowContext(ctx, query, m.ChannelID, m.UserID, m.EncryptionVersion, m.Ciphertext, m.SenderDeviceID, m.E2EEMetadata).
 		Scan(&m.ID, &m.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("create voice message: %w", err)
@@ -35,7 +35,7 @@ func (r *sqliteVoiceMessageRepo) Create(ctx context.Context, m *models.VoiceMess
 
 func (r *sqliteVoiceMessageRepo) GetByID(ctx context.Context, id string) (*models.VoiceMessage, error) {
 	query := `
-		SELECT vm.id, vm.channel_id, vm.user_id, vm.content, vm.edited_at, vm.created_at,
+		SELECT vm.id, vm.channel_id, vm.user_id, vm.content, vm.encryption_version, vm.ciphertext, vm.sender_device_id, vm.e2ee_metadata, vm.edited_at, vm.created_at,
 		       u.id, u.username, u.display_name, u.avatar_url, u.status, u.deleted_at, u.is_hard_deleted
 		FROM voice_messages vm
 		LEFT JOIN users u ON vm.user_id = u.id
@@ -46,7 +46,7 @@ func (r *sqliteVoiceMessageRepo) GetByID(ctx context.Context, id string) (*model
 	var authorID sql.NullString
 
 	err := r.db.QueryRowContext(ctx, query, id).Scan(
-		&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.EditedAt, &msg.CreatedAt,
+		&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.EncryptionVersion, &msg.Ciphertext, &msg.SenderDeviceID, &msg.E2EEMetadata, &msg.EditedAt, &msg.CreatedAt,
 		&authorID, &author.Username, &author.DisplayName, &author.AvatarURL, &author.Status, &author.DeletedAt, &author.IsHardDeleted,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -68,7 +68,7 @@ func (r *sqliteVoiceMessageRepo) GetByChannelID(ctx context.Context, channelID s
 		limit = 100
 	}
 	query := `
-		SELECT vm.id, vm.channel_id, vm.user_id, vm.content, vm.edited_at, vm.created_at,
+		SELECT vm.id, vm.channel_id, vm.user_id, vm.content, vm.encryption_version, vm.ciphertext, vm.sender_device_id, vm.e2ee_metadata, vm.edited_at, vm.created_at,
 		       u.id, u.username, u.display_name, u.avatar_url, u.status, u.deleted_at, u.is_hard_deleted
 		FROM voice_messages vm
 		LEFT JOIN users u ON vm.user_id = u.id
@@ -88,7 +88,7 @@ func (r *sqliteVoiceMessageRepo) GetByChannelID(ctx context.Context, channelID s
 		var author models.User
 		var authorID sql.NullString
 		if err := rows.Scan(
-			&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.EditedAt, &msg.CreatedAt,
+			&msg.ID, &msg.ChannelID, &msg.UserID, &msg.Content, &msg.EncryptionVersion, &msg.Ciphertext, &msg.SenderDeviceID, &msg.E2EEMetadata, &msg.EditedAt, &msg.CreatedAt,
 			&authorID, &author.Username, &author.DisplayName, &author.AvatarURL, &author.Status, &author.DeletedAt, &author.IsHardDeleted,
 		); err != nil {
 			return nil, fmt.Errorf("scan voice message row: %w", err)
@@ -106,24 +106,17 @@ func (r *sqliteVoiceMessageRepo) GetByChannelID(ctx context.Context, channelID s
 	return out, nil
 }
 
-func (r *sqliteVoiceMessageRepo) UpdateContent(ctx context.Context, id, content string) error {
+func (r *sqliteVoiceMessageRepo) UpdateContent(ctx context.Context, id string, req *models.UpdateVoiceMessageRequest) error {
 	res, err := r.db.ExecContext(ctx,
-		`UPDATE voice_messages SET content = ?, edited_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		content, id,
+		`UPDATE voice_messages SET content = NULL, encryption_version = ?, ciphertext = ?, sender_device_id = ?, e2ee_metadata = ?, edited_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		req.EncryptionVersion, req.Ciphertext, req.SenderDeviceID, req.E2EEMetadata, id,
 	)
-	if err != nil {
-		return fmt.Errorf("update voice message: %w", err)
-	}
+	if err != nil { return fmt.Errorf("update encrypted voice message: %w", err) }
 	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("update voice message rows: %w", err)
-	}
-	if n == 0 {
-		return pkg.ErrNotFound
-	}
+	if err != nil { return fmt.Errorf("update voice message rows: %w", err) }
+	if n == 0 { return pkg.ErrNotFound }
 	return nil
 }
-
 func (r *sqliteVoiceMessageRepo) Delete(ctx context.Context, id string) error {
 	res, err := r.db.ExecContext(ctx, `DELETE FROM voice_messages WHERE id = ?`, id)
 	if err != nil {

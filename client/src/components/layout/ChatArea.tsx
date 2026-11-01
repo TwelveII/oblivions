@@ -65,6 +65,7 @@ function ChatAreaContent({
   serverId?: string;
 }) {
   const { t } = useTranslation("chat");
+  const { t: tE2EE } = useTranslation("e2ee");
   const { addFilesRef } = useChatContext();
   const getPinsForChannel = usePinStore((s) => s.getPinsForChannel);
   const fetchPins = usePinStore((s) => s.fetchPins);
@@ -110,6 +111,7 @@ function ChatAreaContent({
                 <span className="ch-topic">{channel.topic}</span>
               </>
             )}
+            <span className="e2ee-status-indicator" title={tE2EE("encryptionActive")} aria-label={tE2EE("encryptionActive")}>🔒</span>
             <div className="ch-actions">
               {/* Pin icon */}
               <button

@@ -3,9 +3,6 @@ import i18n from "../i18n";
 import * as dmApi from "../api/dm";
 import type { DMSearchResult } from "../api/dm";
 import type { UploadOptions } from "../api/client";
-import { buildAttachmentPreview } from "../utils/attachmentPreview";
-import { mapWithConcurrency } from "../utils/concurrency";
-import { PREVIEW_CONCURRENCY } from "../utils/constants";
 import type { DMChannelWithUser, DMMessage, MessageReference } from "../types";
 import { useUIStore } from "./uiStore";
 import { useToastStore } from "./toastStore";
@@ -110,7 +107,6 @@ type DMCoreState = {
   acceptDMRequest: (channelId: string) => Promise<void>;
   declineDMRequest: (channelId: string) => Promise<void>;
 
-  toggleE2EE: (channelId: string, enabled: boolean) => Promise<boolean>;
 
   getMessagesForChannel: (channelId: string) => DMMessage[];
   getTypingUsers: (channelId: string) => string[];
@@ -127,9 +123,8 @@ export type DMStore = DMCoreState & DMSettingsSlice & DMWsSlice;
  * Whether a DM goes out encrypted, or why it cannot go out. Fails closed like the channel path: an
  * unknown state must not default to plaintext on a conversation that mandates encryption.
  */
-function dmSendMode(channel: DMChannelWithUser | undefined): "plaintext" | "e2ee" | { refusal: string } {
-  if (typeof channel?.e2ee_enabled !== "boolean") return { refusal: "chat:encryptionStateUnknown" };
-  if (!channel.e2ee_enabled) return "plaintext";
+function dmSendMode(channel: DMChannelWithUser | undefined): "e2ee" | { refusal: string } {
+  if (!channel) return { refusal: "chat:encryptionStateUnknown" };
   if (!canEncrypt(useE2EEStore.getState()) || !useAuthStore.getState().user?.id) {
     return { refusal: "chat:encryptionRequired" };
   }
@@ -137,19 +132,11 @@ function dmSendMode(channel: DMChannelWithUser | undefined): "plaintext" | "e2ee
 }
 
 async function prepareDMSend(
-  mode: "plaintext" | "e2ee",
   recipientUserId: string,
   content: string,
   files: File[],
   signal: AbortSignal
 ): Promise<PreparedSend> {
-  if (mode === "plaintext") {
-    const thumbs = files.length > 0
-      ? await mapWithConcurrency(files, PREVIEW_CONCURRENCY, (file) => buildAttachmentPreview(file, signal))
-      : undefined;
-    return { thumbs };
-  }
-
   const { localDeviceId } = useE2EEStore.getState();
   const userId = useAuthStore.getState().user?.id;
   if (!localDeviceId || !userId) throw new Error("E2EE device not ready");
@@ -187,7 +174,7 @@ function dmAttempt(nonce: string): SendAttempt {
       }
       try {
         // dmSendMode answers "e2ee" only for a channel it found.
-        prepared = await prepareDMSend(mode, channel?.other_user.id ?? "", entry.content, entry.files, signal);
+        prepared = await prepareDMSend(channel?.other_user.id ?? "", entry.content, entry.files, signal);
       } catch (err) {
         return encryptionFailureOutcome(err, "dmStore");
       }
@@ -197,12 +184,14 @@ function dmAttempt(nonce: string): SendAttempt {
 
     const replyToId = entry.replyToId ?? undefined;
     const sealed = prepared.encrypted;
-    const res = sealed
-      ? await dmApi.sendEncryptedDMMessage(
-          channelId, sealed.ciphertext, sealed.deviceId, sealed.metadata,
-          sealed.files, replyToId, upload, prepared.thumbs, nonce
-        )
-      : await dmApi.sendDMMessage(channelId, entry.content, entry.files, replyToId, upload, prepared.thumbs, nonce);
+    if (!sealed) {
+      useToastStore.getState().addToast("error", i18n.t("chat:encryptionRequired"));
+      return "rejected";
+    }
+    const res = await dmApi.sendEncryptedDMMessage(
+      channelId, sealed.ciphertext, sealed.deviceId, sealed.metadata,
+      sealed.files, replyToId, upload, prepared.thumbs, nonce
+    );
 
     if (!res.success) return sendFailureOutcome(res);
     if (res.data) {
@@ -508,12 +497,12 @@ export const useDMStore = create<DMStore>((set, get, store) => ({
       return false;
     }
 
-    if (editChannelE2EE && !canEncrypt(e2eeState)) {
+    if (!canEncrypt(e2eeState)) {
       useToastStore.getState().addToast("error", i18n.t("chat:encryptionRequired"));
       return false;
     }
 
-    if (editChannelE2EE && e2eeState.initStatus === "ready" && e2eeState.localDeviceId) {
+    if (e2eeState.initStatus === "ready" && e2eeState.localDeviceId) {
       const currentUserId = useAuthStore.getState().user?.id;
 
       if (recipientUserId && currentUserId) {
@@ -562,8 +551,8 @@ export const useDMStore = create<DMStore>((set, get, store) => ({
       }
     }
 
-    const res = await dmApi.editDMMessage(messageId, content);
-    return res.success;
+    useToastStore.getState().addToast("error", i18n.t("chat:encryptionRequired"));
+    return false;
   },
 
   deleteMessage: async (messageId) => {
@@ -622,21 +611,6 @@ export const useDMStore = create<DMStore>((set, get, store) => ({
         selectedDMId: state.selectedDMId === channelId ? null : state.selectedDMId,
       }));
     }
-  },
-
-  toggleE2EE: async (channelId, enabled) => {
-    const res = await dmApi.toggleDME2EE(channelId, enabled);
-    if (res.success && res.data) {
-      set((state) => ({
-        channels: state.channels.map((ch) =>
-          ch.id === channelId ? { ...ch, e2ee_enabled: enabled } : ch
-        ),
-      }));
-      if (enabled) {
-        useE2EEStore.getState().checkAndPromptRecovery();
-      }
-    }
-    return res.success;
   },
 
   getMessagesForChannel: (channelId) => {

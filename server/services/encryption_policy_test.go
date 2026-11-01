@@ -22,10 +22,10 @@ func TestEncryptionPolicy_EveryDirectionOnEveryPath(t *testing.T) {
 		version         int
 		wantCode        string
 	}{
-		{"plaintext on a plaintext server", false, 0, ""},
+		{"plaintext on a plaintext server", false, 0, pkg.CodeEncryptionRequired},
 		{"encrypted on an encrypted server", true, 1, ""},
 		{"plaintext on an encrypted server", true, 0, pkg.CodeEncryptionRequired},
-		{"encrypted on a plaintext server", false, 1, pkg.CodeEncryptionNotAvailable},
+		{"encrypted on a plaintext server", false, 1, ""},
 	}
 
 	for _, tc := range cases {

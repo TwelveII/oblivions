@@ -90,8 +90,7 @@ func TestSQLiteUserRepo_ResetPasswordWithTokenClearsSiblingTokensAndSessions(t *
 	}
 }
 
-// The tombstone keeps the user row, so push_tokens' ON DELETE CASCADE never fires; without the
-// explicit delete a deleted account's phone keeps its registration.
+// A permanent account deletion must remove push tokens as well as the account row.
 func TestSQLiteUserRepo_HardDeleteShouldRemoveThePushTokens(t *testing.T) {
 	ctx := context.Background()
 	db := newUserRepoTestDB(t)
@@ -114,9 +113,14 @@ func TestSQLiteUserRepo_HardDeleteShouldRemoveThePushTokens(t *testing.T) {
 	if left != 0 {
 		t.Fatal("push token survived the account's hard delete")
 	}
+	var userRows int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE id = 'u1'`).Scan(&userRows); err != nil {
+		t.Fatalf("count deleted user rows: %v", err)
+	}
+	if userRows != 0 { t.Fatalf("permanently deleted account row remains: %d", userRows) }
 }
 
-// Signup invite references must not block account tombstoning.
+// Signup invite references must not block physical account deletion.
 func TestSQLiteUserRepo_HardDeleteCleansSignupInviteReferences(t *testing.T) {
 	ctx := context.Background()
 	db := newUserRepoTestDB(t)
@@ -225,7 +229,12 @@ func TestSQLiteUserRepo_HardDeleteCleansDMDeliveries(t *testing.T) {
 	).Scan(&channels); err != nil {
 		t.Fatalf("count DM channels: %v", err)
 	}
-	if channels != 1 {
-		t.Fatalf("DM channel count got %d want 1", channels)
+	if channels != 0 {
+		t.Fatalf("DM channel count got %d want 0 after permanent account deletion", channels)
 	}
+	var userRows int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE id = 'u1'`).Scan(&userRows); err != nil {
+		t.Fatalf("count deleted account: %v", err)
+	}
+	if userRows != 0 { t.Fatalf("deleted account row remains: %d", userRows) }
 }

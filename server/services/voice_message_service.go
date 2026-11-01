@@ -84,14 +84,13 @@ func (s *voiceMessageService) Create(ctx context.Context, userID, channelID stri
 		return nil, err
 	}
 
-	var contentPtr *string
-	if req.Content != "" {
-		contentPtr = &req.Content
-	}
 	msg := &models.VoiceMessage{
-		ChannelID: channelID,
-		UserID:    userID,
-		Content:   contentPtr,
+		ChannelID:         channelID,
+		UserID:            userID,
+		EncryptionVersion: req.EncryptionVersion,
+		Ciphertext:        req.Ciphertext,
+		SenderDeviceID:    req.SenderDeviceID,
+		E2EEMetadata:      req.E2EEMetadata,
 	}
 	if err := s.repo.Create(ctx, msg); err != nil {
 		return nil, err
@@ -136,7 +135,7 @@ func (s *voiceMessageService) Update(ctx context.Context, userID, messageID stri
 	if _, err := s.requireMember(userID, existing.ChannelID); err != nil {
 		return nil, err
 	}
-	if err := s.repo.UpdateContent(ctx, messageID, req.Content); err != nil {
+	if err := s.repo.UpdateContent(ctx, messageID, req); err != nil {
 		return nil, err
 	}
 	updated, err := s.repo.GetByID(ctx, messageID)
