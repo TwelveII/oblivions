@@ -543,7 +543,7 @@ var defaultReferenceSources = map[files.Kind][]string{
 	files.KindServerReport: {`SELECT file_url FROM server_report_attachments WHERE file_url IS NOT NULL AND file_url != ''`},
 	files.KindVoiceMsg:     {`SELECT file_url FROM voice_message_attachments WHERE file_url IS NOT NULL AND file_url != ''`},
 	files.KindAvatar:       {`SELECT avatar_url FROM users WHERE avatar_url IS NOT NULL AND avatar_url != ''`},
-	files.KindWallpaper:    {`SELECT wallpaper_url FROM users WHERE wallpaper_url IS NOT NULL AND wallpaper_url != ''`},
+	files.KindWallpaper:    {`SELECT '' WHERE 0`},
 	files.KindServerIcon:   {`SELECT icon_url FROM servers WHERE icon_url IS NOT NULL AND icon_url != ''`},
 	files.KindServerBanner: {`SELECT banner_url FROM servers WHERE banner_url IS NOT NULL AND banner_url != ''`},
 	files.KindBadge:        {`SELECT icon FROM badges WHERE icon_type = 'custom' AND icon IS NOT NULL AND icon != ''`},

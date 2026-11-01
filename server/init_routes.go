@@ -83,8 +83,6 @@ func initRoutes(
 	mux.Handle("PATCH /api/users/me/profile", auth(h.Member.UpdateProfile))
 	mux.Handle("POST /api/users/me/password", auth(h.Auth.ChangePassword))
 		mux.Handle("POST /api/users/me/avatar", auth(h.Avatar.UploadUserAvatar))
-	mux.Handle("POST /api/users/me/wallpaper", auth(h.Avatar.UploadUserWallpaper))
-	mux.Handle("DELETE /api/users/me/wallpaper", auth(h.Avatar.DeleteUserWallpaper))
 	mux.Handle("GET /api/users/me/preferences", auth(h.Preferences.Get))
 	mux.Handle("POST /api/users/me/dismiss-download-prompt", auth(h.DownloadPrompt.Dismiss))
 	mux.Handle("POST /api/users/me/dismiss-welcome", auth(h.DownloadPrompt.DismissWelcome))
@@ -268,9 +266,11 @@ func initRoutes(
 	// Platform Admin — Reports
 	mux.Handle("GET /api/admin/reports", authAdmin(h.Admin.ListReports))
 	mux.Handle("PATCH /api/admin/reports/{id}/status", authAdmin(h.Admin.UpdateReportStatus))
+	mux.Handle("DELETE /api/admin/reports/{id}", authAdmin(h.Admin.DeleteReport))
 	mux.Handle("DELETE /api/admin/reports/{id}/message", authAdmin(h.Admin.DeleteReportedMessage))
 	mux.Handle("GET /api/admin/server-reports", authAdmin(h.Admin.ListServerReports))
 	mux.Handle("PATCH /api/admin/server-reports/{id}/status", authAdmin(h.Admin.UpdateServerReportStatus))
+	mux.Handle("DELETE /api/admin/server-reports/{id}", authAdmin(h.Admin.DeleteServerReport))
 	mux.Handle("POST /api/admin/reports/mark-seen", authAdmin(h.Admin.MarkReportsSeen))
 
 	// Platform Admin — Badge indicators (new feedback / new reports)
@@ -281,6 +281,7 @@ func initRoutes(
 	mux.Handle("GET /api/admin/feedback/{id}", authAdmin(h.Feedback.AdminGetTicket))
 	mux.Handle("POST /api/admin/feedback/{id}/reply", authAdmin(h.Feedback.AdminReply))
 	mux.Handle("PATCH /api/admin/feedback/{id}/status", authAdmin(h.Feedback.AdminUpdateStatus))
+	mux.Handle("DELETE /api/admin/feedback/{id}", authAdmin(h.Feedback.AdminDeleteTicket))
 	mux.Handle("POST /api/admin/feedback/mark-seen", authAdmin(h.Admin.MarkFeedbackSeen))
 
 	// Platform Admin — Users

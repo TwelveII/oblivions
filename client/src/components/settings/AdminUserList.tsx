@@ -165,7 +165,8 @@ function AdminUserList() {
         limit: pageSize,
         offset: page * pageSize,
         search: debouncedSearch || undefined,
-        statuses: statusFilter,
+        // Exclude legacy hard-delete tombstones from the admin UI entirely.
+        statuses: statusFilter.length ? statusFilter : ["active", "banned", "soft_deleted"],
         presences: presenceFilter,
         admin: adminFilter,
         sort: sortKey,
@@ -286,48 +287,6 @@ function AdminUserList() {
       });
     }
 
-    if (!isMe && user.deleted_at && !user.is_hard_deleted) {
-      items.push({
-        label: t("restore"),
-        separator: items.length > 0 && !items[items.length - 1]?.separator,
-        onClick: () => {
-          void (async () => {
-            const res = await import("../../api/admin").then((m) => m.adminRestoreUser(user.id));
-            if (res.success) {
-              addToast("success", t("restoreServerSuccess")); // reuse restore success key
-              await refetchUsers();
-            } else {
-              addToast("error", res.error ?? t("restoreServerFailed"));
-            }
-          })();
-        },
-      });
-      // A soft-deleted user is otherwise stuck waiting for the 30-day TTL.
-      // Admins need a way to skip the wait — "delete now" maps to the existing
-      // hard-delete API path with hard_delete=true.
-      items.push({
-        label: t("platformUserHardDeleteNow"),
-        danger: true,
-        onClick: () => {
-          void (async () => {
-            const ok = await confirm({
-              title: t("platformUserHardDeleteNowTitle"),
-              message: t("platformUserHardDeleteNowConfirm", { username: user.username }),
-              danger: true,
-              confirmLabel: t("platformUserHardDeleteNowButton"),
-            });
-            if (!ok) return;
-            const res = await hardDeleteUser(user.id, { hard_delete: true });
-            if (res.success) {
-              addToast("success", t("platformDeleteSuccess", { username: user.username }));
-              await refetchUsers();
-            } else {
-              addToast("error", res.error ?? t("platformDeleteError"));
-            }
-          })();
-        },
-      });
-    }
 
     return items;
   }
@@ -412,15 +371,14 @@ function AdminUserList() {
     }
   }
 
-  async function handleDeleteConfirm(reason: string, hardDelete?: boolean) {
+  async function handleDeleteConfirm(reason: string) {
     if (!deleteTarget) return;
     const targetId = deleteTarget.id;
     const targetName = deleteTarget.username;
     setDeleteTarget(null);
 
-    const body: { reason?: string; hard_delete?: boolean } = {};
+    const body: { reason?: string } = {};
     if (reason) body.reason = reason;
-    if (hardDelete) body.hard_delete = true;
 
     const res = await hardDeleteUser(targetId, Object.keys(body).length ? body : undefined);
     if (res.success) {
@@ -587,14 +545,6 @@ function AdminUserList() {
             {user.is_platform_banned && (
               <span className="admin-user-banned-badge">{t("platformUserBannedBadge")}</span>
             )}
-            {user.deleted_at && user.is_hard_deleted && (
-              <span
-                className="admin-user-tombstone-badge"
-                title={t("platformUserTombstoneTitle")}
-              >
-                {t("platformUserTombstoneBadge")}
-              </span>
-            )}
             {user.deleted_at && !user.is_hard_deleted && (
               <span
                 className="admin-user-deleted-badge"
@@ -699,7 +649,6 @@ function AdminUserList() {
             { value: "active", label: t("platformUserFilterActive") },
             { value: "banned", label: t("platformUserFilterBanned") },
             { value: "soft_deleted", label: t("platformUserFilterSoftDeleted") },
-            { value: "tombstone", label: t("platformUserFilterTombstone") },
           ]}
           selected={statusFilter}
           onChange={setStatusFilter}
@@ -820,9 +769,6 @@ function AdminUserList() {
           confirmLabel={t("platformDeleteConfirm")}
           onConfirm={handleDeleteConfirm}
           onCancel={() => setDeleteTarget(null)}
-          showHardDeleteToggle
-          hardDeleteLabel={t("permanentDelete")}
-          hardDeleteHint={t("platformDeleteHardHint")}
         />
       )}
 

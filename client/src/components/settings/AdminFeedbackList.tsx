@@ -10,12 +10,14 @@ import {
   adminGetFeedbackTicket,
   adminReplyToFeedback,
   adminUpdateFeedbackStatus,
+  adminDeleteFeedbackTicket,
 } from "../../api/feedback";
 import type { FeedbackTicket, FeedbackReply, FeedbackStatus, FeedbackType } from "../../types";
 import { resolveAssetUrl, FEEDBACK_ACCEPT_ATTR, isFeedbackAttachment } from "../../utils/constants";
 import AttachmentPreview from "../shared/AttachmentPreview";
 import { useAttachmentViewer } from "../../hooks/useAttachmentViewer";
 import { useUploadProgress } from "../../hooks/useUploadProgress";
+import { useConfirm } from "../../hooks/useConfirm";
 import UploadProgress from "../shared/UploadProgress";
 import { useImageAttach } from "../../hooks/useImageAttach";
 import FilePreview from "../chat/FilePreview";
@@ -47,6 +49,7 @@ function parseUTC(iso: string): number {
 function AdminFeedbackList() {
   const { t } = useTranslation("settings");
   const addToast = useToastStore((s) => s.addToast);
+  const confirm = useConfirm();
   const openAttachment = useAttachmentViewer();
   const { progress: uploadProgress, begin: beginUpload, end: endUpload, cancel: cancelUpload } =
     useUploadProgress();
@@ -168,6 +171,22 @@ function AdminFeedbackList() {
     }
   };
 
+  const handleDeleteTicket = async () => {
+    if (!activeTicket) return;
+    const ok = await confirm({ message: "Permanently delete this feedback ticket and all replies and attachments?", confirmLabel: "Delete feedback", danger: true });
+    if (!ok) return;
+    const id = activeTicket.id;
+    const res = await adminDeleteFeedbackTicket(id);
+    if (res.success) {
+      setActiveTicket(null);
+      setReplies([]);
+      setTickets((prev) => prev.filter((ticket) => ticket.id !== id));
+      setTotal((prev) => Math.max(0, prev - 1));
+      addToast("success", "Feedback deleted");
+      fetchTickets();
+    } else addToast("error", res.error ?? "Could not delete feedback");
+  };
+
   const goBack = () => {
     setActiveTicket(null);
     setReplies([]);
@@ -260,6 +279,7 @@ function AdminFeedbackList() {
           <button className="settings-btn settings-btn-secondary" onClick={goBack}>
             {t("feedbackBackToList")}
           </button>
+          <button type="button" className="settings-btn settings-btn-danger" onClick={handleDeleteTicket}>Delete feedback</button>
         </div>
 
         <div className="feedback-detail-meta">

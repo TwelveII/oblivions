@@ -102,9 +102,12 @@ func (c *Checker) Check(ctx context.Context, user *models.User, filePath string)
 	scopeID := parts[1]
 
 	switch files.Kind(kind) {
-	case files.KindAvatar, files.KindWallpaper, files.KindServerIcon, files.KindBadge:
+	case files.KindAvatar, files.KindServerIcon, files.KindBadge:
 		// Accessible to any authenticated user
 		return nil
+	case files.KindWallpaper:
+		// Wallpaper support is retired; legacy URLs cannot be refreshed.
+		return fmt.Errorf("%w: wallpaper files are no longer supported", ErrAccessDenied)
 
 	case files.KindMessage:
 		// scopeID = messageID → look up message → check channel read permission

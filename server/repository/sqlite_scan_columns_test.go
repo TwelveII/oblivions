@@ -32,13 +32,13 @@ func TestScanUser_EveryColumnLandsInItsOwnField(t *testing.T) {
 
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO users (
-			id, username, display_name, avatar_url, wallpaper_url, password_hash, status, pref_status,
+			id, username, display_name, avatar_url, password_hash, status, pref_status,
 			custom_status, email, language, dm_privacy, is_platform_admin, is_platform_banned,
 			has_seen_download_prompt, has_seen_welcome, platform_ban_reason, platform_banned_by,
 			platform_banned_at, deleted_at, deleted_by_admin, is_hard_deleted, token_version,
 			feedback_last_seen_at, reports_last_seen_at, created_at
 		) VALUES (
-			'id-1', 'username-1', 'display-1', 'avatar-1', 'wallpaper-1', 'hash-1', 'idle', 'dnd',
+			'id-1', 'username-1', 'display-1', 'avatar-1', 'hash-1', 'idle', 'dnd',
 			'custom-1', 'email-1', 'lang-1', 'privacy-1', 1, 1,
 			1, 1, 'reason-1', 'bannedby-1',
 			?, ?, 1, 1, 7,
@@ -57,7 +57,6 @@ func TestScanUser_EveryColumnLandsInItsOwnField(t *testing.T) {
 	assertString(t, "Username", user.Username, "username-1")
 	assertPtr(t, "DisplayName", user.DisplayName, "display-1")
 	assertPtr(t, "AvatarURL", user.AvatarURL, "avatar-1")
-	assertPtr(t, "WallpaperURL", user.WallpaperURL, "wallpaper-1")
 	assertString(t, "PasswordHash", user.PasswordHash, "hash-1")
 	assertString(t, "Status", string(user.Status), "idle")
 	assertString(t, "PrefStatus", string(user.PrefStatus), "dnd")
@@ -409,8 +408,8 @@ func describe(u *models.User) string {
 		return *p
 	}
 	return fmt.Sprintf(
-		"id=%s username=%s display=%s avatar=%s wallpaper=%s hash=%s status=%s pref=%s custom=%s email=%s lang=%s dm=%s admin=%t banned=%t tokenVersion=%d",
-		u.ID, u.Username, deref(u.DisplayName), deref(u.AvatarURL), deref(u.WallpaperURL), u.PasswordHash,
+		"id=%s username=%s display=%s avatar=%s hash=%s status=%s pref=%s custom=%s email=%s lang=%s dm=%s admin=%t banned=%t tokenVersion=%d",
+		u.ID, u.Username, deref(u.DisplayName), deref(u.AvatarURL), u.PasswordHash,
 		u.Status, u.PrefStatus, deref(u.CustomStatus), deref(u.Email), u.Language, u.DMPrivacy,
 		u.IsPlatformAdmin, u.IsPlatformBanned, u.TokenVersion,
 	)

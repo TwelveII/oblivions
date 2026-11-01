@@ -282,3 +282,11 @@ func (r *sqliteReportRepo) LatestCreatedAt(ctx context.Context) (*time.Time, err
 	}
 	return parseSQLiteTimestamp(s.String)
 }
+
+func (r *sqliteReportRepo) Delete(ctx context.Context, id string) error {
+	result, err := r.db.ExecContext(ctx, `DELETE FROM reports WHERE id = ?`, id)
+	if err != nil { return fmt.Errorf("failed to delete report: %w", err) }
+	rows, _ := result.RowsAffected()
+	if rows == 0 { return pkg.ErrNotFound }
+	return nil
+}

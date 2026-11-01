@@ -7,7 +7,7 @@
 //	messages/<messageID>/<filename>
 //	dm/<dmMessageID>/<filename>
 //	avatars/<userID>/<filename>
-//	wallpapers/<userID>/<filename>
+//	legacy wallpapers/<userID>/<filename> (cleanup only)
 //	badges/global/<filename>
 //	soundboards/<serverID>/<filename>
 //	server-icons/<serverID>/<filename>
@@ -47,6 +47,7 @@ const (
 	KindMessage      Kind = "messages"
 	KindDM           Kind = "dm"
 	KindAvatar       Kind = "avatars"
+	// KindWallpaper is retained only so the orphan sweeper can remove legacy wallpaper files.
 	KindWallpaper    Kind = "wallpapers"
 	KindBadge        Kind = "badges"
 	KindSoundboard   Kind = "soundboards"

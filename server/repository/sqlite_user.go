@@ -26,7 +26,7 @@ func NewSQLiteUserRepo(db database.TxQuerier) UserRepository {
 // missed one surfaced as a runtime Scan error rather than a compile failure.
 //
 // Columns only, no SELECT and no FROM: callers append their own WHERE / ORDER BY / LIMIT.
-const userColumns = `id, username, display_name, avatar_url, wallpaper_url, password_hash, status, pref_status, custom_status,
+const userColumns = `id, username, display_name, avatar_url, password_hash, status, pref_status, custom_status,
 		email, language, dm_privacy, is_platform_admin, is_platform_banned, has_seen_download_prompt, has_seen_welcome, guide_hidden,
 		platform_ban_reason, platform_banned_by, platform_banned_at,
 		deleted_at, deleted_by_admin, is_hard_deleted, token_version, feedback_last_seen_at, reports_last_seen_at, created_at, invite_limit, invite_codes_created`
@@ -34,7 +34,7 @@ const userColumns = `id, username, display_name, avatar_url, wallpaper_url, pass
 func scanUser(s scanner) (*models.User, error) {
 	var u models.User
 	err := s.Scan(
-		&u.ID, &u.Username, &u.DisplayName, &u.AvatarURL, &u.WallpaperURL,
+		&u.ID, &u.Username, &u.DisplayName, &u.AvatarURL,
 		&u.PasswordHash, &u.Status, &u.PrefStatus, &u.CustomStatus, &u.Email,
 		&u.Language, &u.DMPrivacy, &u.IsPlatformAdmin, &u.IsPlatformBanned, &u.HasSeenDownloadPrompt, &u.HasSeenWelcome, &u.GuideHidden,
 		&u.PlatformBanReason, &u.PlatformBannedBy, &u.PlatformBannedAt,
@@ -386,14 +386,6 @@ func (r *sqliteUserRepo) UpdateEmail(ctx context.Context, userID string, email *
 	return nil
 }
 
-func (r *sqliteUserRepo) UpdateWallpaper(ctx context.Context, userID string, wallpaperURL *string) error {
-	_, err := r.db.ExecContext(ctx, `UPDATE users SET wallpaper_url = ? WHERE id = ?`, wallpaperURL, userID)
-	if err != nil {
-		return fmt.Errorf("failed to update wallpaper: %w", err)
-	}
-	return nil
-}
-
 func (r *sqliteUserRepo) GetByEmail(ctx context.Context, email string) (*models.User, error) {
 	query := `SELECT ` + userColumns + ` FROM users WHERE email = ?`
 
@@ -506,7 +498,7 @@ func userStateClause(statuses []string) string {
 			ors = append(ors, "(u.deleted_at IS NOT NULL AND u.is_hard_deleted = 0)")
 		case "tombstone":
 			ors = append(ors, "u.is_hard_deleted = 1")
-		}
+				}
 	}
 	if len(ors) == 0 {
 		return ""

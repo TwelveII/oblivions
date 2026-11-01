@@ -1,7 +1,6 @@
-// Package handlers -- AvatarHandler: user avatar, user wallpaper and server icon upload endpoints.
+// Package handlers -- AvatarHandler: avatar and server icon upload endpoints.
 //
-// Separate from UploadService because avatar uploads update User/Server records
-// directly (no messageID or Attachment record), and only image MIME types are accepted.
+// Separate from UploadService because avatar uploads update User/Server records directly.
 package handlers
 
 import (
@@ -14,7 +13,6 @@ import (
 	"github.com/akinalp/mqvi/pkg"
 	"github.com/akinalp/mqvi/pkg/ctxkeys"
 	"github.com/akinalp/mqvi/pkg/files"
-	"github.com/akinalp/mqvi/repository"
 	"github.com/akinalp/mqvi/services"
 )
 
@@ -27,31 +25,25 @@ var allowedImageMimes = map[string]bool{
 	"image/webp": true,
 }
 
-// AvatarHandler handles avatar, wallpaper and icon upload endpoints.
+// AvatarHandler handles avatar and server icon upload endpoints.
 type AvatarHandler struct {
-	userRepo      repository.UserRepository
 	memberService services.MemberService
 	serverService services.ServerService
 	locator       *files.Locator
 	pipeline      services.UploadPipeline
-	urlSigner     services.FileURLSigner
 }
 
 func NewAvatarHandler(
-	userRepo repository.UserRepository,
 	memberService services.MemberService,
 	serverService services.ServerService,
 	locator *files.Locator,
 	pipeline services.UploadPipeline,
-	urlSigner services.FileURLSigner,
 ) *AvatarHandler {
 	return &AvatarHandler{
-		userRepo:      userRepo,
 		memberService: memberService,
 		serverService: serverService,
 		locator:       locator,
 		pipeline:      pipeline,
-		urlSigner:     urlSigner,
 	}
 }
 
@@ -84,51 +76,6 @@ func (h *AvatarHandler) UploadUserAvatar(w http.ResponseWriter, r *http.Request)
 
 	// AvatarURL already signed by memberService.UpdateProfile
 	pkg.JSON(w, http.StatusOK, member)
-}
-
-// UploadUserWallpaper uploads the current user's wallpaper.
-// Deletes the old wallpaper file from disk if present.
-// POST /api/users/me/wallpaper (multipart/form-data)
-func (h *AvatarHandler) UploadUserWallpaper(w http.ResponseWriter, r *http.Request) {
-	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
-	if !ok {
-		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
-		return
-	}
-
-	fileURL, err := h.processUpload(w, r, files.KindWallpaper, user.ID)
-	if err != nil {
-		pkg.Error(w, err)
-		return
-	}
-
-	h.locator.DeleteFromURL(derefStr(user.WallpaperURL))
-
-	if err := h.userRepo.UpdateWallpaper(r.Context(), user.ID, &fileURL); err != nil {
-		pkg.Error(w, err)
-		return
-	}
-
-	pkg.JSON(w, http.StatusOK, map[string]string{"wallpaper_url": h.urlSigner.SignURL(fileURL)})
-}
-
-// DeleteUserWallpaper removes the current user's wallpaper (file + DB column).
-// DELETE /api/users/me/wallpaper
-func (h *AvatarHandler) DeleteUserWallpaper(w http.ResponseWriter, r *http.Request) {
-	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
-	if !ok {
-		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
-		return
-	}
-
-	h.locator.DeleteFromURL(derefStr(user.WallpaperURL))
-
-	if err := h.userRepo.UpdateWallpaper(r.Context(), user.ID, nil); err != nil {
-		pkg.Error(w, err)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // UploadServerIcon uploads the server icon. Requires admin permission.

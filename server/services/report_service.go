@@ -20,11 +20,13 @@ type ReportService interface {
 	CreateReport(ctx context.Context, reporterID, targetID string, req *models.CreateReportRequest) (*models.Report, error)
 	ListReports(ctx context.Context, status string, limit, offset int) ([]models.ReportWithUsers, int, error)
 	UpdateReportStatus(ctx context.Context, reportID string, status models.ReportStatus, adminID string) error
+	DeleteReport(ctx context.Context, reportID string) error
 
 	// Server reports (discovery moderation).
 	CreateServerReport(ctx context.Context, reporterID, serverID string, req *models.CreateReportRequest) (*models.ServerReport, error)
 	ListServerReports(ctx context.Context, status string, limit, offset int) ([]models.ServerReportWithInfo, int, error)
 	UpdateServerReportStatus(ctx context.Context, reportID string, status models.ReportStatus, adminID string) error
+	DeleteServerReport(ctx context.Context, reportID string) error
 }
 
 type reportService struct {
@@ -154,6 +156,10 @@ func (s *reportService) ListServerReports(ctx context.Context, status string, li
 
 func (s *reportService) UpdateServerReportStatus(ctx context.Context, reportID string, status models.ReportStatus, adminID string) error {
 	return s.serverReportRepo.UpdateStatus(ctx, reportID, status, adminID)
+}
+
+func (s *reportService) DeleteServerReport(ctx context.Context, reportID string) error {
+	return s.serverReportRepo.Delete(ctx, reportID)
 }
 
 func (s *reportService) CreateReport(ctx context.Context, reporterID, targetID string, req *models.CreateReportRequest) (*models.Report, error) {
@@ -368,6 +374,10 @@ func (s *reportService) ListReports(ctx context.Context, status string, limit, o
 	}
 
 	return reports, total, nil
+}
+
+func (s *reportService) DeleteReport(ctx context.Context, reportID string) error {
+	return s.reportRepo.Delete(ctx, reportID)
 }
 
 func (s *reportService) UpdateReportStatus(ctx context.Context, reportID string, status models.ReportStatus, adminID string) error {

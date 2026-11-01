@@ -142,3 +142,11 @@ func (r *sqliteServerReportRepo) GetAttachmentsByReportID(ctx context.Context, r
 	}
 	return out, rows.Err()
 }
+
+func (r *sqliteServerReportRepo) Delete(ctx context.Context, reportID string) error {
+	result, err := r.db.ExecContext(ctx, `DELETE FROM server_reports WHERE id = ?`, reportID)
+	if err != nil { return fmt.Errorf("failed to delete server report: %w", err) }
+	rows, _ := result.RowsAffected()
+	if rows == 0 { return pkg.ErrNotFound }
+	return nil
+}

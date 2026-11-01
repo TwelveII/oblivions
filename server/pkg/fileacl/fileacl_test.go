@@ -91,11 +91,11 @@ func TestCheck_ServerIcon_AlwaysAllowed(t *testing.T) {
 	}
 }
 
-func TestCheck_Wallpaper_AlwaysAllowed(t *testing.T) {
+func TestCheck_LegacyWallpaper_Denied(t *testing.T) {
 	c := NewChecker(nil, nil, nil, nil, nil, nil, nil)
 	user := &models.User{ID: "u1"}
-	if err := c.Check(context.Background(), user, "/api/files/wallpapers/u1/bg.jpg"); err != nil {
-		t.Fatalf("wallpaper should be allowed: %v", err)
+	if err := c.Check(context.Background(), user, "/api/files/wallpapers/u1/bg.jpg"); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("legacy wallpaper should be denied, got: %v", err)
 	}
 }
 
