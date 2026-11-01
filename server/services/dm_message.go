@@ -207,7 +207,10 @@ func (s *dmService) sendMessage(ctx context.Context, userID, channelID string, c
 		// Once a request was accepted InitiatedBy stays set, so messages flow freely
 		// even before the recipient replies — otherwise the initiator gets stuck on 403.
 		if channel.Status == models.DMStatusAccepted && channel.InitiatedBy == nil && s.friendChecker != nil {
-			recipient, _ := s.userRepo.GetByID(ctx, otherUserID)
+			recipient, err := s.userRepo.GetByID(ctx, otherUserID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to look up recipient DM privacy settings: %w", err)
+			}
 			if recipient != nil && recipient.DMPrivacy == "message_request" {
 				friends, err := s.friendChecker.AreFriends(ctx, userID, otherUserID)
 				if err != nil {
@@ -227,11 +230,12 @@ func (s *dmService) sendMessage(ctx context.Context, userID, channelID string, c
 							return nil, fmt.Errorf("failed to count messages: %w", err)
 						}
 						if msgCount == 0 {
-							// First message: transition channel to pending
-							_ = s.dmRepo.UpdateChannelStatus(ctx, channelID, models.DMStatusPending)
+							// First message: persist the request state and initiator together.
+							if err := s.dmRepo.SetPendingRequest(ctx, channelID, userID); err != nil {
+								return nil, fmt.Errorf("failed to create DM request: %w", err)
+							}
 							channel.Status = models.DMStatusPending
 							channel.InitiatedBy = &userID
-							_ = s.dmRepo.SetInitiatedBy(ctx, channelID, userID)
 						} else {
 							return nil, fmt.Errorf("%w: dm_request_pending", pkg.ErrForbidden)
 						}
@@ -262,8 +266,10 @@ func (s *dmService) sendMessage(ctx context.Context, userID, channelID string, c
 		}
 	}
 
+	// Never persist plaintext beside an encrypted DM. A malicious or outdated client
+	// may send both fields; the encrypted representation must be the only stored payload.
 	var contentPtr *string
-	if req.Content != "" {
+	if req.EncryptionVersion == 0 && req.Content != "" {
 		contentPtr = &req.Content
 	}
 

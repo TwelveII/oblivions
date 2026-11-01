@@ -453,6 +453,26 @@ func (r *sqliteDMRepo) SetInitiatedBy(ctx context.Context, channelID, userID str
 	return nil
 }
 
+ // SetPendingRequest moves a fresh accepted channel into the request state atomically.
+ // The conditional update prevents concurrent first messages from overwriting a decision.
+func (r *sqliteDMRepo) SetPendingRequest(ctx context.Context, channelID, userID string) error {
+	res, err := r.db.ExecContext(ctx,
+		"UPDATE dm_channels SET status = ?, initiated_by = ? WHERE id = ? AND status = ? AND initiated_by IS NULL",
+		models.DMStatusPending, userID, channelID, models.DMStatusAccepted,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create DM request: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to read DM request update result: %w", err)
+	}
+	if n != 1 {
+		return fmt.Errorf("DM channel changed before request could be created")
+	}
+	return nil
+}
+
 func (r *sqliteDMRepo) CountMessagesBySender(ctx context.Context, channelID, userID string) (int, error) {
 	var count int
 	err := r.db.QueryRowContext(ctx,
