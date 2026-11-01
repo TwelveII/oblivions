@@ -69,6 +69,13 @@ func (m *AuthMiddleware) authenticate(r *http.Request) (*models.User, *models.To
 		return nil, nil, &authFailure{status: http.StatusUnauthorized, message: "user not found"}
 	}
 
+	if siteReader, ok := m.userRepo.(interface { IsSiteEnabled(context.Context) (bool, error) }); ok {
+		enabled, err := siteReader.IsSiteEnabled(r.Context())
+		if err != nil || (!enabled && !user.IsPlatformAdmin) {
+			return nil, nil, &authFailure{status: http.StatusServiceUnavailable, message: "site temporarily unavailable"}
+		}
+	}
+
 	if user.IsPlatformBanned {
 		return nil, nil, &authFailure{status: http.StatusForbidden, message: "account suspended"}
 	}
