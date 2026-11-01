@@ -51,7 +51,11 @@ func scanUser(s scanner) (*models.User, error) {
 func (r *sqliteUserRepo) Create(ctx context.Context, user *models.User) error {
 	query := `
 		INSERT INTO users (id, username, display_name, avatar_url, password_hash, status, email, language, is_platform_admin)
-		VALUES (lower(hex(randomblob(8))), ?, ?, ?, ?, ?, ?, ?, ?)
+		SELECT lower(hex(randomblob(8))), ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM username_reservations
+			WHERE username = ? COLLATE NOCASE AND reserved_until > CURRENT_TIMESTAMP
+		)
 		RETURNING id, created_at`
 
 	err := r.db.QueryRowContext(ctx, query,
@@ -63,8 +67,12 @@ func (r *sqliteUserRepo) Create(ctx context.Context, user *models.User) error {
 		user.Email,
 		user.Language,
 		user.IsPlatformAdmin,
+		user.Username,
 	).Scan(&user.ID, &user.CreatedAt)
 
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: username is temporarily reserved after account deletion", pkg.ErrAlreadyExists)
+	}
 	if err != nil {
 		if isUniqueViolation(err) {
 			if containsString(err.Error(), "idx_users_email") {
@@ -180,10 +188,18 @@ func (r *sqliteUserRepo) GetServerMembers(ctx context.Context, serverID string) 
 func (r *sqliteUserRepo) Update(ctx context.Context, user *models.User) error {
 	query := `
 		UPDATE users SET username = ?, display_name = ?, avatar_url = ?, custom_status = ?, language = ?, dm_privacy = ?
-		WHERE id = ?`
+		WHERE id = ?
+		  AND (
+			username = ? COLLATE NOCASE
+			OR NOT EXISTS (
+				SELECT 1 FROM username_reservations
+				WHERE username = ? COLLATE NOCASE AND reserved_until > CURRENT_TIMESTAMP
+			)
+		  )`
 
 	result, err := r.db.ExecContext(ctx, query,
-		user.Username, user.DisplayName, user.AvatarURL, user.CustomStatus, user.Language, user.DMPrivacy, user.ID,
+		user.Username, user.DisplayName, user.AvatarURL, user.CustomStatus, user.Language, user.DMPrivacy,
+		user.ID, user.Username, user.Username,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update user: %w", err)
@@ -194,6 +210,19 @@ func (r *sqliteUserRepo) Update(ctx context.Context, user *models.User) error {
 		return fmt.Errorf("failed to check rows affected: %w", err)
 	}
 	if affected == 0 {
+		var exists int
+		if err := r.db.QueryRowContext(ctx, `SELECT 1 FROM users WHERE id = ?`, user.ID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+			return pkg.ErrNotFound
+		} else if err != nil {
+			return fmt.Errorf("failed to check user after update: %w", err)
+		}
+		reserved, err := r.IsUsernameReserved(ctx, user.Username)
+		if err != nil {
+			return fmt.Errorf("failed to check username reservation after update: %w", err)
+		}
+		if reserved {
+			return fmt.Errorf("%w: username is temporarily reserved after account deletion", pkg.ErrAlreadyExists)
+		}
 		return pkg.ErrNotFound
 	}
 
@@ -715,6 +744,13 @@ func (r *sqliteUserRepo) IsEmailPlatformBanned(ctx context.Context, email string
 	return count > 0, nil
 }
 
+func (r *sqliteUserRepo) IsUsernameReserved(ctx context.Context, username string) (bool, error) {
+	var count int
+	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM username_reservations WHERE username = ? COLLATE NOCASE AND reserved_until > CURRENT_TIMESTAMP`, username).Scan(&count)
+	if err != nil { return false, fmt.Errorf("failed to check username reservation: %w", err) }
+	return count > 0, nil
+}
+
 func (r *sqliteUserRepo) IsUsernamePlatformBanned(ctx context.Context, username string) (bool, error) {
 	var count int
 	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM platform_bans WHERE username = ? COLLATE NOCASE`, username).Scan(&count)
@@ -786,7 +822,17 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 	_ = byAdmin // retained for repository interface compatibility
 
 	return database.WithTx(ctx, db, func(tx *sql.Tx) error {
-		// Transfer every owned server to an existing member before removing the deleted
+        // Reserve the original username for 24 hours before the account row is removed.
+        var originalUsername string
+        if err := tx.QueryRowContext(ctx, `SELECT username FROM users WHERE id = ?`, userID).Scan(&originalUsername); err != nil {
+            return fmt.Errorf("read username for reservation: %w", err)
+        }
+        if _, err := tx.ExecContext(ctx, `INSERT INTO username_reservations (username, reserved_until)
+            VALUES (?, datetime('now', '+24 hours'))
+            ON CONFLICT(username) DO UPDATE SET reserved_until = excluded.reserved_until`, originalUsername); err != nil {
+            return fmt.Errorf("reserve username: %w", err)
+        }
+        // Transfer every owned server to an existing member before removing the deleted
 		// owner's membership. If a server has no other members, delete that empty server.
 		ownedRows, err := tx.QueryContext(ctx, `SELECT id FROM servers WHERE owner_id = ? ORDER BY id`, userID)
 		if err != nil { return fmt.Errorf("failed to list owned servers: %w", err) }
@@ -872,9 +918,8 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 		if _, err := tx.ExecContext(ctx, `DELETE FROM bans WHERE user_id = ?`, userID); err != nil {
 			return fmt.Errorf("failed to clean up bans: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM platform_bans WHERE user_id = ? OR banned_by = ?`, userID, userID); err != nil {
-			return fmt.Errorf("failed to delete platform ban records: %w", err)
-		}
+		// platform_bans intentionally retains stable user IDs as historical audit data.
+		// Do not delete bans or rewrite their issuer attribution during account deletion.
 		if _, err := tx.ExecContext(ctx, `DELETE FROM reports WHERE reporter_id = ? OR reported_user_id = ?`, userID, userID); err != nil {
 			return fmt.Errorf("failed to delete user reports: %w", err)
 		}

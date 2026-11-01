@@ -42,6 +42,7 @@ type MockUserRepo struct {
 	InsertPlatformBanFn        func(ctx context.Context, email, username, userID, reason, bannedBy string) error
 	DeletePlatformBanFn        func(ctx context.Context, userID string) error
 	IsUsernamePlatformBannedFn func(ctx context.Context, username string) (bool, error)
+	IsUsernameReservedFn func(ctx context.Context, username string) (bool, error)
 	IsPlatformBannedByUserIDFn func(ctx context.Context, userID string) (bool, error)
 	GetActiveByIDFn            func(ctx context.Context, id string) (*models.User, error)
 	GetActiveByUsernameFn      func(ctx context.Context, username string) (*models.User, error)
@@ -213,6 +214,10 @@ func (m *MockUserRepo) DeletePlatformBan(ctx context.Context, userID string) err
 		return m.DeletePlatformBanFn(ctx, userID)
 	}
 	return nil
+}
+func (m *MockUserRepo) IsUsernameReserved(ctx context.Context, username string) (bool, error) {
+	if m.IsUsernameReservedFn != nil { return m.IsUsernameReservedFn(ctx, username) }
+	return false, nil
 }
 func (m *MockUserRepo) IsUsernamePlatformBanned(ctx context.Context, username string) (bool, error) {
 	if m.IsUsernamePlatformBannedFn != nil {

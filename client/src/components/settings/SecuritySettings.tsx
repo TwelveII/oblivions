@@ -46,6 +46,9 @@ function SecuritySettings() {
   const [deletePassword, setDeletePassword] = useState("");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
+  const [confirmingEmergencyDelete, setConfirmingEmergencyDelete] = useState(false);
+  const [emergencyDeletePassword, setEmergencyDeletePassword] = useState("");
+  const [isEmergencyDeleting, setIsEmergencyDeleting] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -77,6 +80,17 @@ function SecuritySettings() {
       setIsLoadingInvites(false);
     });
     return () => { cancelled = true; };
+  }, []);
+
+  // Refresh invite codes on focus and never render consumed codes.
+  useEffect(() => {
+    const refresh = () => {
+      void authApi.getSignupInvites().then((res) => {
+        if (res.success && res.data) setSignupInvites(res.data);
+      });
+    };
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
   }, []);
 
   // ─── Password State ───
@@ -214,11 +228,11 @@ function SecuritySettings() {
 
       {isLoadingInvites ? (
         <p className="settings-value">Loading invite codes…</p>
-      ) : signupInvites.length === 0 ? (
+      ) : signupInvites.filter((invite) => !invite.used_at).length === 0 ? (
         <p className="settings-value">You haven't created any signup codes.</p>
       ) : (
         <ul className="signup-invite-list">
-          {signupInvites.map((invite) => {
+          {signupInvites.filter((invite) => !invite.used_at).map((invite) => {
             const status = invite.revoked_at ? "Revoked"
               : invite.used_at ? "Used"
               : invite.expires_at && new Date(invite.expires_at).getTime() <= Date.now() ? "Expired"
@@ -504,6 +518,49 @@ function SecuritySettings() {
           </div>
         </div>
       )}
+
+      {/* Emergency deletion is separate from the recoverable account deletion above. */}
+      <div style={{ marginTop: 24 }}>
+        <h3 className="settings-section-subtitle">Emergency Delete</h3>
+        <p className="settings-hint">
+          Permanently erase your account, profile, messages, direct-message history and associated files.
+          Your username will be unavailable for 24 hours. This cannot be undone.
+        </p>
+        {!confirmingEmergencyDelete ? (
+          <button className="settings-btn settings-btn-danger" onClick={() => setConfirmingEmergencyDelete(true)}>
+            Emergency Delete
+          </button>
+        ) : (
+          <div style={{ marginTop: 12 }}>
+            <p className="settings-hint" style={{ color: "var(--color-danger, #d33)", marginBottom: 12 }}>
+              This permanently deletes your data. There is no recovery period.
+            </p>
+            <div className="settings-field">
+              <label htmlFor="emergencyDeletePassword" className="settings-label">Enter your password to confirm</label>
+              <input id="emergencyDeletePassword" type="password" value={emergencyDeletePassword}
+                onChange={(e) => setEmergencyDeletePassword(e.target.value)} className="settings-input"
+                autoComplete="off" data-1p-ignore data-lpignore="true" />
+            </div>
+            <div className="settings-btn-row">
+              <button className="settings-btn" onClick={() => { setConfirmingEmergencyDelete(false); setEmergencyDeletePassword(""); }} disabled={isEmergencyDeleting}>
+                {t("cancel", { ns: "common", defaultValue: "Cancel" })}
+              </button>
+              <button className="settings-btn settings-btn-danger" disabled={isEmergencyDeleting || emergencyDeletePassword.length === 0}
+                onClick={async () => {
+                  if (!window.confirm("Permanently erase your account and all associated data? This cannot be undone.")) return;
+                  setIsEmergencyDeleting(true);
+                  try {
+                    const res = await authApi.emergencyDeleteSelf(emergencyDeletePassword);
+                    if (res.success) { await logout(); navigate("/login"); }
+                    else addToast("error", res.error ?? "Emergency deletion failed");
+                  } finally { setIsEmergencyDeleting(false); }
+                }}>
+                {isEmergencyDeleting ? "Deleting…" : "Permanently delete everything"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

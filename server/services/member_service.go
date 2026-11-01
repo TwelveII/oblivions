@@ -155,6 +155,9 @@ func (s *memberService) UpdateProfile(ctx context.Context, userID string, req *m
 		if existErr != nil && !errors.Is(existErr, pkg.ErrNotFound) {
 			return nil, fmt.Errorf("failed to check username availability: %w", existErr)
 		}
+		reserved, reserveErr := s.userRepo.IsUsernameReserved(ctx, *req.Username)
+		if reserveErr != nil { return nil, fmt.Errorf("failed to check username reservation: %w", reserveErr) }
+		if reserved { return nil, fmt.Errorf("%w: username is temporarily reserved after account deletion", pkg.ErrAlreadyExists) }
 		banned, banErr := s.userRepo.IsUsernamePlatformBanned(ctx, *req.Username)
 		if banErr != nil {
 			return nil, fmt.Errorf("failed to check username ban: %w", banErr)

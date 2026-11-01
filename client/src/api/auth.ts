@@ -97,6 +97,14 @@ export async function dismissWelcome() {
 
 /** Change email — requires current password for security. */
 
+/** Permanently erases the account and reserves its username for 24 hours. */
+export async function emergencyDeleteSelf(password: string) {
+  return apiClient<{ message: string }>("/users/me/emergency", {
+    method: "DELETE",
+    body: { password },
+  });
+}
+
 export async function softDeleteSelf(password: string) {
   return apiClient<{ message: string }>("/users/me", {
     method: "DELETE",
