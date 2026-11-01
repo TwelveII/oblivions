@@ -266,8 +266,10 @@ func (s *dmService) sendMessage(ctx context.Context, userID, channelID string, c
 		}
 	}
 
+	// Never persist plaintext beside an encrypted DM. A malicious or outdated client
+	// may send both fields; the encrypted representation must be the only stored payload.
 	var contentPtr *string
-	if req.Content != "" {
+	if req.EncryptionVersion == 0 && req.Content != "" {
 		contentPtr = &req.Content
 	}
 
