@@ -371,28 +371,39 @@ func (s *voiceService) MoveUser(ctx context.Context, moverUserID, targetUserID, 
 // AdminDisconnectUser force-disconnects a user from voice.
 // Requires PermMoveMembers in the target's current channel (same as Discord).
 func (s *voiceService) AdminDisconnectUser(ctx context.Context, disconnecterUserID, targetUserID string) error {
-	s.mu.Lock()
-
+	// Snapshot the target's channel under a brief read lock. Permission resolution hits the
+	// database and must never run under s.mu: voice joins, leaves and state updates share this
+	// lock across every server, so a slow query here would stall all voice state mutations.
+	s.mu.RLock()
 	state, ok := s.states[targetUserID]
 	if !ok {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return fmt.Errorf("%w: target user is not in a voice channel", pkg.ErrBadRequest)
 	}
+	channelID := state.ChannelID
+	s.mu.RUnlock()
 
-	effectivePerms, err := s.permResolver.ResolveChannelPermissions(ctx, disconnecterUserID, state.ChannelID)
+	effectivePerms, err := s.permResolver.ResolveChannelPermissions(ctx, disconnecterUserID, channelID)
 	if err != nil {
-		s.mu.Unlock()
 		s.logError(models.LogCategoryVoice, &disconnecterUserID, "AdminDisconnectUser: permission resolve failed", map[string]string{
-			"target_user": targetUserID, "channel_id": state.ChannelID, "error": err.Error(),
+			"target_user": targetUserID, "channel_id": channelID, "error": err.Error(),
 		})
 		return fmt.Errorf("failed to resolve permissions: %w", err)
 	}
 	if !effectivePerms.Has(models.PermMoveMembers) {
-		s.mu.Unlock()
 		return fmt.Errorf("%w: move members permission required", pkg.ErrForbidden)
 	}
 
-	channelID := state.ChannelID
+	// Re-lock and re-verify the target is still in the channel we authorized against.
+	// If they left or moved while permissions were being resolved, abort rather than
+	// disconnecting them from a different channel under a stale authorization decision.
+	s.mu.Lock()
+	state, ok = s.states[targetUserID]
+	if !ok || state.ChannelID != channelID {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: target user is not in a voice channel", pkg.ErrBadRequest)
+	}
+
 	serverID := state.ServerID
 	username := state.Username
 	displayName := state.DisplayName
