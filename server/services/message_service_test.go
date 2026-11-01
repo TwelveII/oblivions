@@ -58,9 +58,11 @@ func TestMessageCreate(t *testing.T) {
 		errSentinel error
 	}{
 		{
-			name:    "should create message successfully",
+			name:    "plaintext message is rejected when encryption is mandatory",
 			content: "hello world",
 			perms:   models.PermSendMessages | models.PermReadMessages,
+			wantErr: true,
+			errSentinel: pkg.ErrBadRequest,
 		},
 		{
 			name:        "should fail when content is empty",
