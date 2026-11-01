@@ -30,6 +30,7 @@ type AdminHandler struct {
 	appLogService           services.AppLogService
 	badgeService            services.SettingsBadgeService
 	screenShareStats        ScreenShareStatsProvider
+	crisisModeService       services.CrisisModeService
 }
 
 func NewAdminHandler(
@@ -42,6 +43,7 @@ func NewAdminHandler(
 	appLogService services.AppLogService,
 	badgeService services.SettingsBadgeService,
 	screenShareStats ScreenShareStatsProvider,
+	crisisModeService services.CrisisModeService,
 ) *AdminHandler {
 	return &AdminHandler{
 		livekitAdminService:     livekitAdminService,
@@ -53,6 +55,7 @@ func NewAdminHandler(
 		appLogService:           appLogService,
 		badgeService:            badgeService,
 		screenShareStats:        screenShareStats,
+		crisisModeService:       crisisModeService,
 	}
 }
 
@@ -820,4 +823,46 @@ func (h *AdminHandler) DeleteServerReport(w http.ResponseWriter, r *http.Request
 		return
 	}
 	pkg.JSON(w, http.StatusOK, map[string]string{"message": "server report deleted"})
+}
+
+
+// GetCrisisModeState returns the independent conversation-retention worker state.
+func (h *AdminHandler) GetCrisisModeState(w http.ResponseWriter, r *http.Request) {
+	state, err := h.crisisModeService.GetState(r.Context())
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+	pkg.JSON(w, http.StatusOK, state)
+}
+
+// SetCrisisMode enables or disables automatic 24-hour conversation cleanup.
+func (h *AdminHandler) SetCrisisMode(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := h.crisisModeService.SetEnabled(r.Context(), req.Enabled); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+	state, err := h.crisisModeService.GetState(r.Context())
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+	pkg.JSON(w, http.StatusOK, state)
+}
+
+// CleanConversationsNow immediately deletes channel, DM, and voice messages and their attachments.
+func (h *AdminHandler) CleanConversationsNow(w http.ResponseWriter, r *http.Request) {
+	result, err := h.crisisModeService.CleanNow(r.Context())
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+	pkg.JSON(w, http.StatusOK, result)
 }
