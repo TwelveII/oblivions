@@ -146,6 +146,12 @@ func (s *authService) logWarn(userID *string, message string, metadata map[strin
 	}
 }
 
+func (s *authService) logInfo(userID *string, message string, metadata map[string]string) {
+	if s.appLogger != nil {
+		s.appLogger.Log(models.LogLevelInfo, models.LogCategoryAuth, userID, nil, message, metadata)
+	}
+}
+
 func NewAuthService(
 	userRepo repository.UserRepository,
 	sessionRepo repository.SessionRepository,
@@ -353,7 +359,10 @@ func (s *authService) Register(ctx context.Context, req *models.CreateUserReques
 		return nil, err
 	}
 
-	return s.generateTokens(ctx, user, client)
+	tokens, tokenErr := s.generateTokens(ctx, user, client)
+	if tokenErr != nil { return nil, tokenErr }
+	s.logInfo(&user.ID, "Account registered", map[string]string{"username": user.Username, "invite_based": "true", "language": user.Language})
+	return tokens, nil
 }
 
 func (s *authService) Login(ctx context.Context, req *models.LoginRequest, client models.ClientInfo) (*AuthTokens, error) {
@@ -364,6 +373,7 @@ func (s *authService) Login(ctx context.Context, req *models.LoginRequest, clien
 	user, err := s.userRepo.GetByUsername(ctx, req.Username)
 	if err != nil {
 		if errors.Is(err, pkg.ErrNotFound) {
+			s.logWarn(nil, "Login failed: unknown username", map[string]string{"username": req.Username})
 			return nil, fmt.Errorf("%w: invalid username or password", pkg.ErrUnauthorized)
 		}
 		return nil, err
@@ -408,7 +418,10 @@ func (s *authService) Login(ctx context.Context, req *models.LoginRequest, clien
 	}
 	user.Status = models.UserStatusOnline
 
-	return s.generateTokens(ctx, user, client)
+	tokens, tokenErr := s.generateTokens(ctx, user, client)
+	if tokenErr != nil { return nil, tokenErr }
+	s.logInfo(&user.ID, "Login successful", map[string]string{"username": user.Username})
+	return tokens, nil
 }
 
 // RefreshToken exchanges a refresh token for a new set. The session row is the device; only its
@@ -518,7 +531,9 @@ func (s *authService) Logout(ctx context.Context, refreshToken string) error {
 		return fmt.Errorf("failed to update status: %w", err)
 	}
 
-	return s.sessionRepo.DeleteByID(ctx, session.ID)
+	if err := s.sessionRepo.DeleteByID(ctx, session.ID); err != nil { return err }
+	s.logInfo(&session.UserID, "Logout successful", map[string]string{"session_id": session.ID})
+	return nil
 }
 
 // findSession resolves a refresh token to its session: by the embedded session ID, or for a
