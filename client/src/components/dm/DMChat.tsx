@@ -303,6 +303,7 @@ function DMChatContent({
 
       {blockConfirmOpen && otherUser && (
         <BlockConfirmDialog
+          allowReporting={false}
           username={channelName}
           onClose={() => setBlockConfirmOpen(false)}
           onConfirm={async () => {
