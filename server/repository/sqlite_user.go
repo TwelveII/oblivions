@@ -51,7 +51,11 @@ func scanUser(s scanner) (*models.User, error) {
 func (r *sqliteUserRepo) Create(ctx context.Context, user *models.User) error {
 	query := `
 		INSERT INTO users (id, username, display_name, avatar_url, password_hash, status, email, language, is_platform_admin)
-		VALUES (lower(hex(randomblob(8))), ?, ?, ?, ?, ?, ?, ?, ?)
+		SELECT lower(hex(randomblob(8))), ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM username_reservations
+			WHERE username = ? COLLATE NOCASE AND reserved_until > CURRENT_TIMESTAMP
+		)
 		RETURNING id, created_at`
 
 	err := r.db.QueryRowContext(ctx, query,
@@ -63,8 +67,12 @@ func (r *sqliteUserRepo) Create(ctx context.Context, user *models.User) error {
 		user.Email,
 		user.Language,
 		user.IsPlatformAdmin,
+		user.Username,
 	).Scan(&user.ID, &user.CreatedAt)
 
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: username is temporarily reserved after account deletion", pkg.ErrAlreadyExists)
+	}
 	if err != nil {
 		if isUniqueViolation(err) {
 			if containsString(err.Error(), "idx_users_email") {
@@ -180,10 +188,18 @@ func (r *sqliteUserRepo) GetServerMembers(ctx context.Context, serverID string) 
 func (r *sqliteUserRepo) Update(ctx context.Context, user *models.User) error {
 	query := `
 		UPDATE users SET username = ?, display_name = ?, avatar_url = ?, custom_status = ?, language = ?, dm_privacy = ?
-		WHERE id = ?`
+		WHERE id = ?
+		  AND (
+			username = ? COLLATE NOCASE
+			OR NOT EXISTS (
+				SELECT 1 FROM username_reservations
+				WHERE username = ? COLLATE NOCASE AND reserved_until > CURRENT_TIMESTAMP
+			)
+		  )`
 
 	result, err := r.db.ExecContext(ctx, query,
-		user.Username, user.DisplayName, user.AvatarURL, user.CustomStatus, user.Language, user.DMPrivacy, user.ID,
+		user.Username, user.DisplayName, user.AvatarURL, user.CustomStatus, user.Language, user.DMPrivacy,
+		user.ID, user.Username, user.Username,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update user: %w", err)
@@ -194,6 +210,19 @@ func (r *sqliteUserRepo) Update(ctx context.Context, user *models.User) error {
 		return fmt.Errorf("failed to check rows affected: %w", err)
 	}
 	if affected == 0 {
+		var exists int
+		if err := r.db.QueryRowContext(ctx, `SELECT 1 FROM users WHERE id = ?`, user.ID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+			return pkg.ErrNotFound
+		} else if err != nil {
+			return fmt.Errorf("failed to check user after update: %w", err)
+		}
+		reserved, err := r.IsUsernameReserved(ctx, user.Username)
+		if err != nil {
+			return fmt.Errorf("failed to check username reservation after update: %w", err)
+		}
+		if reserved {
+			return fmt.Errorf("%w: username is temporarily reserved after account deletion", pkg.ErrAlreadyExists)
+		}
 		return pkg.ErrNotFound
 	}
 
