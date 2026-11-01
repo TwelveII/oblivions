@@ -197,7 +197,7 @@ func TestDMSendFailsClosedWhenRecipientPrivacyLookupFails(t *testing.T) {
 	}}
 	svc := &dmService{
 		dmRepo: dmRepo,
-		userRepo: recipientLookupErrorRepo{err: lookupErr},
+		userRepo: &recipientLookupErrorRepo{err: lookupErr},
 		friendChecker: policyFriendChecker{friends: false},
 	}
 	_, _, err := svc.SendMessage(context.Background(), "alice", "c1", &models.CreateDMMessageRequest{
@@ -223,7 +223,7 @@ func TestDMSendStopsWhenPendingRequestCannotBePersisted(t *testing.T) {
 	// Override recipient privacy while keeping the sender lookup successful.
 	svc := &dmService{
 		dmRepo: dmRepo,
-		userRepo: privacyRequestUserRepo{},
+		userRepo: &privacyRequestUserRepo{},
 		friendChecker: policyFriendChecker{friends: false},
 	}
 	_, _, err := svc.SendMessage(context.Background(), "alice", "c1", &models.CreateDMMessageRequest{
