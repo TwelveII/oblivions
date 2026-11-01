@@ -177,7 +177,10 @@ function AdminLogsPanel() {
     <div className="admin-logs-panel">
       {/* Header */}
       <div className="admin-logs-header">
-        <h2 className="settings-section-title">{t("platformLogsTitle")}</h2>
+        <div>
+          <h2 className="settings-section-title">{t("platformLogsTitle")}</h2>
+          <p className="settings-hint">{t("platformLogsRetentionNotice")}</p>
+        </div>
         <button
           className="settings-btn settings-btn-danger"
           onClick={handleClear}
