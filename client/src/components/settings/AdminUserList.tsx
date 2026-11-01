@@ -768,9 +768,6 @@ function AdminUserList() {
           confirmLabel={t("platformDeleteConfirm")}
           onConfirm={handleDeleteConfirm}
           onCancel={() => setDeleteTarget(null)}
-          showHardDeleteToggle
-          hardDeleteLabel={t("permanentDelete")}
-          hardDeleteHint={t("platformDeleteHardHint")}
         />
       )}
 
