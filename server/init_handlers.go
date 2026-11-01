@@ -83,7 +83,7 @@ func initHandlers(svcs *Services, repos *Repositories, limiters *RateLimiters, h
 		Reaction:          handlers.NewReactionHandler(svcs.Reaction),
 		ChannelPermission: handlers.NewChannelPermissionHandler(svcs.ChannelPermission),
 		Friendship:        handlers.NewFriendshipHandler(svcs.Friendship),
-		Avatar:            handlers.NewAvatarHandler(repos.User, svcs.Member, svcs.Server, fileLocator, svcs.UploadPipeline, urlSigner),
+		Avatar:            handlers.NewAvatarHandler(svcs.Member, svcs.Server, fileLocator, svcs.UploadPipeline),
 		Stats:             handlers.NewStatsHandler(repos.User),
 		ClientPolicy:      handlers.NewClientPolicyHandler(cfg.ClientVersions.MinAndroid, cfg.ClientVersions.MinIOS),
 		ClientError:       handlers.NewClientErrorHandler(svcs.ClientError, limiters.ClientError, limiters.ClientRenderCrash, limiters.ClientErrorDaily),
