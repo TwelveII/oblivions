@@ -518,6 +518,11 @@ func (h *AuthHandler) EmergencyDeleteSelf(w http.ResponseWriter, r *http.Request
 }
 
 func (h *AuthHandler) RestoreAccount(w http.ResponseWriter, r *http.Request) {
+	if enabled, err := h.siteEnabled(r.Context()); err != nil || !enabled {
+		pkg.ErrorWithMessage(w, http.StatusServiceUnavailable, "site temporarily unavailable")
+		return
+	}
+
 	ip := ratelimit.ExtractIP(r)
 	if h.loginLimiter != nil && !h.loginLimiter.Allow(ip) {
 		retryAfter := h.loginLimiter.RetryAfterSeconds(ip)
