@@ -212,7 +212,7 @@ function SettingsContent({ activeTab }: { activeTab: string }) {
       return <PlatformSettings />;
 
     case "platform-crisis":
-      return <CrisisModePanel />;
+      return <PlatformSettings />;
 
     case "platform-servers":
       return <AdminServerList />;
@@ -227,7 +227,7 @@ function SettingsContent({ activeTab }: { activeTab: string }) {
       return <AdminServerReportList />;
 
     case "platform-logs":
-      return <AdminLogsPanel />;
+      return <PlatformSettings />;
 
     case "platform-feedback":
       return <AdminFeedbackList />;
