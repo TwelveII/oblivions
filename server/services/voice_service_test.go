@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/akinalp/mqvi/models"
 	"github.com/akinalp/mqvi/testutil"
@@ -466,4 +467,44 @@ func (m *mockLiveKitGetter) GetPlatformInstanceForRegion(ctx context.Context, _ 
 
 func (m *recordingLiveKitGetter) GetPlatformInstanceForRegion(ctx context.Context, _ string) (*models.LiveKitInstance, error) {
 	return m.GetByServerID(ctx, "")
+}
+
+
+// AdminDisconnectUser must not hold the global voice lock while resolving permissions.
+// The resolver can need to inspect voice state itself; doing that under s.mu would deadlock
+// every voice operation sharing the lock.
+func TestAdminDisconnectUserResolvesPermissionsOutsideVoiceLock(t *testing.T) {
+	service, _ := newTestVoiceService()
+	svc := service.(*voiceService)
+	svc.states["target"] = &models.VoiceState{
+		UserID: "target", ChannelID: "ch1", ServerID: "srv1",
+	}
+
+	svc.permResolver = &testutil.MockChannelPermResolver{
+		ResolveChannelPermissionsFn: func(_ context.Context, _, _ string) (models.Permission, error) {
+			// This takes s.mu.RLock. It deadlocks if AdminDisconnectUser still holds s.mu.Lock.
+			if svc.GetUserVoiceState("target") == nil {
+				t.Fatal("target state should remain present during permission resolution")
+			}
+			return models.PermMoveMembers, nil
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.AdminDisconnectUser(context.Background(), "admin", "target")
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("AdminDisconnectUser returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("AdminDisconnectUser deadlocked while resolving permissions")
+	}
+
+	if svc.GetUserVoiceState("target") != nil {
+		t.Fatal("target should be removed after a successful disconnect")
+	}
 }
