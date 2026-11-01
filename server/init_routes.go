@@ -264,6 +264,9 @@ func initRoutes(
 	mux.Handle("POST /api/admin/servers/{serverId}/restore", authAdmin(h.Admin.AdminRestoreServer))
 
 	// Platform Admin — Reports
+	mux.Handle("GET /api/admin/crisis-mode", authAdmin(h.Admin.GetCrisisModeState))
+	mux.Handle("PATCH /api/admin/crisis-mode", authAdmin(h.Admin.SetCrisisMode))
+	mux.Handle("POST /api/admin/crisis-mode/clean-now", authAdmin(h.Admin.CleanConversationsNow))
 	mux.Handle("GET /api/admin/reports", authAdmin(h.Admin.ListReports))
 	mux.Handle("PATCH /api/admin/reports/{id}/status", authAdmin(h.Admin.UpdateReportStatus))
 	mux.Handle("DELETE /api/admin/reports/{id}", authAdmin(h.Admin.DeleteReport))
