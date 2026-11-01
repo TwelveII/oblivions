@@ -249,6 +249,9 @@ export function establishAndEncrypt(
 ): Promise<SignalWireMessage> {
   return withSessionLock(signalSessionKey(userId, deviceId), async () => {
     if (opts?.forceNewSession) {
+      // Check the pin before discarding a working session. A rejected key change
+      // must not destroy the last known-good ratchet state.
+      await assertIdentityMatchesPin(userId, deviceId, fromBase64(bundle.identityKey));
       await keyStorage.deleteSession(userId, deviceId);
     }
     if (!(await keyStorage.hasSession(userId, deviceId))) {
