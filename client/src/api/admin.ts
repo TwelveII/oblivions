@@ -244,6 +244,10 @@ export async function listAdminReports(status?: string) {
   );
 }
 
+export async function deleteAdminReport(reportId: string) {
+  return apiClient<{ message: string }>(`/admin/reports/${reportId}`, { method: "DELETE" });
+}
+
 export async function updateReportStatus(reportId: string, status: string) {
   return apiClient<{ message: string }>(`/admin/reports/${reportId}/status`, {
     method: "PATCH",
@@ -263,6 +267,10 @@ export async function listAdminServerReports(status?: string) {
   return apiClient<{ reports: AdminServerReportItem[]; total: number }>(
     `/admin/server-reports${query}`
   );
+}
+
+export async function deleteAdminServerReport(reportId: string) {
+  return apiClient<{ message: string }>(`/admin/server-reports/${reportId}`, { method: "DELETE" });
 }
 
 export async function updateServerReportStatus(reportId: string, status: string) {
