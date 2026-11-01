@@ -699,7 +699,6 @@ function AdminUserList() {
             { value: "active", label: t("platformUserFilterActive") },
             { value: "banned", label: t("platformUserFilterBanned") },
             { value: "soft_deleted", label: t("platformUserFilterSoftDeleted") },
-            { value: "tombstone", label: t("platformUserFilterTombstone") },
           ]}
           selected={statusFilter}
           onChange={setStatusFilter}
