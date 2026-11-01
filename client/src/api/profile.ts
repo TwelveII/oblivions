@@ -30,17 +30,6 @@ export async function uploadAvatar(file: File, upload?: UploadOptions) {
   return uploadRequest<MemberWithRoles>("/users/me/avatar", formData, upload);
 }
 
-export async function uploadWallpaper(file: File, upload?: UploadOptions) {
-  const formData = new FormData();
-  formData.append("file", file);
-
-  return uploadRequest<{ wallpaper_url: string }>("/users/me/wallpaper", formData, upload);
-}
-
-export async function deleteWallpaper() {
-  return apiClient<void>("/users/me/wallpaper", { method: "DELETE" });
-}
-
 export type StorageUsage = {
   bytes_used: number;
   quota_bytes: number;
