@@ -330,6 +330,19 @@ func (h *FeedbackHandler) AdminUpdateStatus(w http.ResponseWriter, r *http.Reque
 	pkg.JSON(w, http.StatusOK, map[string]string{"message": "feedback status updated"})
 }
 
+// AdminDeleteTicket -- DELETE /api/admin/feedback/{id}
+func (h *FeedbackHandler) AdminDeleteTicket(w http.ResponseWriter, r *http.Request) {
+	if _, ok := r.Context().Value(ctxkeys.User).(*models.User); !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "admin not found in context")
+		return
+	}
+	if err := h.service.AdminDeleteTicket(r.Context(), r.PathValue("id")); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+	pkg.JSON(w, http.StatusOK, map[string]string{"message": "feedback deleted"})
+}
+
 // parseAndCreateReply handles both JSON and multipart reply creation with optional file uploads.
 func (h *FeedbackHandler) parseAndCreateReply(w http.ResponseWriter, r *http.Request, ticketID, userID string, isAdmin bool) (*models.FeedbackReply, error) {
 	var req models.CreateFeedbackReplyRequest
