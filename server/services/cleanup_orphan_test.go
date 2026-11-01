@@ -67,7 +67,7 @@ func orphanTestDB(t *testing.T) *sql.DB {
 	exec(`INSERT INTO servers (id, name, owner_id) VALUES ('s1', 'public server', 'u1')`)
 	exec(`INSERT INTO server_reports (id, reporter_id, server_id, reason, description)
 	      VALUES ('sr1', 'u1', 's1', 'spam', 'evidence attached')`)
-	exec(`INSERT INTO voice_messages (id, channel_id, user_id) VALUES ('vm1', 'c1', 'u1')`)
+	exec(`INSERT INTO voice_messages (id, channel_id, user_id, encryption_version, ciphertext, sender_device_id) VALUES ('vm1', 'c1', 'u1', 1, 'ciphertext', 'device1')`)
 	return db.Conn
 }
 
