@@ -76,7 +76,7 @@ func NewAdminUserService(
 	}
 }
 
-func (s *adminUserService) PlatformBanUser(ctx context.Context, adminUserID, targetUserID, reason string, deleteMessages bool) error {
+func (s *adminUserService) PlatformBanUser(ctx context.Context, adminUserID, targetUserID, reason string, _ bool) error {
 	if adminUserID == targetUserID {
 		return fmt.Errorf("%w: cannot ban yourself", pkg.ErrBadRequest)
 	}
@@ -94,15 +94,32 @@ func (s *adminUserService) PlatformBanUser(ctx context.Context, adminUserID, tar
 		return fmt.Errorf("%w: user is already banned", pkg.ErrBadRequest)
 	}
 
-	// Collect file refs BEFORE any mutations so a failed collect doesn't leave partial state
-	var msgPlan *CleanupPlan
-	if deleteMessages {
-		var collectErr error
-		msgPlan, collectErr = s.fileCleanup.CollectUserMessageFiles(ctx, targetUserID)
-		if collectErr != nil {
-			return fmt.Errorf("failed to collect user message files: %w", collectErr)
-		}
+	// A platform ban is destructive by policy: collect all user-authored message
+	// files and every owned server's files before mutating anything.
+	// The durable ban record is retained so the account cannot re-register.
+	msgPlan, collectErr := s.fileCleanup.CollectUserMessageFiles(ctx, targetUserID)
+	if collectErr != nil {
+		return fmt.Errorf("failed to collect user message files: %w", collectErr)
 	}
+	ownedServerIDs, err := s.serverRepo.ListActiveServerIDsByOwner(ctx, targetUserID)
+	if err != nil {
+		return fmt.Errorf("failed to list owned servers: %w", err)
+	}
+	serverPlans := make(map[string]*CleanupPlan, len(ownedServerIDs))
+	serverMembers := make(map[string][]string, len(ownedServerIDs))
+	for _, sid := range ownedServerIDs {
+		plan, planErr := s.fileCleanup.CollectServerFiles(ctx, sid)
+		if planErr != nil {
+			return fmt.Errorf("failed to collect files for owned server %s: %w", sid, planErr)
+		}
+		members, membersErr := s.serverRepo.GetMemberUserIDs(ctx, sid)
+		if membersErr != nil {
+			return fmt.Errorf("failed to list members for owned server %s: %w", sid, membersErr)
+		}
+		serverPlans[sid] = plan
+		serverMembers[sid] = members
+	}
+	msgPlan = mergeCleanupPlans(msgPlan, serverPlans)
 
 	// Atomic: user flag + durable ban record in one transaction
 	var banEmail string
@@ -122,12 +139,40 @@ func (s *adminUserService) PlatformBanUser(ctx context.Context, adminUserID, tar
 		return err
 	}
 
-	if deleteMessages {
-		if err := s.userRepo.DeleteAllMessagesByUser(ctx, targetUserID); err != nil {
-			return fmt.Errorf("failed to delete user messages: %w", err)
+	// Notify every remaining member through the platform system-notice channel
+	// before removing the server. Server content itself is not retained.
+	for _, sid := range ownedServerIDs {
+		server, serverErr := s.serverRepo.GetByID(ctx, sid)
+		serverName := "a server"
+		if serverErr == nil && server.Name != "" {
+			serverName = server.Name
 		}
-		s.fileCleanup.Execute(msgPlan)
+		for _, memberID := range serverMembers[sid] {
+			if memberID == targetUserID {
+				continue
+			}
+			s.hub.BroadcastToUser(memberID, ws.Event{
+				Op: "platform_notice",
+				Data: map[string]string{
+					"title": "Server removed",
+					"message": fmt.Sprintf("The server %q was permanently removed because its owner was platform-banned. All messages, channels, and uploaded server files were deleted.", serverName),
+				},
+			})
+		}
+		s.hub.BroadcastToServer(sid, ws.Event{Op: ws.OpServerDelete, Data: map[string]string{"id": sid}})
+		if err := s.serverRepo.Delete(ctx, sid); err != nil {
+			log.Printf("[admin] failed to delete owned server %s during platform ban of %s: %v", sid, targetUserID, err)
+			return fmt.Errorf("failed to delete owned server %s: %w", sid, err)
+		}
+		s.fileCleanup.Execute(serverPlans[sid])
 	}
+
+	// Delete the banned user's messages everywhere, including DMs; server-owned
+	// content has already been cascaded away above.
+	if err := s.userRepo.DeleteAllMessagesByUser(ctx, targetUserID); err != nil {
+		return fmt.Errorf("failed to delete user messages: %w", err)
+	}
+	s.fileCleanup.Execute(msgPlan)
 
 	s.voiceKit.DisconnectUser(targetUserID)
 	s.hub.DisconnectUser(targetUserID)
