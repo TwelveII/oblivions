@@ -2,7 +2,6 @@ package repository
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 
 	"github.com/akinalp/mqvi/testutil/dbtest"
@@ -116,5 +115,4 @@ func TestSQLiteUserRepo_HardDeleteRemovesOwnedServerWithNoOtherMembers(t *testin
 	if servers != 0 || users != 0 {
 		t.Fatalf("empty server/account remain: servers=%d users=%d", servers, users)
 	}
-	_ = sql.ErrNoRows
 }
