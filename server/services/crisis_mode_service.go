@@ -131,6 +131,9 @@ func (s *crisisModeService) SetEnabled(ctx context.Context, enabled bool) error 
 	if err != nil {
 		return fmt.Errorf("update crisis mode state: %w", err)
 	}
+	action := "Crisis Mode disabled"
+	if enabled { action = "Crisis Mode enabled" }
+	recordAuditLog(ctx, s.db, "", "", "", action, map[string]string{"enabled": fmt.Sprint(enabled)})
 	return nil
 }
 
@@ -164,6 +167,9 @@ func (s *crisisModeService) SetSiteEnabled(ctx context.Context, enabled bool) er
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit site availability update: %w", err)
 	}
+	action := "Site access restored"
+	if !enabled { action = "Site disabled for ordinary users" }
+	recordAuditLog(ctx, s.db, "", "", "", action, map[string]string{"site_enabled": fmt.Sprint(enabled)})
 	if !enabled && s.connections != nil {
 		rows, err := s.db.QueryContext(ctx, `SELECT id FROM users WHERE is_platform_admin = 0`)
 		if err != nil {
@@ -253,5 +259,10 @@ func (s *crisisModeService) CleanNow(ctx context.Context) (*CrisisModeCleanResul
 		s.fileCleanup.Execute(plan)
 	}
 	log.Printf("[crisis] conversation cleanup complete: channel=%d dm=%d voice=%d", result.ChannelMessages, result.DMMessages, result.VoiceMessages)
+	recordAuditLog(ctx, s.db, "", "", "", "Crisis Mode conversation cleanup completed", map[string]string{
+		"channel_messages_deleted": fmt.Sprint(result.ChannelMessages),
+		"dm_messages_deleted": fmt.Sprint(result.DMMessages),
+		"voice_messages_deleted": fmt.Sprint(result.VoiceMessages),
+	})
 	return result, nil
 }
