@@ -307,7 +307,7 @@ func initServices(db *sql.DB, repos *Repositories, hub ws.EventPublisher, cfg *c
 		cfg.HetznerAPIToken,
 		voiceService,
 	)
-	crisisModeService := services.NewCrisisModeService(db, fileCleanupService)
+	crisisModeService := services.NewCrisisModeService(db, fileCleanupService, hub)
 	cleanupService := services.NewCleanupService(
 		db, repos.Cleanup, repos.ScanHashCache,
 		repos.User, repos.Server, repos.Session,
