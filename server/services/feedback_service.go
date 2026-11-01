@@ -20,6 +20,7 @@ type FeedbackService interface {
 	AddReply(ctx context.Context, ticketID, userID string, isAdmin bool, req *models.CreateFeedbackReplyRequest) (*models.FeedbackReply, error)
 	UpdateStatus(ctx context.Context, ticketID string, req *models.UpdateFeedbackStatusRequest) error
 	DeleteTicket(ctx context.Context, id, userID string) error
+	AdminDeleteTicket(ctx context.Context, id string) error
 }
 
 type feedbackService struct {
@@ -227,13 +228,18 @@ func (s *feedbackService) AddReply(ctx context.Context, ticketID, userID string,
 
 func (s *feedbackService) DeleteTicket(ctx context.Context, id, userID string) error {
 	ticket, err := s.feedbackRepo.GetTicketByID(ctx, id)
-	if err != nil {
-		return err
-	}
-	if ticket.UserID != userID {
-		return fmt.Errorf("%w: you can only delete your own feedback", pkg.ErrForbidden)
-	}
+	if err != nil { return err }
+	if ticket.UserID != userID { return fmt.Errorf("%w: you can only delete your own feedback", pkg.ErrForbidden) }
+	return s.deleteTicket(ctx, id, ticket.UserID)
+}
 
+func (s *feedbackService) AdminDeleteTicket(ctx context.Context, id string) error {
+	ticket, err := s.feedbackRepo.GetTicketByID(ctx, id)
+	if err != nil { return err }
+	return s.deleteTicket(ctx, id, ticket.UserID)
+}
+
+func (s *feedbackService) deleteTicket(ctx context.Context, id, ownerID string) error {
 	// Delete physical files and release quota before CASCADE removes rows
 	if atts, err := s.feedbackRepo.GetAttachmentsByTicketID(ctx, id); err == nil {
 		var totalBytes int64
@@ -244,8 +250,8 @@ func (s *feedbackService) DeleteTicket(ctx context.Context, id, userID string) e
 			}
 		}
 		if totalBytes > 0 {
-			if err := s.storageService.Release(ctx, userID, totalBytes); err != nil {
-				log.Printf("[feedback] failed to release storage quota for user %s: %v", userID, err)
+			if err := s.storageService.Release(ctx, ownerID, totalBytes); err != nil {
+				log.Printf("[feedback] failed to release storage quota for user %s: %v", ownerID, err)
 			}
 		}
 	}
