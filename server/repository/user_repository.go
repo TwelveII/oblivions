@@ -63,6 +63,7 @@ type UserRepository interface {
 	IsEmailPlatformBanned(ctx context.Context, email string) (bool, error)
 	// IsUsernamePlatformBanned checks the platform_bans table for a banned username.
 	IsUsernamePlatformBanned(ctx context.Context, username string) (bool, error)
+	IsUsernameReserved(ctx context.Context, username string) (bool, error)
 	// IsPlatformBannedByUserID checks if a platform_bans record exists for a user ID (works after hard-delete).
 	IsPlatformBannedByUserID(ctx context.Context, userID string) (bool, error)
 	// InsertPlatformBan adds a persistent ban record that survives user hard-delete.
