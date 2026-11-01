@@ -56,6 +56,10 @@ func (s fileTokenAuthStub) ResetPassword(context.Context, string, string) error 
 func (s fileTokenAuthStub) SoftDeleteSelf(context.Context, string, string) error {
 	return nil
 }
+func (s fileTokenAuthStub) EmergencyDeleteSelf(context.Context, string, string) error {
+	return nil
+}
+func (s fileTokenAuthStub) SetFileCleanupService(services.FileCleanupService) {}
 func (s fileTokenAuthStub) RestoreAccount(context.Context, string, string, models.ClientInfo) (*services.AuthTokens, error) {
 	return nil, nil
 }
