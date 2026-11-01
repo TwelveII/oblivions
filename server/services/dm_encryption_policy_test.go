@@ -22,8 +22,10 @@ type policyDMRepo struct {
 	channel *models.DMChannel
 	message *models.DMMessage
 
-	created int
-	updated int
+	created      int
+	updated      int
+	pendingCalls int
+	pendingErr   error
 }
 
 func (r *policyDMRepo) GetChannelByID(context.Context, string) (*models.DMChannel, error) {
@@ -42,6 +44,33 @@ func (r *policyDMRepo) CreateMessage(context.Context, *models.DMMessage) error {
 func (r *policyDMRepo) UpdateMessage(context.Context, string, *models.UpdateDMMessageRequest) error {
 	r.updated++
 	return errReachedPersistence
+}
+
+func (r *policyDMRepo) CountMessagesBySender(context.Context, string, string) (int, error) {
+	return 0, nil
+}
+
+func (r *policyDMRepo) SetPendingRequest(context.Context, string, string) error {
+	r.pendingCalls++
+	return r.pendingErr
+}
+
+type policyFriendChecker struct{ friends bool }
+
+func (f policyFriendChecker) AreFriends(context.Context, string, string) (bool, error) {
+	return f.friends, nil
+}
+
+type recipientLookupErrorRepo struct {
+	policyUserRepo
+	err error
+}
+
+func (r recipientLookupErrorRepo) GetByID(_ context.Context, id string) (*models.User, error) {
+	if id == "bob" {
+		return nil, r.err
+	}
+	return &models.User{ID: id}, nil
 }
 
 // policyUserRepo keeps the recipient lookups between the policy gate and the write from panicking.
@@ -155,4 +184,65 @@ func assertPolicyAtCallSite(t *testing.T, err error, wantCode string, writes int
 	if writes != 0 {
 		t.Errorf("%s anyway (%d times)", wroteMsg, writes)
 	}
+}
+
+
+// A privacy lookup outage must not turn a private account into an unrestricted one.
+func TestDMSendFailsClosedWhenRecipientPrivacyLookupFails(t *testing.T) {
+	lookupErr := errors.New("database unavailable")
+	dmRepo := &policyDMRepo{channel: &models.DMChannel{
+		ID: "c1", User1ID: "alice", User2ID: "bob", Status: models.DMStatusAccepted,
+	}}
+	svc := &dmService{
+		dmRepo: dmRepo,
+		userRepo: recipientLookupErrorRepo{err: lookupErr},
+		friendChecker: policyFriendChecker{friends: false},
+	}
+	_, _, err := svc.SendMessage(context.Background(), "alice", "c1", &models.CreateDMMessageRequest{
+		Content: "hello", EncryptionVersion: 1,
+		Ciphertext: encryptedField(1, "CIPHER"), SenderDeviceID: encryptedField(1, "dev1"),
+	})
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("error = %v, want recipient privacy lookup error", err)
+	}
+	if dmRepo.created != 0 {
+		t.Fatalf("created %d messages after privacy lookup failed, want 0", dmRepo.created)
+	}
+}
+
+// A failed request-state write must stop the message; otherwise a request could be sent while
+// the channel remains accepted and the recipient's privacy boundary is bypassed on later sends.
+func TestDMSendStopsWhenPendingRequestCannotBePersisted(t *testing.T) {
+	writeErr := errors.New("database write failed")
+	dmRepo := &policyDMRepo{
+		channel: &models.DMChannel{ID: "c1", User1ID: "alice", User2ID: "bob", Status: models.DMStatusAccepted},
+		pendingErr: writeErr,
+	}
+	users := &policyUserRepo{}
+	// Override recipient privacy while keeping the sender lookup successful.
+	svc := &dmService{
+		dmRepo: dmRepo,
+		userRepo: privacyRequestUserRepo{},
+		friendChecker: policyFriendChecker{friends: false},
+	}
+	_ = users
+	_, _, err := svc.SendMessage(context.Background(), "alice", "c1", &models.CreateDMMessageRequest{
+		Content: "hello", EncryptionVersion: 1,
+		Ciphertext: encryptedField(1, "CIPHER"), SenderDeviceID: encryptedField(1, "dev1"),
+	})
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("error = %v, want pending-request persistence error", err)
+	}
+	if dmRepo.pendingCalls != 1 || dmRepo.created != 0 {
+		t.Fatalf("pending calls=%d created=%d, want 1 and 0", dmRepo.pendingCalls, dmRepo.created)
+	}
+}
+
+type privacyRequestUserRepo struct{ policyUserRepo }
+
+func (privacyRequestUserRepo) GetByID(_ context.Context, id string) (*models.User, error) {
+	if id == "bob" {
+		return &models.User{ID: id, DMPrivacy: "message_request"}, nil
+	}
+	return &models.User{ID: id}, nil
 }
