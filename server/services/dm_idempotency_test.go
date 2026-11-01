@@ -73,7 +73,7 @@ func TestDMSend_RetryOfARequestsFirstMessageIsNotRefused(t *testing.T) {
 	t.Run("without a nonce the pending request refuses a second send", func(t *testing.T) {
 		svc, repo := pendingRequestDMService()
 
-		_, _, err := svc.SendMessage(ctx, "alice", "c1", &models.CreateDMMessageRequest{EncryptionVersion: 1, Ciphertext: "ciphertext", SenderDeviceID: "device1", Content: "hello"})
+		_, _, err := svc.SendMessage(ctx, "alice", "c1", &models.CreateDMMessageRequest{EncryptionVersion: 1, Ciphertext: ptr("ciphertext"), SenderDeviceID: ptr("device1"), Content: "hello"})
 
 		if !errors.Is(err, pkg.ErrForbidden) || repo.created != 0 {
 			t.Fatalf("err = %v, created %d; want ErrForbidden — the gate this test relies on", err, repo.created)
@@ -83,7 +83,7 @@ func TestDMSend_RetryOfARequestsFirstMessageIsNotRefused(t *testing.T) {
 	t.Run("the retry with the first send's nonce gets the stored message", func(t *testing.T) {
 		svc, repo := pendingRequestDMService()
 
-		msg, repeat, err := svc.SendMessage(ctx, "alice", "c1", &models.CreateDMMessageRequest{EncryptionVersion: 1, Ciphertext: "ciphertext", SenderDeviceID: "device1", Content: "hello", ClientNonce: "nonce-req-01"})
+		msg, repeat, err := svc.SendMessage(ctx, "alice", "c1", &models.CreateDMMessageRequest{EncryptionVersion: 1, Ciphertext: ptr("ciphertext"), SenderDeviceID: ptr("device1"), Content: "hello", ClientNonce: "nonce-req-01"})
 
 		if err != nil || !repeat || msg.ID != "m1" || repo.created != 0 {
 			t.Fatalf("got (%v, repeat=%v, %v), created %d; want the stored m1, nothing created", msg, repeat, err, repo.created)
@@ -97,7 +97,7 @@ func TestDMSend_RetryOfARequestsFirstMessageIsNotRefused(t *testing.T) {
 		svc, repo := pendingRequestDMService()
 		repo.stored["nonce-req-01"] = [2]string{"m1", "other"}
 
-		_, _, err := svc.SendMessage(ctx, "alice", "c1", &models.CreateDMMessageRequest{EncryptionVersion: 1, Ciphertext: "ciphertext", SenderDeviceID: "device1", Content: "hello", ClientNonce: "nonce-req-01"})
+		_, _, err := svc.SendMessage(ctx, "alice", "c1", &models.CreateDMMessageRequest{EncryptionVersion: 1, Ciphertext: ptr("ciphertext"), SenderDeviceID: ptr("device1"), Content: "hello", ClientNonce: "nonce-req-01"})
 
 		if !errors.Is(err, pkg.ErrConflict) {
 			t.Fatalf("err = %v, want ErrConflict", err)
@@ -112,7 +112,7 @@ func TestDMSend_TheCopyThatLosesTheInsertRaceReturnsTheWinner(t *testing.T) {
 		return repository.ErrDuplicateClientNonce
 	}
 
-	msg, repeat, err := svc.SendMessage(context.Background(), "alice", "c1", &models.CreateDMMessageRequest{EncryptionVersion: 1, Ciphertext: "ciphertext", SenderDeviceID: "device1", Content: "hello", ClientNonce: "nonce-race-dm"})
+	msg, repeat, err := svc.SendMessage(context.Background(), "alice", "c1", &models.CreateDMMessageRequest{EncryptionVersion: 1, Ciphertext: ptr("ciphertext"), SenderDeviceID: ptr("device1"), Content: "hello", ClientNonce: "nonce-race-dm"})
 
 	if err != nil || !repeat || msg.ID != "winner" {
 		t.Fatalf("got (%v, repeat=%v, %v), want the winner as a repeat", msg, repeat, err)
