@@ -10,6 +10,7 @@ import {
   adminGetFeedbackTicket,
   adminReplyToFeedback,
   adminUpdateFeedbackStatus,
+  adminDeleteFeedbackTicket,
 } from "../../api/feedback";
 import type { FeedbackTicket, FeedbackReply, FeedbackStatus, FeedbackType } from "../../types";
 import { resolveAssetUrl, FEEDBACK_ACCEPT_ATTR, isFeedbackAttachment } from "../../utils/constants";
@@ -156,6 +157,19 @@ function AdminFeedbackList() {
     setIsSendingReply(false);
   };
 
+  const handleDeleteTicket = async () => {
+    if (!activeTicket || !window.confirm("Permanently delete this feedback ticket and its attachments?")) return;
+    const res = await adminDeleteFeedbackTicket(activeTicket.id);
+    if (res.success) {
+      addToast("success", "Feedback deleted.");
+      setActiveTicket(null);
+      setReplies([]);
+      fetchTickets();
+    } else {
+      addToast("error", res.error ?? "Could not delete feedback.");
+    }
+  };
+
   const handleStatusChange = async (newStatus: string) => {
     if (!activeTicket) return;
     const res = await adminUpdateFeedbackStatus(activeTicket.id, newStatus);
@@ -255,11 +269,14 @@ function AdminFeedbackList() {
   if (activeTicket) {
     return (
       <div className="settings-section">
-        <div className="settings-section-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div className="settings-section-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
           <h2 className="settings-section-title">{activeTicket.subject}</h2>
-          <button className="settings-btn settings-btn-secondary" onClick={goBack}>
-            {t("feedbackBackToList")}
-          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" className="settings-btn settings-btn-danger" onClick={handleDeleteTicket}>Delete</button>
+            <button className="settings-btn settings-btn-secondary" onClick={goBack}>
+              {t("feedbackBackToList")}
+            </button>
+          </div>
         </div>
 
         <div className="feedback-detail-meta">
