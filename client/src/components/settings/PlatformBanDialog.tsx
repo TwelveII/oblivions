@@ -13,7 +13,6 @@ type PlatformBanDialogProps = {
 function PlatformBanDialog({ username, onConfirm, onCancel }: PlatformBanDialogProps) {
   const { t } = useTranslation("settings");
   const [reason, setReason] = useState("");
-  const [deleteMessages, setDeleteMessages] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -30,7 +29,7 @@ function PlatformBanDialog({ username, onConfirm, onCancel }: PlatformBanDialogP
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    onConfirm(reason.trim(), deleteMessages);
+    onConfirm(reason.trim(), true);
   }
 
   return createPortal(
@@ -59,15 +58,6 @@ function PlatformBanDialog({ username, onConfirm, onCancel }: PlatformBanDialogP
             rows={3}
             maxLength={500}
           />
-
-          <label className="platform-ban-checkbox-label">
-            <input
-              type="checkbox"
-              checked={deleteMessages}
-              onChange={(e) => setDeleteMessages(e.target.checked)}
-            />
-            <span>{t("platformBanDeleteMessages")}</span>
-          </label>
 
           <div className="modal-actions">
             <button
