@@ -7,6 +7,7 @@
 //	messages/<messageID>/<filename>
 //	dm/<dmMessageID>/<filename>
 //	avatars/<userID>/<filename>
+//	wallpapers/<userID>/<filename> (legacy cleanup only)
 //	badges/global/<filename>
 //	soundboards/<serverID>/<filename>
 //	server-icons/<serverID>/<filename>
@@ -46,6 +47,7 @@ const (
 	KindMessage      Kind = "messages"
 	KindDM           Kind = "dm"
 	KindAvatar       Kind = "avatars"
+	KindWallpaper    Kind = "wallpapers"
 	KindBadge        Kind = "badges"
 	KindSoundboard   Kind = "soundboards"
 	KindServerIcon   Kind = "server-icons"
@@ -61,6 +63,7 @@ var validKinds = map[Kind]bool{
 	KindMessage:      true,
 	KindDM:           true,
 	KindAvatar:       true,
+	KindWallpaper:    true,
 	KindBadge:        true,
 	KindSoundboard:   true,
 	KindServerIcon:   true,
