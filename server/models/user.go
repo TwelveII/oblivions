@@ -44,8 +44,7 @@ type User struct {
 	PlatformBanReason     string     `json:"-"`
 	PlatformBannedBy      string     `json:"-"`
 	PlatformBannedAt      *time.Time `json:"-"`
-	// Soft-delete state. DeletedAt non-null + IsHardDeleted=0 → recoverable account.
-	// IsHardDeleted=1 → anonymized tombstone (username renamed, personal data wiped).
+	// Soft-delete state. DeletedAt non-null means the account is recoverable until its TTL expires.
 	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
 	DeletedByAdmin bool       `json:"-"`
 	IsHardDeleted  bool       `json:"is_hard_deleted,omitempty"`
