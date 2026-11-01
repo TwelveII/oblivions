@@ -715,6 +715,13 @@ func (r *sqliteUserRepo) IsEmailPlatformBanned(ctx context.Context, email string
 	return count > 0, nil
 }
 
+func (r *sqliteUserRepo) IsUsernameReserved(ctx context.Context, username string) (bool, error) {
+	var count int
+	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM username_reservations WHERE username = ? COLLATE NOCASE AND reserved_until > CURRENT_TIMESTAMP`, username).Scan(&count)
+	if err != nil { return false, fmt.Errorf("failed to check username reservation: %w", err) }
+	return count > 0, nil
+}
+
 func (r *sqliteUserRepo) IsUsernamePlatformBanned(ctx context.Context, username string) (bool, error) {
 	var count int
 	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM platform_bans WHERE username = ? COLLATE NOCASE`, username).Scan(&count)
