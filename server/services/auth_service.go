@@ -68,6 +68,8 @@ type AuthService interface {
 	RecordCredentialStoreFailure(userID string, req *models.CredentialStoreFailureRequest)
 
 	SetAppLogger(logger AuthAppLogger)
+	SetFileCleanupService(cleanup FileCleanupService)
+	EmergencyDeleteSelf(ctx context.Context, userID, password string) error
 }
 
 // AccountDeletedError signals that login was attempted on a soft-deleted account.
@@ -93,6 +95,7 @@ type AuthTokens struct {
 
 type authService struct {
 	db            *sql.DB
+	fileCleanup   FileCleanupService
 	userRepo      repository.UserRepository
 	sessionRepo   repository.SessionRepository
 	resetRepo     repository.PasswordResetRepository // nil if email not configured
@@ -114,6 +117,8 @@ const refreshGraceWindow = 60 * time.Second
 
 // rotateAttempts bounds the compare-and-swap loop; each retry means another request won a race.
 const rotateAttempts = 3
+
+func (s *authService) SetFileCleanupService(cleanup FileCleanupService) { s.fileCleanup = cleanup }
 
 func (s *authService) SetAppLogger(logger AuthAppLogger) {
 	s.appLogger = logger
@@ -697,6 +702,25 @@ func (s *authService) ChangeEmail(ctx context.Context, userID, password, newEmai
 // SoftDeleteSelf marks the current user soft-deleted after password verification.
 // Recoverable via login flow within SoftDeleteTTLDays. Caller is responsible for
 // disconnecting realtime sessions and invalidating refresh tokens.
+// EmergencyDeleteSelf permanently removes the account and associated data.
+func (s *authService) EmergencyDeleteSelf(ctx context.Context, userID, password string) error {
+ user, err := s.userRepo.GetByID(ctx, userID)
+ if err != nil { return err }
+ if user.PasswordHash == "" { return fmt.Errorf("%w: account not eligible for deletion", pkg.ErrForbidden) }
+ if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
+  return fmt.Errorf("%w: password is incorrect", pkg.ErrUnauthorized)
+ }
+ if s.fileCleanup == nil { return fmt.Errorf("file cleanup is not configured") }
+ plan, err := s.fileCleanup.CollectUserFiles(ctx, userID)
+ if err != nil { return fmt.Errorf("collect account files: %w", err) }
+ if err := s.userRepo.HardDeleteUser(ctx, userID, false); err != nil {
+  return fmt.Errorf("permanently delete account: %w", err)
+ }
+ s.fileCleanup.Execute(plan)
+ if s.hub != nil { s.hub.DisconnectUser(userID) }
+ return nil
+}
+
 func (s *authService) SoftDeleteSelf(ctx context.Context, userID, password string) error {
 	user, err := s.userRepo.GetByID(ctx, userID)
 	if err != nil {
@@ -744,7 +768,7 @@ func (s *authService) RestoreAccount(ctx context.Context, username, password str
 		return nil, err
 	}
 
-	if user.PasswordHash == "" || user.IsHardDeleted {
+	if user.PasswordHash == "" {
 		return nil, fmt.Errorf("%w: invalid username or password", pkg.ErrUnauthorized)
 	}
 
