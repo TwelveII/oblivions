@@ -866,3 +866,26 @@ func (h *AdminHandler) CleanConversationsNow(w http.ResponseWriter, r *http.Requ
 	}
 	pkg.JSON(w, http.StatusOK, result)
 }
+
+
+// SetSiteAvailability enables or disables sign-in and API access for ordinary users.
+// Platform administrators retain access so they can re-enable the site.
+func (h *AdminHandler) SetSiteAvailability(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := h.crisisModeService.SetSiteEnabled(r.Context(), req.Enabled); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+	state, err := h.crisisModeService.GetState(r.Context())
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+	pkg.JSON(w, http.StatusOK, state)
+}
