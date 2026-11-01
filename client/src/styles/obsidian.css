@@ -153,3 +153,23 @@ button:disabled { cursor:not-allowed; }
   .settings-nav { border-radius:0; border:0; }
   .settings-content { border-radius:0; border:0; padding:22px 16px; }
 }
+
+
+/* Startup: keep the React boot state aligned with the pre-React HTML loader. */
+.app-loading {
+  width:100%;
+  min-height:100vh;
+  min-height:100svh;
+  box-sizing:border-box;
+  padding:24px;
+  background:radial-gradient(ellipse at 50% 0%,rgba(112,132,157,.13),transparent 55%),var(--bg-0);
+  color:var(--t0);
+  font-family:var(--f-ui);
+  letter-spacing:-.012em;
+}
+.app-loading-logo { display:block; object-fit:contain; }
+.app-loading-spinner {
+  border-color:rgba(220,231,244,.10);
+  border-top-color:var(--primary);
+  border-radius:50%;
+}
