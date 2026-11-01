@@ -30,6 +30,7 @@ const CATEGORY_OPTIONS: { value: string; labelKey: string }[] = [
   { value: "ws", labelKey: "platformLogsCategoryWs" },
   { value: "auth", labelKey: "platformLogsCategoryAuth" },
   { value: "general", labelKey: "platformLogsCategoryGeneral" },
+  { value: "audit", labelKey: "platformLogsCategoryAudit" },
   { value: "feedback", labelKey: "platformLogsCategoryFeedback" },
   { value: "cleaner", labelKey: "platformLogsCategoryCleaner" },
   { value: "client", labelKey: "platformLogsCategoryClient" },
@@ -177,7 +178,10 @@ function AdminLogsPanel() {
     <div className="admin-logs-panel">
       {/* Header */}
       <div className="admin-logs-header">
-        <h2 className="settings-section-title">{t("platformLogsTitle")}</h2>
+        <div>
+          <h2 className="settings-section-title">{t("platformLogsTitle")}</h2>
+          <p className="settings-hint">{t("platformLogsRetentionNotice")}</p>
+        </div>
         <button
           className="settings-btn settings-btn-danger"
           onClick={handleClear}

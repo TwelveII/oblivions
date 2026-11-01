@@ -73,7 +73,7 @@ func (s *appLogService) Clear(ctx context.Context) error {
 	return s.repo.DeleteAll(ctx)
 }
 
-// Start runs the async writer and daily auto-purge (30 days).
+// Start runs the async writer and purges logs older than 24 hours.
 func (s *appLogService) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
@@ -94,16 +94,16 @@ func (s *appLogService) Start() {
 		}
 	}()
 
-	// Auto-purge: delete logs older than 30 days, check every 6 hours
+	// Auto-purge: enforce the 24-hour retention window, checking every 15 minutes
 	go func() {
-		ticker := time.NewTicker(6 * time.Hour)
+		ticker := time.NewTicker(15 * time.Minute)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				cutoff := time.Now().AddDate(0, 0, -30).UTC().Format("2006-01-02 15:04:05")
+				cutoff := time.Now().Add(-24 * time.Hour).UTC().Format("2006-01-02 15:04:05")
 				deleted, err := s.repo.DeleteBefore(context.Background(), cutoff)
 				if err != nil {
 					log.Printf("[app_log] auto-purge error: %v", err)
