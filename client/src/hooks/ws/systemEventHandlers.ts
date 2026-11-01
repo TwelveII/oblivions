@@ -22,6 +22,7 @@ import { useJoinRequestStore } from "../../stores/joinRequestStore";
 import { getOpenConversations } from "../../stores/uiStore";
 import { mapWithConcurrency } from "../../utils/concurrency";
 import { useGuideStore } from "../../stores/guideStore";
+import { useToastStore } from "../../stores/toastStore";
 import type {
   WSMessage,
   MemberWithRoles,
@@ -253,6 +254,14 @@ export async function handleSystemEvent(
       const roles = msg.d as Role[];
       useRoleStore.getState().handleRolesReorder(serverId, roles);
       useMemberStore.getState().handleRolesReorder(serverId, roles);
+      return true;
+    }
+
+    case "platform_notice": {
+      const notice = msg.d as { title?: string; message?: string };
+      if (notice.message) {
+        useToastStore.getState().addToast("warning", notice.message, 9000);
+      }
       return true;
     }
 
