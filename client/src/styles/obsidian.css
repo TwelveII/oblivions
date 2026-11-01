@@ -50,12 +50,13 @@ button,input,textarea,select { font:inherit; }
 .sb-logo { width:27px; height:27px; border-radius:8px; }
 .sb-brand-name { font-size:15px; font-weight:750; letter-spacing:.045em; }
 .ch-tree { padding:10px 2px; }
-.ch-tree-section-header { padding:9px 11px; font-size:10px; letter-spacing:.13em; font-weight:750; color:var(--t3); }
-.ch-tree-server-header { padding:9px 11px; font-size:13px; font-weight:650; border-radius:7px; }
-.ch-tree-server-icon,.ch-tree-server-icon-fallback { width:27px; height:27px; border-radius:8px; }
-.ch-tree-server-add { opacity:.55; }
-.ch-tree-server-header-row:hover .ch-tree-server-add { opacity:1; }
-.ch-tree-section-body { padding:0 5px; }
+.ch-tree-cat-header { padding:9px 11px; font-size:10px; letter-spacing:.13em; font-weight:750; color:var(--t2); border-radius:7px; }
+.ch-tree-cat-row { padding-inline:5px; }
+.ch-tree-item { min-height:31px; border-radius:7px; }
+.ch-tree-label { font-size:12px; }
+.ch-tree-icon { opacity:.78; }
+.ch-tree-cat-add { opacity:.58; }
+.ch-tree-cat-row:hover .ch-tree-cat-add { opacity:1; }
 .ch-tree-section-body button,.ch-tree button { transition:background .16s ease,color .16s ease,border-color .16s ease; }
 .app-panel { border-radius:12px; }
 .main-area { gap:10px; }
