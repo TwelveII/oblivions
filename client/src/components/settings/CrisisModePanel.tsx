@@ -7,6 +7,7 @@ import {
   cleanConversationsNow,
   getCrisisModeState,
   setCrisisModeEnabled,
+  setSiteEnabled,
   type CrisisModeCleanResult,
   type CrisisModeState,
 } from "../../api/admin";
@@ -39,6 +40,28 @@ function CrisisModePanel() {
       } else addToast("error", res.error ?? "Could not update Crisis Mode");
     } catch {
       addToast("error", "Could not update Crisis Mode");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSiteToggle(enabled: boolean) {
+    const ok = enabled || await confirm({
+      message: "Disable access for all ordinary users? Their active sessions will be revoked. Platform administrators will retain access.",
+      confirmLabel: "Disable site",
+      danger: true,
+    });
+    if (!ok) return;
+
+    setBusy(true);
+    try {
+      const res = await setSiteEnabled(enabled);
+      if (res.success && res.data) {
+        setState(res.data);
+        addToast("success", enabled ? "Site access restored" : "Site disabled for ordinary users");
+      } else addToast("error", res.error ?? "Could not change site availability");
+    } catch {
+      addToast("error", "Could not change site availability");
     } finally {
       setBusy(false);
     }
@@ -92,6 +115,18 @@ function CrisisModePanel() {
                 checked={state?.enabled ?? false}
                 disabled={busy || !state}
                 onChange={(e) => void handleToggle(e.target.checked)}
+              />
+            </label>
+            <label className="settings-toggle-row">
+              <span>
+                <strong>Disable site</strong>
+                <small>Block ordinary users from logging in or using the API. Platform administrators retain access.</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={!(state?.site_enabled ?? true)}
+                disabled={busy || !state}
+                onChange={(e) => void handleSiteToggle(!e.target.checked)}
               />
             </label>
             <p className="settings-hint">
