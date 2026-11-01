@@ -1,7 +1,6 @@
-// Package handlers -- AvatarHandler: user avatar, user wallpaper and server icon upload endpoints.
+// Package handlers -- AvatarHandler: avatar and server icon upload endpoints.
 //
-// Separate from UploadService because avatar uploads update User/Server records
-// directly (no messageID or Attachment record), and only image MIME types are accepted.
+// Separate from UploadService because avatar uploads update User/Server records directly.
 package handlers
 
 import (
@@ -27,31 +26,25 @@ var allowedImageMimes = map[string]bool{
 	"image/webp": true,
 }
 
-// AvatarHandler handles avatar, wallpaper and icon upload endpoints.
+// AvatarHandler handles avatar and server icon upload endpoints.
 type AvatarHandler struct {
-	userRepo      repository.UserRepository
 	memberService services.MemberService
 	serverService services.ServerService
 	locator       *files.Locator
 	pipeline      services.UploadPipeline
-	urlSigner     services.FileURLSigner
 }
 
 func NewAvatarHandler(
-	userRepo repository.UserRepository,
 	memberService services.MemberService,
 	serverService services.ServerService,
 	locator *files.Locator,
 	pipeline services.UploadPipeline,
-	urlSigner services.FileURLSigner,
 ) *AvatarHandler {
 	return &AvatarHandler{
-		userRepo:      userRepo,
 		memberService: memberService,
 		serverService: serverService,
 		locator:       locator,
 		pipeline:      pipeline,
-		urlSigner:     urlSigner,
 	}
 }
 
