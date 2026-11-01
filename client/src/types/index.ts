@@ -672,6 +672,8 @@ export type AdminReportListItem = {
    *  "client" = reporter-supplied (E2EE), null = no text. */
   message_id: string | null;
   dm_message_id: string | null;
+  /** DM channel containing a legacy reported message, for admin navigation. */
+  dm_channel_id?: string | null;
   voice_message_id: string | null;
   message_excerpt: string | null;
   excerpt_source: "server" | "client" | null;
