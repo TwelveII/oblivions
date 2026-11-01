@@ -121,6 +121,10 @@ func (s *adminUserService) PlatformBanUser(ctx context.Context, adminUserID, tar
 	}); err != nil {
 		return err
 	}
+	recordAuditLog(ctx, s.db, adminUserID, targetUserID, "", "Platform user banned", map[string]string{
+		"reason": reason,
+		"messages_deleted": fmt.Sprint(deleteMessages),
+	})
 
 	if deleteMessages {
 		if err := s.userRepo.DeleteAllMessagesByUser(ctx, targetUserID); err != nil {
