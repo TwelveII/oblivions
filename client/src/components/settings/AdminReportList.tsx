@@ -11,7 +11,7 @@ import { useToastStore } from "../../stores/toastStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useDMStore } from "../../stores/dmStore";
 import { useUIStore } from "../../stores/uiStore";
-import { listAdminReports, updateReportStatus, platformBanUser, hardDeleteUser, deleteReportedMessage } from "../../api/admin";
+import { listAdminReports, updateReportStatus, platformBanUser, hardDeleteUser, deleteReportedMessage, deleteAdminReport } from "../../api/admin";
 import { useConfirm } from "../../hooks/useConfirm";
 import { useSettingsBadgeStore } from "../../stores/settingsBadgeStore";
 import { useContextMenu } from "../../hooks/useContextMenu";
@@ -313,6 +313,13 @@ function AdminReportList() {
     }
 
     items.push({
+      label: "Delete report",
+      danger: true,
+      separator: true,
+      onClick: () => handleDeleteReport(report),
+    });
+
+    items.push({
       label: t("platformReportBanReported"),
       danger: true,
       separator: true,
@@ -326,6 +333,16 @@ function AdminReportList() {
     });
 
     return items;
+  }
+
+  async function handleDeleteReport(report: AdminReportListItem) {
+    const ok = await confirm({ message: "Permanently delete this report and its evidence?", confirmLabel: "Delete report", danger: true });
+    if (!ok) return;
+    const res = await deleteAdminReport(report.id);
+    if (res.success) {
+      setReports((prev) => prev.filter((item) => item.id !== report.id));
+      addToast("success", "Report deleted");
+    } else addToast("error", res.error ?? "Could not delete report");
   }
 
   async function handleDeleteReportedMessage(report: AdminReportListItem) {
