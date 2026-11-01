@@ -13,8 +13,9 @@ import (
 // worker. Reports and their evidence are intentionally retained; only chat messages and their
 // message attachments are removed.
 type CrisisModeState struct {
-	Enabled   bool       `json:"enabled"`
-	LastRunAt *time.Time `json:"last_run_at"`
+	Enabled     bool       `json:"enabled"`
+	SiteEnabled bool       `json:"site_enabled"`
+	LastRunAt   *time.Time `json:"last_run_at"`
 }
 
 type CrisisModeCleanResult struct {
@@ -30,6 +31,7 @@ type CrisisModeService interface {
 	Stop()
 	GetState(ctx context.Context) (*CrisisModeState, error)
 	SetEnabled(ctx context.Context, enabled bool) error
+	SetSiteEnabled(ctx context.Context, enabled bool) error
 	CleanNow(ctx context.Context) (*CrisisModeCleanResult, error)
 }
 
@@ -95,12 +97,12 @@ func (s *crisisModeService) loop(ctx context.Context) {
 }
 
 func (s *crisisModeService) GetState(ctx context.Context) (*CrisisModeState, error) {
-	var enabled int
+	var enabled, siteEnabled int
 	var last sql.NullTime
-	if err := s.db.QueryRowContext(ctx, `SELECT enabled, last_run_at FROM crisis_mode_state WHERE id = 1`).Scan(&enabled, &last); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT enabled, site_enabled, last_run_at FROM crisis_mode_state WHERE id = 1`).Scan(&enabled, &siteEnabled, &last); err != nil {
 		return nil, fmt.Errorf("read crisis mode state: %w", err)
 	}
-	state := &CrisisModeState{Enabled: enabled == 1}
+	state := &CrisisModeState{Enabled: enabled == 1, SiteEnabled: siteEnabled == 1}
 	if last.Valid {
 		t := last.Time.UTC()
 		state.LastRunAt = &t
@@ -126,6 +128,36 @@ func (s *crisisModeService) SetEnabled(ctx context.Context, enabled bool) error 
 // CleanNow collects all message-file references before the transaction, deletes all conversation
 // rows atomically, then removes files/releases quota. If the DB transaction fails, no files are
 // deleted. This does not delete report evidence, accounts, channels, or server configuration.
+
+func (s *crisisModeService) SetSiteEnabled(ctx context.Context, enabled bool) error {
+	value := 0
+	if enabled {
+		value = 1
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin site availability update: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE crisis_mode_state SET site_enabled = ? WHERE id = 1`, value); err != nil {
+		return fmt.Errorf("update site availability: %w", err)
+	}
+	if !enabled {
+		// Invalidate access tokens and remove refresh sessions for every ordinary account.
+		// Platform administrators keep their sessions so they can restore the site.
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET token_version = token_version + 1 WHERE is_platform_admin = 0`); err != nil {
+			return fmt.Errorf("revoke ordinary-user access tokens: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE is_platform_admin = 0)`); err != nil {
+			return fmt.Errorf("revoke ordinary-user sessions: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit site availability update: %w", err)
+	}
+	return nil
+}
+
 func (s *crisisModeService) CleanNow(ctx context.Context) (*CrisisModeCleanResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
