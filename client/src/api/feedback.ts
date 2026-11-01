@@ -106,6 +106,10 @@ export async function adminReplyToFeedback(
   return apiClient<FeedbackReply>(`/admin/feedback/${ticketId}/reply`, { method: "POST", body: { content } });
 }
 
+export async function adminDeleteFeedbackTicket(ticketId: string) {
+  return apiClient<{ message: string }>(`/admin/feedback/${ticketId}`, { method: "DELETE" });
+}
+
 export async function adminUpdateFeedbackStatus(ticketId: string, status: string) {
   return apiClient<{ message: string }>(`/admin/feedback/${ticketId}/status`, {
     method: "PATCH",
