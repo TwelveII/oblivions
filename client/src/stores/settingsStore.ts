@@ -75,6 +75,7 @@ type SettingsTab =
   | "invites"
   | "join-requests"
   | "platform"
+  | "platform-crisis"
   | "platform-servers"
   | "platform-users"
   | "platform-reports"
