@@ -587,14 +587,6 @@ function AdminUserList() {
             {user.is_platform_banned && (
               <span className="admin-user-banned-badge">{t("platformUserBannedBadge")}</span>
             )}
-            {user.deleted_at && user.is_hard_deleted && (
-              <span
-                className="admin-user-tombstone-badge"
-                title={t("platformUserTombstoneTitle")}
-              >
-                {t("platformUserTombstoneBadge")}
-              </span>
-            )}
             {user.deleted_at && !user.is_hard_deleted && (
               <span
                 className="admin-user-deleted-badge"
@@ -699,7 +691,6 @@ function AdminUserList() {
             { value: "active", label: t("platformUserFilterActive") },
             { value: "banned", label: t("platformUserFilterBanned") },
             { value: "soft_deleted", label: t("platformUserFilterSoftDeleted") },
-            { value: "tombstone", label: t("platformUserFilterTombstone") },
           ]}
           selected={statusFilter}
           onChange={setStatusFilter}
