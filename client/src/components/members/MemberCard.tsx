@@ -43,9 +43,11 @@ type MemberCardProps = {
   user?: User;
   position: { top: number; left: number };
   onClose: () => void;
+  /** Disable reporting actions when this card is opened from a DM conversation. */
+  allowReporting?: boolean;
 };
 
-function MemberCard({ member, user: userProp, position, onClose }: MemberCardProps) {
+function MemberCard({ member, user: userProp, position, onClose, allowReporting = true }: MemberCardProps) {
   const { t } = useTranslation("common");
   const { t: tSettings } = useTranslation("settings");
   const logout = useLogout();
@@ -511,7 +513,7 @@ function MemberCard({ member, user: userProp, position, onClose }: MemberCardPro
         />
       )}
 
-      {showReport && (
+      {allowReporting && showReport && (
         <ReportModal
           userId={userId}
           username={displayName ?? username}
