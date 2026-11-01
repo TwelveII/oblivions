@@ -82,8 +82,8 @@ func TestSQLiteUserRepo_ExpiredUsernameReservationDoesNotBlock(t *testing.T) {
 
 	if _, err := db.ExecContext(ctx, `
 		INSERT INTO username_reservations (username, reserved_until)
-		VALUES ('ReleasedName', ?)
-	`, time.Now().UTC().Add(-time.Hour)); err != nil {
+		VALUES ('ReleasedName', datetime('now', '-1 hour'))
+	`); err != nil {
 		t.Fatalf("insert expired reservation: %v", err)
 	}
 
