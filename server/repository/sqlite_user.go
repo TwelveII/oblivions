@@ -786,7 +786,17 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 	_ = byAdmin // retained for repository interface compatibility
 
 	return database.WithTx(ctx, db, func(tx *sql.Tx) error {
-		// Transfer every owned server to an existing member before removing the deleted
+        // Reserve the original username for 24 hours before the account row is removed.
+        var originalUsername string
+        if err := tx.QueryRowContext(ctx, `SELECT username FROM users WHERE id = ?`, userID).Scan(&originalUsername); err != nil {
+            return fmt.Errorf("read username for reservation: %w", err)
+        }
+        if _, err := tx.ExecContext(ctx, `INSERT INTO username_reservations (username, reserved_until)
+            VALUES (?, datetime('now', '+24 hours'))
+            ON CONFLICT(username) DO UPDATE SET reserved_until = excluded.reserved_until`, originalUsername); err != nil {
+            return fmt.Errorf("reserve username: %w", err)
+        }
+        // Transfer every owned server to an existing member before removing the deleted
 		// owner's membership. If a server has no other members, delete that empty server.
 		ownedRows, err := tx.QueryContext(ctx, `SELECT id FROM servers WHERE owner_id = ? ORDER BY id`, userID)
 		if err != nil { return fmt.Errorf("failed to list owned servers: %w", err) }
