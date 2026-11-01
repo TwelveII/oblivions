@@ -330,6 +330,28 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 	}
 	plan.refs = append(plan.refs, rpAboutRefs...)
 
+	// ─── Public-server report evidence filed by the user ───
+	// server_reports cascade when reporter_id is deleted. Collect their evidence too,
+	// except for reports on empty owned servers whose files were already collected above
+	// by CollectServerFiles before the server itself is deleted.
+	srRefs, err := s.queryFileRefs(ctx, false, `
+		SELECT sra.file_url, COALESCE(sra.file_size, 0), sr.reporter_id
+		FROM server_report_attachments sra
+		JOIN server_reports sr ON sr.id = sra.server_report_id
+		WHERE sr.reporter_id = ?
+		  AND sr.server_id NOT IN (
+		    SELECT s.id FROM servers s
+		    WHERE s.owner_id = ?
+		      AND NOT EXISTS (
+		        SELECT 1 FROM server_members sm
+		        WHERE sm.server_id = s.id AND sm.user_id <> ?
+		      )
+		  )`, userID, userID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("collect user server-report files: %w", err)
+	}
+	plan.refs = append(plan.refs, srRefs...)
+
 	return plan, nil
 }
 
