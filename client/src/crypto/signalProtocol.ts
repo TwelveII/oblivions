@@ -277,10 +277,14 @@ async function processPreKeyBundleLocked(
     ? fromBase64(bundle.oneTimePrekey)
     : null;
 
-  // Verify signed prekey signature
+  // Verify signed prekey signature before trusting any material in the bundle.
   if (!verifySignedPreKey(theirSigningKey, theirSignedPrekey, theirSignature)) {
     throw new Error("Signed prekey signature verification failed");
   }
+
+  // TOFU pinning: a server must not be able to silently replace a device identity.
+  // A changed key requires an explicit, out-of-band re-verification by the user.
+  await assertTrustedIdentity(userId, deviceId, theirIdentityKey);
 
   // Generate ephemeral key pair
   const ephemeralKeyPair = generateX25519KeyPair();
@@ -336,14 +340,7 @@ async function processPreKeyBundleLocked(
     skippedMessageKeys: [],
   };
 
-  // TOFU — trust on first use
-  await keyStorage.saveTrustedIdentity({
-    userId,
-    deviceId,
-    identityKey: theirIdentityKey,
-    firstSeen: Date.now(),
-    verified: false,
-  });
+  // Identity was pinned (or first-seen) before any session state was created.
 
   const session: StoredSession = {
     userId,
@@ -382,6 +379,10 @@ export async function processPreKeyMessage(
 
   const senderIdentityKey = fromBase64(preKeyInfo.identityKey);
   const senderEphemeralKey = fromBase64(preKeyInfo.ephemeralKey);
+
+  // Authenticate the sender's long-term identity before using it in X3DH.
+  // Without this check, a forged PreKey envelope could overwrite an existing TOFU pin.
+  await assertTrustedIdentity(senderUserId, senderDeviceId, senderIdentityKey);
 
   // Find signed prekey
   const signedPreKey = await keyStorage.getSignedPreKey(
@@ -467,14 +468,7 @@ export async function processPreKeyMessage(
     skippedMessageKeys: [],
   };
 
-  // TOFU
-  await keyStorage.saveTrustedIdentity({
-    userId: senderUserId,
-    deviceId: senderDeviceId,
-    identityKey: senderIdentityKey,
-    firstSeen: Date.now(),
-    verified: false,
-  });
+  // The identity was pinned before the X3DH calculation.
 
   await keyStorage.saveSession({
     userId: senderUserId,
@@ -485,6 +479,41 @@ export async function processPreKeyMessage(
   });
 
   return sessionState;
+}
+
+/**
+ * Trust on first use for a remote device identity.
+ *
+ * Existing pins are immutable here: a server-side key replacement must never be
+ * silently accepted as a new identity. Key changes need an explicit user-facing
+ * verification/reset flow; until that exists, refusing is the safe behaviour.
+ */
+async function assertTrustedIdentity(
+  userId: string,
+  deviceId: string,
+  identityKey: Uint8Array
+): Promise<void> {
+  if (identityKey.length !== 32) {
+    throw new Error("Invalid E2EE identity key length");
+  }
+
+  const trusted = await keyStorage.getTrustedIdentity(userId, deviceId);
+  if (trusted) {
+    if (!bytesEqual(trusted.identityKey, identityKey)) {
+      throw new Error(
+        `E2EE identity key changed for device ${deviceId} (user ${userId}); refusing the session to prevent a possible man-in-the-middle attack. Verify the device identity out of band before trusting a replacement key.`
+      );
+    }
+    return;
+  }
+
+  await keyStorage.saveTrustedIdentity({
+    userId,
+    deviceId,
+    identityKey: identityKey.slice(),
+    firstSeen: Date.now(),
+    verified: false,
+  });
 }
 
 // ──────────────────────────────────
