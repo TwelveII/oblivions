@@ -3,7 +3,6 @@
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useSettingsStore } from "../../stores/settingsStore";
-import { useToastStore } from "../../stores/toastStore";
 import { THEMES, THEME_ORDER, type ThemeId } from "../../styles/themes";
 import { isElectron, isCapacitor } from "../../utils/constants";
 
