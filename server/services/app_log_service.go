@@ -108,7 +108,7 @@ func (s *appLogService) Start() {
 				if err != nil {
 					log.Printf("[app_log] auto-purge error: %v", err)
 				} else if deleted > 0 {
-					log.Printf("[app_log] auto-purge: deleted %d logs older than 30 days", deleted)
+					log.Printf("[app_log] auto-purge: deleted %d logs older than 24 hours", deleted)
 				}
 			}
 		}

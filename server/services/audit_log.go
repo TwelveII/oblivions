@@ -13,6 +13,10 @@ func recordAuditLog(ctx context.Context, db *sql.DB, actorID, targetID, serverID
 	if db == nil {
 		return
 	}
+	if metadata == nil { metadata = make(map[string]string) }
+	if actorID != "" { metadata["actor_id"] = actorID }
+	if targetID != "" { metadata["target_id"] = targetID }
+	if serverID != "" { metadata["server_id"] = serverID }
 	raw := "{}"
 	if len(metadata) > 0 {
 		if b, err := json.Marshal(metadata); err == nil {

@@ -173,22 +173,36 @@ function AdminLogsPanel() {
   }
 
   const totalPages = Math.ceil(total / PAGE_SIZE);
+  const pageErrors = logs.filter((log) => log.level === "error").length;
+  const pageWarnings = logs.filter((log) => log.level === "warn").length;
+  const pageAudit = logs.filter((log) => log.category === "audit").length;
 
   return (
     <div className="admin-logs-panel">
       {/* Header */}
       <div className="admin-logs-header">
-        <div>
+        <div className="admin-logs-heading">
+          <span className="admin-logs-eyebrow">PLATFORM OBSERVABILITY</span>
           <h2 className="settings-section-title">{t("platformLogsTitle")}</h2>
           <p className="settings-hint">{t("platformLogsRetentionNotice")}</p>
         </div>
+        <div className="admin-logs-header-actions">
+          <button type="button" className="settings-btn" onClick={() => fetchLogs(page)} disabled={isLoading}>{isLoading ? "Refreshing…" : "Refresh"}</button>
         <button
           className="settings-btn settings-btn-danger"
           onClick={handleClear}
           disabled={total === 0}
         >
           {t("platformLogsClearAll")}
-        </button>
+          </button>
+        </div>
+      </div>
+
+      <div className="admin-logs-summary">
+        <div className="admin-logs-stat"><span>RETENTION WINDOW</span><strong>24 hours</strong><small>Automatic purge of older records</small></div>
+        <div className="admin-logs-stat"><span>MATCHING EVENTS</span><strong>{total.toLocaleString()}</strong><small>Across current filters</small></div>
+        <div className="admin-logs-stat"><span>ERRORS ON PAGE</span><strong className="is-error">{pageErrors}</strong><small>Worth investigating</small></div>
+        <div className="admin-logs-stat"><span>WARNINGS / AUDIT</span><strong>{pageWarnings} / {pageAudit}</strong><small>Current page only</small></div>
       </div>
 
       {/* Filters */}
@@ -242,7 +256,7 @@ function AdminLogsPanel() {
             return (
               <div
                 key={log.id}
-                className={`admin-log-entry${isExpanded ? " expanded" : ""}`}
+                className={`admin-log-entry level-${log.level}${isExpanded ? " expanded" : ""}`}
                 onClick={() => toggleExpand(log.id)}
                 style={{ cursor: "pointer" }}
               >
@@ -257,9 +271,13 @@ function AdminLogsPanel() {
                     </span>
                   )}
                   <span className="admin-log-message">{log.message}</span>
-                  <span className="admin-log-time">
-                    {formatTimestamp(log.created_at)}
-                  </span>
+                  <span className="admin-log-time" title={formatTimestamp(log.created_at)}>{formatTimestamp(log.created_at)}</span>
+                  <span className="admin-log-expand-mark" aria-hidden="true">{isExpanded ? "−" : "+"}</span>
+                </div>
+                <div className="admin-log-subline">
+                  <span>{log.display_name || log.username || (log.user_id ? "User " + log.user_id.slice(0, 8) : "System")}</span>
+                  {log.server_id && <span>Server · {log.server_id}</span>}
+                  <span>Event · {log.id}</span>
                 </div>
 
                 {isExpanded && (
@@ -272,12 +290,12 @@ function AdminLogsPanel() {
                         <span className="admin-log-meta-value">{value}</span>
                       </div>
                     ))}
-                    {log.user_id && (
-                      <div className="admin-log-meta-item">
-                        <span className="admin-log-meta-key">user_id:</span>
-                        <span className="admin-log-meta-value">{log.user_id}</span>
-                      </div>
-                    )}
+                    <div className="admin-log-detail-grid">
+                      <div className="admin-log-meta-item"><span className="admin-log-meta-key">Log ID:</span><span className="admin-log-meta-value">{log.id}</span></div>
+                      <div className="admin-log-meta-item"><span className="admin-log-meta-key">Timestamp:</span><span className="admin-log-meta-value">{formatTimestamp(log.created_at)}</span></div>
+                      {log.user_id && <div className="admin-log-meta-item"><span className="admin-log-meta-key">User ID:</span><span className="admin-log-meta-value">{log.user_id}</span></div>}
+                      {log.server_id && <div className="admin-log-meta-item"><span className="admin-log-meta-key">Server ID:</span><span className="admin-log-meta-value">{log.server_id}</span></div>}
+                    </div>
                   </div>
                 )}
               </div>

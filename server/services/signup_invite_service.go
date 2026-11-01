@@ -118,6 +118,7 @@ func (s *signupInviteService) Create(ctx context.Context, inviterID string, expi
 	}
 
 	result.Code = code
+	recordAuditLog(ctx, s.db, inviterID, "", "", "Signup invitation created", map[string]string{"invite_id": result.ID, "expires_in_days": fmt.Sprint(expiryDays), "expires_at": func() string { if result.ExpiresAt == nil { return "never" }; return result.ExpiresAt.UTC().Format(time.RFC3339) }()})
 	return &result, nil
 }
 
@@ -162,6 +163,7 @@ func (s *signupInviteService) Revoke(ctx context.Context, inviterID, inviteID st
 	if n == 0 {
 		return ErrSignupInviteInvalid
 	}
+	recordAuditLog(ctx, s.db, inviterID, "", "", "Signup invitation revoked", map[string]string{"invite_id": inviteID})
 	return nil
 }
 
@@ -183,6 +185,7 @@ func (s *signupInviteService) AdminSetLimit(ctx context.Context, userID string, 
 	if n == 0 {
 		return sql.ErrNoRows
 	}
+	recordAuditLog(ctx, s.db, "", userID, "", "Signup invitation limit updated", map[string]string{"new_limit": fmt.Sprint(limit)})
 	return nil
 }
 

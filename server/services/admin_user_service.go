@@ -178,7 +178,7 @@ func (s *adminUserService) PlatformUnbanUser(ctx context.Context, adminUserID, t
 	}
 
 	// Atomic: clear user flag (if user exists) + remove durable ban record
-	return database.WithTx(ctx, s.db, func(tx *sql.Tx) error {
+	err := database.WithTx(ctx, s.db, func(tx *sql.Tx) error {
 		txRepo := repository.NewSQLiteUserRepo(tx)
 		if userExists {
 			if err := txRepo.PlatformUnban(ctx, targetUserID); err != nil {
@@ -190,6 +190,9 @@ func (s *adminUserService) PlatformUnbanUser(ctx context.Context, adminUserID, t
 		}
 		return nil
 	})
+	if err != nil { return err }
+	recordAuditLog(ctx, s.db, adminUserID, targetUserID, "", "Platform user unbanned", nil)
+	return nil
 }
 
 // SoftDeleteUser marks the user soft-deleted (recoverable for 30 days).
@@ -232,6 +235,7 @@ func (s *adminUserService) SoftDeleteUser(ctx context.Context, adminUserID, targ
 		}
 	}
 
+	recordAuditLog(ctx, s.db, adminUserID, targetUserID, "", "Platform user soft-deleted", map[string]string{"username": target.Username, "reason": reason, "recovery_window_days": fmt.Sprint(models.SoftDeleteTTLDays)})
 	log.Printf("[admin] admin %s soft-deleted user %s (%s)", adminUserID, targetUserID, target.Username)
 	return nil
 }
@@ -259,6 +263,7 @@ func (s *adminUserService) RestoreUser(ctx context.Context, adminUserID, targetU
 		return fmt.Errorf("failed to restore user: %w", err)
 	}
 
+	recordAuditLog(ctx, s.db, adminUserID, targetUserID, "", "Platform user restored", map[string]string{"username": target.Username})
 	log.Printf("[admin] admin %s restored user %s (%s)", adminUserID, targetUserID, target.Username)
 	return nil
 }
@@ -317,6 +322,7 @@ func (s *adminUserService) HardDeleteUser(ctx context.Context, adminUserID, targ
 
 	// Phase 3: delete files from disk + release other users' quota
 	s.fileCleanup.Execute(plan)
+	recordAuditLog(ctx, s.db, adminUserID, targetUserID, "", "Platform user permanently deleted", map[string]string{"username": target.Username, "reason": reason, "owned_servers_deleted": fmt.Sprint(len(ownedServerIDs))})
 
 	return nil
 }

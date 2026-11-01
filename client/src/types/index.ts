@@ -764,7 +764,8 @@ export type AppLogCategory =
   | "feedback"
   | "livekit"
   | "cleaner"
-  | "client";
+  | "client"
+  | "audit";
 
 export type AppLog = {
   id: string;
