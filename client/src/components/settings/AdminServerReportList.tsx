@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { useToastStore } from "../../stores/toastStore";
-import { listAdminServerReports, updateServerReportStatus } from "../../api/admin";
+import { listAdminServerReports, updateServerReportStatus, deleteAdminServerReport } from "../../api/admin";
 import Modal from "../shared/Modal";
 import { resolveAssetUrl } from "../../utils/constants";
 import { useAttachmentViewer } from "../../hooks/useAttachmentViewer";
@@ -99,6 +99,17 @@ function AdminServerReportList() {
     });
   }
 
+  async function handleDelete(id: string) {
+    if (!window.confirm("Permanently delete this server report?")) return;
+    const res = await deleteAdminServerReport(id);
+    if (res.success) {
+      setReports((prev) => prev.filter((report) => report.id !== id));
+      addToast("success", "Server report deleted.");
+    } else {
+      addToast("error", res.error ?? "Could not delete server report.");
+    }
+  }
+
   if (isLoading) {
     return (
       <div className="admin-report-list">
@@ -138,6 +149,7 @@ function AdminServerReportList() {
                 <th>{t("platformReportFiles")}</th>
                 <th>{t("platformReportDate")}</th>
                 <th>{t("platformReportStatus")}</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -194,6 +206,11 @@ function AdminServerReportList() {
                           </button>
                         )}
                       </div>
+                    </td>
+                    <td>
+                      <button type="button" className="settings-btn settings-btn-danger" onClick={() => handleDelete(r.id)}>
+                        Delete
+                      </button>
                     </td>
                   </tr>
                 );
