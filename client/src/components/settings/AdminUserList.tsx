@@ -302,31 +302,7 @@ function AdminUserList() {
           })();
         },
       });
-      // A soft-deleted user is otherwise stuck waiting for the 30-day TTL.
-      // Admins need a way to skip the wait — "delete now" maps to the existing
-      // hard-delete API path with hard_delete=true.
-      items.push({
-        label: t("platformUserHardDeleteNow"),
-        danger: true,
-        onClick: () => {
-          void (async () => {
-            const ok = await confirm({
-              title: t("platformUserHardDeleteNowTitle"),
-              message: t("platformUserHardDeleteNowConfirm", { username: user.username }),
-              danger: true,
-              confirmLabel: t("platformUserHardDeleteNowButton"),
-            });
-            if (!ok) return;
-            const res = await hardDeleteUser(user.id, { hard_delete: true });
-            if (res.success) {
-              addToast("success", t("platformDeleteSuccess", { username: user.username }));
-              await refetchUsers();
-            } else {
-              addToast("error", res.error ?? t("platformDeleteError"));
-            }
-          })();
-        },
-      });
+
     }
 
     return items;
@@ -412,17 +388,13 @@ function AdminUserList() {
     }
   }
 
-  async function handleDeleteConfirm(reason: string, hardDelete?: boolean) {
+  async function handleDeleteConfirm(reason: string) {
     if (!deleteTarget) return;
     const targetId = deleteTarget.id;
     const targetName = deleteTarget.username;
     setDeleteTarget(null);
 
-    const body: { reason?: string; hard_delete?: boolean } = {};
-    if (reason) body.reason = reason;
-    if (hardDelete) body.hard_delete = true;
-
-    const res = await hardDeleteUser(targetId, Object.keys(body).length ? body : undefined);
+    const res = await hardDeleteUser(targetId, reason ? { reason } : undefined);
     if (res.success) {
       addToast("success", t("platformDeleteSuccess", { username: targetName }));
       await refetchUsers();
@@ -811,9 +783,6 @@ function AdminUserList() {
           confirmLabel={t("platformDeleteConfirm")}
           onConfirm={handleDeleteConfirm}
           onCancel={() => setDeleteTarget(null)}
-          showHardDeleteToggle
-          hardDeleteLabel={t("permanentDelete")}
-          hardDeleteHint={t("platformDeleteHardHint")}
         />
       )}
 
