@@ -205,6 +205,15 @@ func (r *sqliteReportRepo) UpdateStatus(ctx context.Context, id string, status m
 	return nil
 }
 
+func (r *sqliteReportRepo) Delete(ctx context.Context, id string) error {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM reports WHERE id = ?`, id)
+	if err != nil { return fmt.Errorf("failed to delete report: %w", err) }
+	n, err := res.RowsAffected()
+	if err != nil { return fmt.Errorf("failed to check deleted report: %w", err) }
+	if n == 0 { return fmt.Errorf("%w: report %s", pkg.ErrNotFound, id) }
+	return nil
+}
+
 // HasPendingReport checks for a duplicate pending report: same reporter, target and
 // message context. A profile report and a message report on the same user are distinct.
 func (r *sqliteReportRepo) HasPendingReport(ctx context.Context, reporterID, targetID, messageID, dmMessageID, voiceMessageID string) (bool, error) {
