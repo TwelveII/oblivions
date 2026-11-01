@@ -256,7 +256,7 @@ function AdminLogsPanel() {
             return (
               <div
                 key={log.id}
-                className={`admin-log-entry${isExpanded ? " expanded" : ""}`}
+                className={`admin-log-entry level-${log.level}${isExpanded ? " expanded" : ""}`}
                 onClick={() => toggleExpand(log.id)}
                 style={{ cursor: "pointer" }}
               >
