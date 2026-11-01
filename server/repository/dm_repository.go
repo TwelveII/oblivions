@@ -15,6 +15,7 @@ type DMRepository interface {
 	CreateChannel(ctx context.Context, channel *models.DMChannel) error
 	UpdateChannelStatus(ctx context.Context, channelID, status string) error
 	SetInitiatedBy(ctx context.Context, channelID, userID string) error
+	SetPendingRequest(ctx context.Context, channelID, userID string) error
 	CountMessagesBySender(ctx context.Context, channelID, userID string) (int, error)
 	DeleteChannel(ctx context.Context, channelID string) error
 	SetE2EEEnabled(ctx context.Context, channelID string, enabled bool) error
