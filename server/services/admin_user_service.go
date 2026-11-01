@@ -105,6 +105,20 @@ func (s *adminUserService) PlatformBanUser(ctx context.Context, adminUserID, tar
 	if err != nil {
 		return fmt.Errorf("failed to list owned servers: %w", err)
 	}
+	// Include soft-deleted servers too; a platform ban permanently purges every
+	// server owned by the account, not just servers currently visible in the UI.
+	deletedServers, err := s.serverRepo.ListDeletedByOwner(ctx, targetUserID)
+	if err != nil {
+		return fmt.Errorf("failed to list soft-deleted owned servers: %w", err)
+	}
+	seenServerIDs := make(map[string]bool, len(ownedServerIDs)+len(deletedServers))
+	for _, sid := range ownedServerIDs { seenServerIDs[sid] = true }
+	for _, server := range deletedServers {
+		if !seenServerIDs[server.ID] {
+			ownedServerIDs = append(ownedServerIDs, server.ID)
+			seenServerIDs[server.ID] = true
+		}
+	}
 	serverPlans := make(map[string]*CleanupPlan, len(ownedServerIDs))
 	serverMembers := make(map[string][]string, len(ownedServerIDs))
 	for _, sid := range ownedServerIDs {
