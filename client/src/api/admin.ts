@@ -362,6 +362,13 @@ export async function getCrisisModeState() {
   return apiClient<CrisisModeState>("/admin/crisis-mode");
 }
 
+export async function setSiteEnabled(enabled: boolean) {
+  return apiClient<CrisisModeState>("/admin/site-availability", {
+    method: "PATCH",
+    body: { enabled },
+  });
+}
+
 export async function setCrisisModeEnabled(enabled: boolean) {
   return apiClient<CrisisModeState>("/admin/crisis-mode", {
     method: "PATCH",
