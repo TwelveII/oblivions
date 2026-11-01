@@ -60,7 +60,7 @@ type AuthService interface {
 	SoftDeleteSelf(ctx context.Context, userID, password string) error
 
 	// RestoreAccount un-soft-deletes the user after password verification.
-	// Returns auth tokens like a regular login. Tombstone (is_hard_deleted=1) is not recoverable.
+	// Returns auth tokens like a regular login. Permanently deleted accounts have no row to restore.
 	RestoreAccount(ctx context.Context, username, password string, client models.ClientInfo) (*AuthTokens, error)
 
 	// RecordCredentialStoreFailure logs a desktop app that could not save or read its
@@ -765,7 +765,6 @@ func (s *authService) SoftDeleteSelf(ctx context.Context, userID, password strin
 
 // RestoreAccount un-soft-deletes the user after username + password verification
 // and returns auth tokens (so the user is logged in immediately).
-// Tombstone (is_hard_deleted=1) is not recoverable.
 func (s *authService) RestoreAccount(ctx context.Context, username, password string, client models.ClientInfo) (*AuthTokens, error) {
 	user, err := s.userRepo.GetByUsername(ctx, username)
 	if err != nil {
