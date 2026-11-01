@@ -126,6 +126,7 @@ func (s *signupInviteService) List(ctx context.Context, inviterID string) ([]Sig
 		SELECT id, created_at, expires_at, used_at, revoked_at
 		FROM signup_invite_codes
 		WHERE inviter_user_id = ?
+		  AND used_at IS NULL
 		ORDER BY created_at DESC
 	`, inviterID)
 	if err != nil {
