@@ -1,4 +1,4 @@
-/** PlatformActionDialog — Reusable confirmation dialog with optional reason textarea. */
+/** PlatformActionDialog — Reusable confirmation dialog with a reason textarea. */
 
 import { useState, useRef, useEffect } from "react";
 import { createPortal } from "react-dom";
@@ -11,7 +11,7 @@ type PlatformActionDialogProps = {
   reasonPlaceholder: string;
   confirmLabel: string;
   onConfirm: (reason: string) => void;
-    onCancel: () => void;
+  onCancel: () => void;
 };
 
 function PlatformActionDialog({
@@ -68,8 +68,6 @@ function PlatformActionDialog({
             rows={3}
             maxLength={500}
           />
-
-
 
           <div className="modal-actions">
             <button
