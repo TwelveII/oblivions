@@ -1,5 +1,4 @@
-/* Google Fonts — Manrope (UI + display via weight hierarchy), Source Code Pro (mono) */
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&family=Source+Code+Pro:wght@400;500&display=swap');
+/* Local/system font stacks only: avoid third-party font requests and metadata leakage. */
 
 /* ═══════════════════════════════════════
    CSS VARIABLES

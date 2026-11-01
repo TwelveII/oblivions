@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter, HashRouter } from "react-router-dom";
 import "./i18n"; // Must be imported before App for i18n initialization
 import "./styles/globals.css";
+import "./styles/obsidian.css";
 import App from "./App";
 import ErrorBoundary from "./components/shared/ErrorBoundary";
 import { isNativeApp } from "./utils/constants";
