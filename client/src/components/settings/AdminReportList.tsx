@@ -342,6 +342,7 @@ function AdminReportList() {
     if (res.success) {
       addToast("success", "Report deleted.");
       setReports((prev) => prev.filter((item) => item.id !== report.id));
+      setDetailId(null);
     } else {
       addToast("error", res.error ?? "Could not delete report.");
     }
@@ -823,6 +824,11 @@ function AdminReportList() {
                 </div>
               </section>
             )}
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
+              <button type="button" className="settings-btn settings-btn-danger" onClick={() => handleDeleteReport(detailReport)}>
+                Delete report
+              </button>
+            </div>
           </div>
         )}
       </Modal>
