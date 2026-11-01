@@ -93,6 +93,7 @@ func initRoutes(
 	mux.Handle("POST /api/users/me/guide/app", auth(h.Guide.MarkAppUsed))
 	mux.Handle("GET /api/users/me/deleted-servers", auth(h.Server.GetDeletedServers))
 	mux.Handle("DELETE /api/users/me", auth(h.Auth.SoftDeleteSelf))
+	mux.Handle("DELETE /api/users/me/emergency", auth(h.Auth.EmergencyDeleteSelf))
 	mux.Handle("PATCH /api/users/me/preferences", auth(h.Preferences.Update))
 	mux.Handle("GET /api/users/me/storage", auth(h.Storage.GetUsage))
 
