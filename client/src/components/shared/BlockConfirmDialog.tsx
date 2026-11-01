@@ -16,6 +16,7 @@ type BlockConfirmDialogProps = {
 function BlockConfirmDialog({ username, allowReporting = true, onConfirm, onClose }: BlockConfirmDialogProps) {
   const { t } = useTranslation("dm");
   const { t: tCommon } = useTranslation("common");
+  const [alsoReport, setAlsoReport] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
 
   async function handleConfirm() {
