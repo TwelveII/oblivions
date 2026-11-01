@@ -22,6 +22,7 @@ type Device = {
   signedPreKeys: Map<number, { id: number; publicKey: Uint8Array; privateKey: Uint8Array; signature: Uint8Array; createdAt: number }>;
   preKeys: Map<number, { id: number; publicKey: Uint8Array; privateKey: Uint8Array }>;
   sessions: Map<string, unknown>;
+  trustedIdentities: Map<string, { userId: string; deviceId: string; identityKey: Uint8Array; firstSeen: number; verified: boolean }>;
   /** Load-bearing, not incidental: the pending X3DH info a first message carries is stashed here
    *  between establishing the session and encrypting, so a metadata stub that returns null turns
    *  every first message into an ordinary one the recipient cannot open. */
@@ -50,8 +51,10 @@ vi.mock("./keyStorage", () => ({
     current.sessions.set(`${s.userId}:${s.deviceId}`, clone(s));
   }),
   deleteSession: vi.fn(async (u: string, d: string) => { current.sessions.delete(`${u}:${d}`); }),
-  getTrustedIdentity: vi.fn(async () => null),
-  saveTrustedIdentity: vi.fn(async () => {}),
+  getTrustedIdentity: vi.fn(async (u: string, d: string) => current.trustedIdentities.get(`${u}:${d}`) ?? null),
+  saveTrustedIdentity: vi.fn(async (identity: { userId: string; deviceId: string; identityKey: Uint8Array; firstSeen: number; verified: boolean }) => {
+    current.trustedIdentities.set(`${identity.userId}:${identity.deviceId}`, clone(identity));
+  }),
   getMetadata: vi.fn(async (k: string) => current.metadata.get(k) ?? null),
   setMetadata: vi.fn(async (k: string, v: unknown) => { current.metadata.set(k, v); }),
   deleteMetadata: vi.fn(async (k: string) => { current.metadata.delete(k); }),
@@ -80,6 +83,7 @@ function newDevice(userId: string, deviceId: string, registrationId: number): De
     ]),
     preKeys: new Map([[100, { id: 100, publicKey: x25519.getPublicKey(otpPriv), privateKey: otpPriv }]]),
     sessions: new Map(),
+    trustedIdentities: new Map(),
     metadata: new Map(),
   };
 }
@@ -144,6 +148,44 @@ describe("Signal round-trip", () => {
     );
 
     expect(await bobReceivesFirst(bob, wire)).toBe(plaintext);
+  });
+
+  it("should refuse a prekey bundle that changes a previously pinned device identity", async () => {
+    // First contact pins Bob's identity on Alice's device.
+    await as(alice, () =>
+      establishAndEncrypt(BOB.userId, BOB.deviceId, bundleOf(bob), "first contact")
+    );
+
+    // A server-side attacker substitutes a new X25519 identity while replaying the
+    // otherwise-valid signing key and signed prekey. The existing pin must win.
+    const replacement = x25519.getPublicKey(x25519.utils.randomSecretKey());
+    const forgedBundle = { ...bundleOf(bob), identityKey: toBase64(replacement) };
+
+    await expect(
+      as(alice, () =>
+        establishAndEncrypt(BOB.userId, BOB.deviceId, forgedBundle, "must not send")
+      )
+    ).rejects.toThrow(/identity key changed/i);
+  });
+
+  it("should refuse an incoming prekey message from a changed sender identity", async () => {
+    const wire = await as(alice, () =>
+      establishAndEncrypt(BOB.userId, BOB.deviceId, bundleOf(bob), "hello")
+    );
+
+    // Bob already has an independently pinned identity for Alice. A forged PreKey
+    // envelope must not overwrite it and replace the ratchet session.
+    const replacement = x25519.getPublicKey(x25519.utils.randomSecretKey());
+    bob.trustedIdentities.set(`${ALICE.userId}:${ALICE.deviceId}`, {
+      userId: ALICE.userId,
+      deviceId: ALICE.deviceId,
+      identityKey: replacement,
+      firstSeen: 1,
+      verified: true,
+    });
+
+    await expect(bobReceivesFirst(bob, wire)).rejects.toThrow(/identity key changed/i);
+    expect(bob.sessions.has(`${ALICE.userId}:${ALICE.deviceId}`)).toBe(false);
   });
 
   it("should keep working when they take turns", async () => {
