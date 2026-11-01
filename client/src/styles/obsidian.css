@@ -1,0 +1,99 @@
+/* Oblivions — Obsidian visual system
+   Additive layer: intentionally leaves component behavior and layout logic untouched. */
+:root {
+  --bg-0:#0b0d10;
+  --bg-1:#101318;
+  --bg-2:#151a20;
+  --bg-3:#1b222a;
+  --bg-4:#232c36;
+  --bg-5:#303b47;
+  --bg-h:#202a35;
+  --bg-ub:#080a0d;
+  --b1:rgba(220,231,244,.075);
+  --b2:rgba(220,231,244,.13);
+  --t0:#edf1f5;
+  --t1:#c5cdd6;
+  --t2:#8995a3;
+  --t3:#687584;
+  --primary:#a8b7c9;
+  --primary-s:rgba(168,183,201,.10);
+  --primary-m:rgba(168,183,201,.2);
+  --primary-h:#d0dbe7;
+  --secondary:#a8b7c9;
+  --secondary-s:rgba(168,183,201,.08);
+  --teal:#a8b7c9;
+  --gradient:linear-gradient(145deg,#0b0d10 0%,#111720 55%,#141a22 100%);
+  --f-ui:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --f-m:ui-monospace,SFMono-Regular,Consolas,monospace;
+  --panel-gap:12px;
+  --panel-radius:12px;
+  --panel-border:rgba(220,231,244,.09);
+  --panel-inset:inset 0 1px 0 rgba(255,255,255,.025);
+  --panel-shadow:0 18px 55px rgba(0,0,0,.22);
+  --input-bg:#11171e;
+  --input-border:rgba(220,231,244,.13);
+  --picker-bg:#11171e;
+}
+html,body { background-color:var(--bg-0); color:var(--t0); }
+body { font-family:var(--f-ui); letter-spacing:-.012em; }
+button,input,textarea,select { font:inherit; }
+::selection { background:rgba(168,183,201,.28); color:#fff; }
+:focus-visible { outline:2px solid #b7c6d7 !important; outline-offset:2px; }
+::-webkit-scrollbar-thumb { background:#34404d; border-radius:8px; }
+::-webkit-scrollbar-thumb:hover { background:#526171; }
+
+/* App surfaces */
+.mqvi-app { gap:12px; padding:12px; background:radial-gradient(ellipse at 48% -20%,rgba(100,122,148,.09),transparent 55%),var(--bg-0); }
+.sidebar,.app-body,.main-area,.members-panel { min-width:0; }
+.sidebar { gap:10px; }
+.sb-header { height:48px; padding:0 12px; border-bottom-color:var(--b1); }
+.sb-logo { width:27px; height:27px; border-radius:8px; }
+.sb-brand-name { font-size:15px; font-weight:750; letter-spacing:.045em; }
+.ch-tree { padding:10px 2px; }
+.ch-tree-section-header { padding:9px 11px; font-size:10px; letter-spacing:.13em; font-weight:750; color:var(--t3); }
+.ch-tree-server-header { padding:9px 11px; font-size:13px; font-weight:650; border-radius:7px; }
+.ch-tree-server-icon,.ch-tree-server-icon-fallback { width:27px; height:27px; border-radius:8px; }
+.ch-tree-server-add { opacity:.55; }
+.ch-tree-server-header-row:hover .ch-tree-server-add { opacity:1; }
+.ch-tree-section-body { padding:0 5px; }
+.ch-tree-section-body button,.ch-tree button { transition:background .16s ease,color .16s ease,border-color .16s ease; }
+.app-panel { border-radius:12px; }
+.main-area { gap:10px; }
+.app-body { background:var(--bg-1); border:1px solid var(--b1); border-radius:13px; overflow:hidden; }
+.members-panel { border-left:1px solid var(--b1); }
+
+/* Controls and inputs */
+button { transition:background-color .16s ease,border-color .16s ease,color .16s ease,transform .16s ease,opacity .16s ease; }
+button:active:not(:disabled) { transform:translateY(1px); }
+input,textarea,select { color:var(--t0); }
+input:not([type=checkbox]):not([type=radio]),textarea,select {
+  border-color:var(--input-border);
+  border-radius:8px;
+}
+input:focus,textarea:focus,select:focus { border-color:rgba(183,198,215,.55) !important; box-shadow:0 0 0 3px rgba(168,183,201,.09); }
+button:disabled { cursor:not-allowed; }
+
+/* Authentication and public pages */
+.auth-page,.landing-page { background:radial-gradient(ellipse at 50% 0%,rgba(112,132,157,.13),transparent 55%),var(--bg-0) !important; }
+.auth-card {
+  background:linear-gradient(160deg,rgba(25,31,39,.98),rgba(14,18,23,.98)) !important;
+  border:1px solid rgba(220,231,244,.12) !important;
+  border-radius:16px !important;
+  box-shadow:0 28px 90px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.035) !important;
+}
+.auth-title { letter-spacing:-.045em; font-weight:750 !important; }
+.auth-subtitle { color:var(--t2) !important; }
+.auth-label { color:var(--t1) !important; font-size:12px !important; font-weight:650 !important; letter-spacing:.025em; }
+.auth-input { background:#0c1117 !important; border:1px solid var(--b2) !important; border-radius:9px !important; min-height:44px; }
+.auth-btn { min-height:44px; border-radius:9px !important; font-weight:700 !important; letter-spacing:.01em; }
+.auth-link,.auth-download-link,.auth-home-link { color:var(--t2) !important; }
+.auth-link a,.auth-home-link:hover,.auth-download-link:hover { color:var(--t0) !important; }
+
+/* Motion respects operating-system accessibility preferences. */
+@media (prefers-reduced-motion: no-preference) {
+  .app-panel,.auth-card { animation:obsidian-enter .24s ease-out both; }
+  @keyframes obsidian-enter { from { opacity:.88; transform:translateY(3px); } to { opacity:1; transform:translateY(0); } }
+}
+@media (prefers-reduced-motion: reduce) {
+  *,*::before,*::after { scroll-behavior:auto !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
+}
