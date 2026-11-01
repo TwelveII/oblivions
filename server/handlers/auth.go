@@ -455,7 +455,17 @@ func (h *AuthHandler) SoftDeleteSelf(w http.ResponseWriter, r *http.Request) {
 // limiter cannot pivot to /auth/restore for the same brute-force budget.
 // EmergencyDeleteSelf permanently erases the authenticated account.
 func (h *AuthHandler) EmergencyDeleteSelf(w http.ResponseWriter, r *http.Request) {
- user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	ip := ratelimit.ExtractIP(r)
+	if h.loginLimiter != nil && !h.loginLimiter.Allow(ip) {
+		retryAfter := h.loginLimiter.RetryAfterSeconds(ip)
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+		pkg.ErrorWithMessage(w, http.StatusTooManyRequests,
+			fmt.Sprintf("too many attempts, please try again in %s",
+				ratelimit.FormatRetryMessage(retryAfter)))
+		return
+	}
+
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
  if !ok { pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context"); return }
  var req struct { Password string `json:"password"` }
  if err := json.NewDecoder(r.Body).Decode(&req); err != nil { pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body"); return }
