@@ -57,6 +57,7 @@ vi.mock("./keyStorage", () => ({
   }),
   getSignedPreKey: vi.fn(async () => null),
   getPreKey: vi.fn(async () => null),
+  getTrustedIdentity: vi.fn(async () => null),
   saveTrustedIdentity: vi.fn(async () => {}),
   getRegistrationData: vi.fn(async () => null),
 }));

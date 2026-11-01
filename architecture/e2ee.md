@@ -70,6 +70,14 @@ Prekeys are pooled per device — `pkg.ErrPrekeyExhausted` and the `prekey_low` 
 refilling. `device_list_update`, `device_key_change` and `group_session_new` are the WS ops that keep
 peers in sync.
 
+Remote device identity keys use TOFU pins keyed by user + device ID. Both outbound bundle
+processing and inbound PreKey handshakes reject a key that differs from an existing pin; they never
+silently overwrite it. A first-seen inbound identity is pinned only after its first message passes
+AES-GCM authentication, so an unauthenticated envelope cannot poison the pin. A rejected identity
+change is surfaced as a decryption error and requires out-of-band verification before any trust
+reset. TOFU protects returning contacts, not the very first contact against an active attacker;
+fingerprint/QR verification or a key-transparency system is needed for that stronger guarantee.
+
 **Key backup** (`keyBackup.ts`) is gated behind a **mandatory recovery password set on first setup**
 (`feat(e2ee): mandatory recovery password on first setup`, 03-07). Keys are preserved on logout, not
 wiped.

@@ -249,6 +249,9 @@ export function establishAndEncrypt(
 ): Promise<SignalWireMessage> {
   return withSessionLock(signalSessionKey(userId, deviceId), async () => {
     if (opts?.forceNewSession) {
+      // Check the pin before discarding a working session. A rejected key change
+      // must not destroy the last known-good ratchet state.
+      await assertIdentityMatchesPin(userId, deviceId, fromBase64(bundle.identityKey));
       await keyStorage.deleteSession(userId, deviceId);
     }
     if (!(await keyStorage.hasSession(userId, deviceId))) {
@@ -277,10 +280,14 @@ async function processPreKeyBundleLocked(
     ? fromBase64(bundle.oneTimePrekey)
     : null;
 
-  // Verify signed prekey signature
+  // Verify signed prekey signature before trusting any material in the bundle.
   if (!verifySignedPreKey(theirSigningKey, theirSignedPrekey, theirSignature)) {
     throw new Error("Signed prekey signature verification failed");
   }
+
+  // TOFU pinning: a server must not be able to silently replace a device identity.
+  // A changed key requires an explicit, out-of-band re-verification by the user.
+  await rememberTrustedIdentityIfFirstSeen(userId, deviceId, theirIdentityKey);
 
   // Generate ephemeral key pair
   const ephemeralKeyPair = generateX25519KeyPair();
@@ -336,14 +343,7 @@ async function processPreKeyBundleLocked(
     skippedMessageKeys: [],
   };
 
-  // TOFU — trust on first use
-  await keyStorage.saveTrustedIdentity({
-    userId,
-    deviceId,
-    identityKey: theirIdentityKey,
-    firstSeen: Date.now(),
-    verified: false,
-  });
+  // Identity was pinned (or first-seen) before any session state was created.
 
   const session: StoredSession = {
     userId,
@@ -382,6 +382,10 @@ export async function processPreKeyMessage(
 
   const senderIdentityKey = fromBase64(preKeyInfo.identityKey);
   const senderEphemeralKey = fromBase64(preKeyInfo.ephemeralKey);
+
+  // Authenticate the sender's long-term identity before using it in X3DH.
+  // Without this check, a forged PreKey envelope could overwrite an existing TOFU pin.
+  await assertIdentityMatchesPin(senderUserId, senderDeviceId, senderIdentityKey);
 
   // Find signed prekey
   const signedPreKey = await keyStorage.getSignedPreKey(
@@ -467,14 +471,7 @@ export async function processPreKeyMessage(
     skippedMessageKeys: [],
   };
 
-  // TOFU
-  await keyStorage.saveTrustedIdentity({
-    userId: senderUserId,
-    deviceId: senderDeviceId,
-    identityKey: senderIdentityKey,
-    firstSeen: Date.now(),
-    verified: false,
-  });
+  // Existing pins were checked before X3DH; first-seen pins wait for AEAD authentication.
 
   await keyStorage.saveSession({
     userId: senderUserId,
@@ -485,6 +482,47 @@ export async function processPreKeyMessage(
   });
 
   return sessionState;
+}
+
+/**
+ * Reject a changed identity whenever a pin already exists. First-seen inbound
+ * identities are not pinned until their first message authenticates successfully;
+ * otherwise a forged, undecryptable PreKey envelope could poison the TOFU record.
+ */
+async function assertIdentityMatchesPin(
+  userId: string,
+  deviceId: string,
+  identityKey: Uint8Array
+): Promise<void> {
+  if (identityKey.length !== 32) {
+    throw new Error("Invalid E2EE identity key length");
+  }
+
+  const trusted = await keyStorage.getTrustedIdentity(userId, deviceId);
+  if (trusted && !bytesEqual(trusted.identityKey, identityKey)) {
+    throw new Error(
+      `E2EE identity key changed for device ${deviceId} (user ${userId}); refusing the session to prevent a possible man-in-the-middle attack. Verify the device identity out of band before trusting a replacement key.`
+    );
+  }
+}
+
+/** Pin a first-seen identity after the relevant cryptographic proof succeeded. */
+async function rememberTrustedIdentityIfFirstSeen(
+  userId: string,
+  deviceId: string,
+  identityKey: Uint8Array
+): Promise<void> {
+  await assertIdentityMatchesPin(userId, deviceId, identityKey);
+  const trusted = await keyStorage.getTrustedIdentity(userId, deviceId);
+  if (trusted) return;
+
+  await keyStorage.saveTrustedIdentity({
+    userId,
+    deviceId,
+    identityKey: identityKey.slice(),
+    firstSeen: Date.now(),
+    verified: false,
+  });
 }
 
 // ──────────────────────────────────
@@ -692,6 +730,15 @@ async function decryptMessageLocked(
 
   const plaintext = await aesGcmDecrypt(messageKey, ciphertext, header);
   const decoded = new TextDecoder().decode(plaintext);
+
+  // Only a successfully authenticated first message may establish a TOFU pin.
+  if (wireMessage.type === SignalMessageType.PreKey && wireMessage.preKeyInfo) {
+    await rememberTrustedIdentityIfFirstSeen(
+      senderUserId,
+      senderDeviceId,
+      fromBase64(wireMessage.preKeyInfo.identityKey)
+    );
+  }
 
   session.state = state;
   session.updatedAt = Date.now();
