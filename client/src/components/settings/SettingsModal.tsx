@@ -22,8 +22,6 @@ import AdminServerList from "./AdminServerList";
 import AdminUserList from "./AdminUserList";
 import AdminReportList from "./AdminReportList";
 import AdminServerReportList from "./AdminServerReportList";
-import AdminLogsPanel from "./AdminLogsPanel";
-import CrisisModePanel from "./CrisisModePanel";
 import EncryptionSettings from "./EncryptionSettings";
 import GeneralSettings from "./GeneralSettings";
 import FeedbackSettings from "./FeedbackSettings";
