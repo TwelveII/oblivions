@@ -79,6 +79,17 @@ function SecuritySettings() {
     return () => { cancelled = true; };
   }, []);
 
+  // Refresh invite codes on focus and never render consumed codes.
+  useEffect(() => {
+    const refresh = () => {
+      void authApi.getSignupInvites().then((res) => {
+        if (res.success && res.data) setSignupInvites(res.data);
+      });
+    };
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, []);
+
   // ─── Password State ───
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -214,11 +225,11 @@ function SecuritySettings() {
 
       {isLoadingInvites ? (
         <p className="settings-value">Loading invite codes…</p>
-      ) : signupInvites.length === 0 ? (
+      ) : signupInvites.filter((invite) => !invite.used_at).length === 0 ? (
         <p className="settings-value">You haven't created any signup codes.</p>
       ) : (
         <ul className="signup-invite-list">
-          {signupInvites.map((invite) => {
+          {signupInvites.filter((invite) => !invite.used_at).map((invite) => {
             const status = invite.revoked_at ? "Revoked"
               : invite.used_at ? "Used"
               : invite.expires_at && new Date(invite.expires_at).getTime() <= Date.now() ? "Expired"
