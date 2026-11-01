@@ -43,14 +43,12 @@ const SERVER_ITEMS: NavItem[] = [
 
 /** Platform Settings — platform admin only */
 const PLATFORM_ITEMS: NavItem[] = [
-  { id: "platform", labelKey: "platformLiveKitInstances" },
-  { id: "platform-crisis", labelKey: "platformCrisisTab" },
+  { id: "platform", labelKey: "platformSettings" },
   { id: "platform-servers", labelKey: "platformServersTab" },
   { id: "platform-users", labelKey: "platformUsersTab" },
   { id: "platform-reports", labelKey: "platformReportsTab" },
   { id: "platform-server-reports", labelKey: "platformServerReportsTab" },
   { id: "platform-feedback", labelKey: "platformFeedbackTab" },
-  { id: "platform-logs", labelKey: "platformLogsTab" },
 ];
 
 type SettingsNavProps = {
