@@ -471,7 +471,7 @@ export async function processPreKeyMessage(
     skippedMessageKeys: [],
   };
 
-  // The identity was pinned before the X3DH calculation.
+  // Existing pins were checked before X3DH; first-seen pins wait for AEAD authentication.
 
   await keyStorage.saveSession({
     userId: senderUserId,
