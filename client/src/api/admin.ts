@@ -349,6 +349,7 @@ export async function setAdminUserInviteLimit(userId: string, inviteLimit: numbe
 
 export type CrisisModeState = {
   enabled: boolean;
+  site_enabled: boolean;
   last_run_at: string | null;
 };
 
