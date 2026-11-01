@@ -121,7 +121,6 @@ func (s *adminServerService) DeleteServer(ctx context.Context, adminUserID, serv
 		}
 	}
 
-	recordAuditLog(ctx, s.db, adminUserID, server.OwnerID, serverID, "Platform server soft-deleted", map[string]string{"server_name": server.Name, "reason": reason, "owner_id": server.OwnerID})
 	log.Printf("[admin-server] admin %s soft-deleted server %s (%s)", adminUserID, serverID, server.Name)
 	return nil
 }
@@ -168,7 +167,6 @@ func (s *adminServerService) HardDeleteServer(ctx context.Context, adminUserID, 
 		}
 	}
 
-	recordAuditLog(ctx, s.db, adminUserID, server.OwnerID, serverID, "Platform server permanently deleted", map[string]string{"server_name": server.Name, "reason": reason, "owner_id": server.OwnerID, "was_active": fmt.Sprint(wasActive)})
 	log.Printf("[admin-server] admin %s hard-deleted server %s (%s)", adminUserID, serverID, server.Name)
 	return nil
 }
