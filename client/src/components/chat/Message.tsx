@@ -122,7 +122,7 @@ function Message({ message, isCompact, pending }: MessageProps) {
 
   const isOwner = currentUser?.id === message.user_id;
   // Report: other users' messages only; a deleted author has nothing left to eject.
-  const canReport = !isOwner && !!message.author && !message.author.deleted_at;
+  const canReport = mode !== "dm" && !isOwner && !!message.author && !message.author.deleted_at;
   const blockedUserIds = useBlockStore((s) => s.blockedUserIds);
   const isReplyToBlocked =
     !!message.referenced_message?.author && blockedUserIds.includes(message.referenced_message.author.id);
