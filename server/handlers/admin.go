@@ -325,7 +325,7 @@ func (h *AdminHandler) GetLiveKitInstanceMetrics(w http.ResponseWriter, r *http.
 // status/presence/admin are repeatable (empty = all).
 func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 	page, err := h.livekitAdminService.ListUsersPaged(r.Context(),
-		parseAdminListParams(r, []string{"active", "banned", "soft_deleted", "tombstone"}))
+		parseAdminListParams(r, []string{"active", "banned", "soft_deleted"}))
 	if err != nil {
 		pkg.Error(w, err)
 		return
