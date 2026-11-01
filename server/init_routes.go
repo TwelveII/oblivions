@@ -83,8 +83,6 @@ func initRoutes(
 	mux.Handle("PATCH /api/users/me/profile", auth(h.Member.UpdateProfile))
 	mux.Handle("POST /api/users/me/password", auth(h.Auth.ChangePassword))
 		mux.Handle("POST /api/users/me/avatar", auth(h.Avatar.UploadUserAvatar))
-	mux.Handle("POST /api/users/me/wallpaper", auth(h.Avatar.UploadUserWallpaper))
-	mux.Handle("DELETE /api/users/me/wallpaper", auth(h.Avatar.DeleteUserWallpaper))
 	mux.Handle("GET /api/users/me/preferences", auth(h.Preferences.Get))
 	mux.Handle("POST /api/users/me/dismiss-download-prompt", auth(h.DownloadPrompt.Dismiss))
 	mux.Handle("POST /api/users/me/dismiss-welcome", auth(h.DownloadPrompt.DismissWelcome))
