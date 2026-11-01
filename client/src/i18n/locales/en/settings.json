@@ -638,6 +638,7 @@
   "platformLogsCategoryWs": "WebSocket",
   "platformLogsCategoryAuth": "Auth",
   "platformLogsCategoryGeneral": "General",
+  "platformLogsCategoryAudit": "Audit",
   "platformLogsCategoryFeedback": "Feedback",
   "platformLogsCategoryLiveKit": "LiveKit",
   "platformLogsCategoryCleaner": "Cleaner",
