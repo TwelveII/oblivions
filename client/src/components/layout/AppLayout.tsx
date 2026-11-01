@@ -48,7 +48,6 @@ import AFKKickPopup from "../voice/AFKKickPopup";
 import ConnectionBanner from "../shared/ConnectionBanner";
 import { useAuthStore } from "../../stores/authStore";
 import { isCapacitor, resolveAssetUrl } from "../../utils/constants";
-import { resolveWallpaperBlobUrl } from "../../utils/wallpaperCache";
 import { useServerStore } from "../../stores/serverStore";
 import { useChannelStore } from "../../stores/channelStore";
 import { useMemberStore } from "../../stores/memberStore";
@@ -92,42 +91,6 @@ function AppLayout() {
   const showRecoveryPrompt = useE2EEStore((s) => s.showRecoveryPrompt);
 
   // Blur + transparent classes are applied at App root level so they also
-  // affect pre-auth pages. Wallpaper stays here because it depends on auth
-  // (user.wallpaper_url) and must not leak to login screens.
-  const wallpaperUrl = useAuthStore((s) => s.user?.wallpaper_url ?? null);
-  const wallpaperEnabled = useSettingsStore((s) => s.wallpaperEnabled);
-  const pendingWallpaperPreviewUrl = useSettingsStore((s) => s.pendingWallpaperPreviewUrl);
-  useEffect(() => {
-    if (pendingWallpaperPreviewUrl) {
-      document.documentElement.style.setProperty("--wallpaper", `url(${pendingWallpaperPreviewUrl})`);
-      return;
-    }
-
-    const remoteUrl = wallpaperEnabled && wallpaperUrl ? resolveAssetUrl(wallpaperUrl) : null;
-
-    // Clear immediately (sync) when nothing to show — avoids stale frame during async fetch
-    if (!remoteUrl) {
-      document.documentElement.style.setProperty("--wallpaper", "none");
-      return;
-    }
-
-    let previousObjectUrl: string | null = null;
-    let cancelled = false;
-
-    resolveWallpaperBlobUrl(remoteUrl).then((blobUrl) => {
-      if (cancelled) {
-        if (blobUrl) URL.revokeObjectURL(blobUrl);
-        return;
-      }
-      previousObjectUrl = blobUrl;
-      document.documentElement.style.setProperty("--wallpaper", blobUrl ? `url(${blobUrl})` : "none");
-    });
-
-    return () => {
-      cancelled = true;
-      if (previousObjectUrl) URL.revokeObjectURL(previousObjectUrl);
-    };
-  }, [wallpaperUrl, wallpaperEnabled, pendingWallpaperPreviewUrl]);
 
   const activeServerId = useServerStore((s) => s.activeServerId);
   const servers = useServerStore((s) => s.servers);
