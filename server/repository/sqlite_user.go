@@ -496,6 +496,8 @@ func userStateClause(statuses []string) string {
 			ors = append(ors, "u.is_platform_banned = 1")
 		case "soft_deleted":
 			ors = append(ors, "(u.deleted_at IS NOT NULL AND u.is_hard_deleted = 0)")
+		case "tombstone":
+			ors = append(ors, "u.is_hard_deleted = 1")
 				}
 	}
 	if len(ors) == 0 {
@@ -530,7 +532,6 @@ func userAdminClause(admin []string) string {
 // to username/id/display_name. Filters combine with AND across dimensions, OR within.
 func buildAdminUserFilter(statuses, presences, admin []string, search string) (string, []any) {
 	var clauses []string
-	clauses = append(clauses, "u.is_hard_deleted = 0")
 	var args []any
 
 	if c := userStateClause(statuses); c != "" {
