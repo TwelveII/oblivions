@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ type AuthHandler struct {
 	urlSigner        services.FileURLSigner
 	fileCookieTTL    time.Duration
 	credentialRL     *ratelimit.MessageRateLimiter // credential-store failure reports, per user
+	crisisModeService services.CrisisModeService
 }
 
 // NewAuthHandler creates a new AuthHandler. All limiters may be nil to disable rate limiting.
@@ -38,7 +40,12 @@ func NewAuthHandler(
 	urlSigner services.FileURLSigner,
 	fileCookieTTL time.Duration,
 	credentialRL *ratelimit.MessageRateLimiter,
+	crisisMode ...services.CrisisModeService,
 ) *AuthHandler {
+	var crisisModeService services.CrisisModeService
+	if len(crisisMode) > 0 {
+		crisisModeService = crisisMode[0]
+	}
 	return &AuthHandler{
 		authService:      authService,
 		loginLimiter:     loginLimiter,
@@ -48,7 +55,20 @@ func NewAuthHandler(
 		urlSigner:        urlSigner,
 		fileCookieTTL:    fileCookieTTL,
 		credentialRL:     credentialRL,
+		crisisModeService: crisisModeService,
 	}
+}
+
+
+func (h *AuthHandler) siteEnabled(ctx context.Context) (bool, error) {
+	if h.crisisModeService == nil {
+		return true, nil
+	}
+	state, err := h.crisisModeService.GetState(ctx)
+	if err != nil {
+		return false, err
+	}
+	return state.SiteEnabled, nil
 }
 
 // CredentialStoreFailure handles POST /api/auth/credential-store-failure.
@@ -101,6 +121,11 @@ func clientInfo(r *http.Request) models.ClientInfo {
 // First registered user automatically becomes Owner.
 // IP-based rate limiting prevents registration spam.
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
+	if enabled, err := h.siteEnabled(r.Context()); err != nil || !enabled {
+		pkg.ErrorWithMessage(w, http.StatusServiceUnavailable, "site temporarily unavailable")
+		return
+	}
+
 	ip := ratelimit.ExtractIP(r)
 	if h.registerLimiter != nil && !h.registerLimiter.Allow(ip) {
 		retryAfter := h.registerLimiter.RetryAfterSeconds(ip)
@@ -173,6 +198,18 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	enabled, siteErr := h.siteEnabled(r.Context())
+	if siteErr != nil {
+		_ = h.authService.Logout(r.Context(), tokens.RefreshToken)
+		pkg.ErrorWithMessage(w, http.StatusServiceUnavailable, "site temporarily unavailable")
+		return
+	}
+	if !enabled && !tokens.User.IsPlatformAdmin {
+		_ = h.authService.Logout(r.Context(), tokens.RefreshToken)
+		pkg.ErrorWithMessage(w, http.StatusServiceUnavailable, "site temporarily unavailable")
+		return
+	}
+
 	if h.loginLimiter != nil {
 		h.loginLimiter.Reset(ip)
 	}
@@ -201,6 +238,13 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	tokens, err := h.authService.RefreshToken(r.Context(), req.RefreshToken, clientInfo(r))
 	if err != nil {
 		pkg.Error(w, err)
+		return
+	}
+
+	enabled, siteErr := h.siteEnabled(r.Context())
+	if siteErr != nil || (!enabled && !tokens.User.IsPlatformAdmin) {
+		_ = h.authService.Logout(r.Context(), tokens.RefreshToken)
+		pkg.ErrorWithMessage(w, http.StatusServiceUnavailable, "site temporarily unavailable")
 		return
 	}
 
