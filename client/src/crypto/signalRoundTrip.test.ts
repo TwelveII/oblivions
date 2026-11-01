@@ -151,10 +151,14 @@ describe("Signal round-trip", () => {
   });
 
   it("should refuse a prekey bundle that changes a previously pinned device identity", async () => {
-    // First contact pins Bob's identity on Alice's device.
-    await as(alice, () =>
-      establishAndEncrypt(BOB.userId, BOB.deviceId, bundleOf(bob), "first contact")
-    );
+    // Alice already has Bob's independently pinned identity.
+    alice.trustedIdentities.set(`${BOB.userId}:${BOB.deviceId}`, {
+      userId: BOB.userId,
+      deviceId: BOB.deviceId,
+      identityKey: bob.identity.publicKey,
+      firstSeen: 1,
+      verified: true,
+    });
 
     // A server-side attacker substitutes a new X25519 identity while replaying the
     // otherwise-valid signing key and signed prekey. The existing pin must win.
