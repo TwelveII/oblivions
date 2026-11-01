@@ -46,7 +46,7 @@ import DiscoveryOverlay from "../discovery/DiscoveryOverlay";
 import ScreenPicker from "../voice/ScreenPicker";
 import AFKKickPopup from "../voice/AFKKickPopup";
 import ConnectionBanner from "../shared/ConnectionBanner";
-import { isCapacitor, resolveAssetUrl } from "../../utils/constants";
+import { isCapacitor } from "../../utils/constants";
 import { useServerStore } from "../../stores/serverStore";
 import { useChannelStore } from "../../stores/channelStore";
 import { useMemberStore } from "../../stores/memberStore";
