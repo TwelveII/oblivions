@@ -97,3 +97,58 @@ button:disabled { cursor:not-allowed; }
 @media (prefers-reduced-motion: reduce) {
   *,*::before,*::after { scroll-behavior:auto !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; }
 }
+
+/* Conversation workspace */
+.main-area { background:transparent; }
+.chat-area { background:var(--bg-1); border:1px solid var(--b1); border-radius:12px; overflow:hidden; }
+.messages-scroll { padding:18px clamp(14px,2.2vw,30px) 24px; scroll-padding-block:24px; }
+.msg { padding-block:2px; }
+.msg-row { gap:11px; }
+.msg-body { background:transparent; border:1px solid transparent; box-shadow:none; border-radius:9px; padding:5px 9px; max-width:min(78%,820px); }
+.msg:not(.grouped) .msg-body { background:rgba(255,255,255,.018); border-color:rgba(220,231,244,.045); }
+.msg:hover .msg-body { background:rgba(255,255,255,.028); border-color:var(--b1); }
+.msg-name { font-size:13px; font-weight:700; letter-spacing:-.01em; }
+.msg-time { font-size:10px; color:#718091; }
+.msg-text { font-size:14px; line-height:1.62; color:#dce2e9; }
+.msg-text code { background:#0a0e13; border-color:var(--b1); color:#c2cfdd; }
+.msg-hover-actions { background:#202832; border-color:var(--b2); border-radius:8px; }
+.msg-reaction-btn { background:#151c24; border-color:var(--b1); }
+.msg-reaction-btn.active { background:rgba(168,183,201,.13); border-color:rgba(168,183,201,.45); }
+.msg-attachment-file { background:#111820; border-color:var(--b1); border-radius:10px; }
+.msg-welcome h2 { font-size:clamp(25px,3vw,34px); letter-spacing:-.055em; }
+.msg-welcome-icon { background:#19212a; border:1px solid var(--b1); }
+.dm-header { min-height:54px; height:auto; padding:10px 18px; margin:0 0 10px; border:1px solid var(--b1); border-radius:11px; background:#11171e; box-shadow:none; }
+.dm-header-name { font-size:14px; font-weight:700; letter-spacing:-.02em; }
+.chat-msg-viewport { background:transparent; }
+.member-label,.member-label-toggle { color:#8794a3; font-size:10px; letter-spacing:.13em; }
+.member-name { color:#cbd3dc; font-weight:600; }
+.member-activity { color:#718091; }
+
+/* Settings should feel like a native control room, not stacked generic dialogs. */
+.settings-overlay { gap:12px; }
+.settings-nav { width:230px; padding:18px 12px; background:#10151b; border-color:var(--b1); box-shadow:none; }
+.settings-nav-label { padding:15px 10px 6px; font-size:9px; letter-spacing:.16em; }
+.settings-nav-item { min-height:36px; padding:8px 10px; border-radius:7px; font-size:12px; }
+.settings-nav-item.active { color:#eef2f6; background:#202a35; box-shadow:inset 2px 0 #a8b7c9; }
+.settings-content { padding:clamp(22px,4vw,42px); background:#10151b; border-color:var(--b1); box-shadow:none; }
+.settings-section { max-width:900px; }
+.settings-section-title { font-size:20px; letter-spacing:-.035em; }
+.settings-section-desc { max-width:680px; line-height:1.65; }
+.settings-label { font-size:10px; letter-spacing:.12em; }
+.settings-input,.settings-select,.settings-textarea { background:#0b1016; border-color:var(--b2); }
+.settings-btn { border:1px solid rgba(220,231,244,.14); background:#aab8c8; color:#10151b; font-weight:750; }
+.settings-btn:hover { background:#d0dbe7; }
+.settings-btn-secondary { background:#202a35; color:#d5dde6; border-color:var(--b1); }
+.settings-btn-danger { background:rgba(205,94,94,.1); color:#e28b8b; border-color:rgba(205,94,94,.2); }
+
+/* Responsive refinements: keep controls comfortably tappable and content uncluttered. */
+@media (max-width:768px) {
+  .mqvi-app { padding:0; gap:0; }
+  .chat-area { border-radius:0; border-left:0; border-right:0; }
+  .messages-scroll { padding:12px 10px 18px; }
+  .msg-body { max-width:100%; }
+  .dm-header { border-radius:0; border-left:0; border-right:0; min-height:50px; }
+  .settings-overlay { padding:0; gap:0; }
+  .settings-nav { border-radius:0; border:0; }
+  .settings-content { border-radius:0; border:0; padding:22px 16px; }
+}
