@@ -185,6 +185,18 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 		return nil, fmt.Errorf("collect owned servers: %w", err)
 	}
 	for _, sid := range serverIDs {
+		// Ownership is transferred when another member remains, so those servers and
+		// their shared assets must survive. Collect whole-server files only when the
+		// repository's deletion transaction will remove an empty server.
+		var otherMembers int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM server_members WHERE server_id = ? AND user_id <> ?`, sid, userID,
+		).Scan(&otherMembers); err != nil {
+			return nil, fmt.Errorf("count other members for owned server %s: %w", sid, err)
+		}
+		if otherMembers > 0 {
+			continue
+		}
 		serverPlan, err := s.CollectServerFiles(ctx, sid)
 		if err != nil {
 			return nil, fmt.Errorf("collect owned server %s files: %w", sid, err)
@@ -204,7 +216,11 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 		    SELECT c.id FROM channels c
 		    JOIN servers s ON c.server_id = s.id
 		    WHERE s.owner_id = ?
-		  )`, userID, userID)
+		      AND NOT EXISTS (
+		        SELECT 1 FROM server_members sm
+		        WHERE sm.server_id = s.id AND sm.user_id <> ?
+		      )
+		  )`, userID, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("collect user message files: %w", err)
 	}
@@ -220,7 +236,7 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 			SELECT c.id FROM channels c
 			JOIN servers s ON c.server_id = s.id
 			WHERE s.owner_id = ?
-		)`, userID, userID)
+		)`, userID, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("collect user voice files: %w", err)
 	}
@@ -243,7 +259,14 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 		SELECT file_url, COALESCE(file_size, 0)
 		FROM soundboard_sounds
 		WHERE uploaded_by = ?
-		  AND server_id NOT IN (SELECT id FROM servers WHERE owner_id = ?)`, userID, userID)
+		  AND server_id NOT IN (
+		    SELECT s.id FROM servers s
+		    WHERE s.owner_id = ?
+		      AND NOT EXISTS (
+		        SELECT 1 FROM server_members sm
+		        WHERE sm.server_id = s.id AND sm.user_id <> ?
+		      )
+		  )`, userID, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("collect user soundboard files: %w", err)
 	}
