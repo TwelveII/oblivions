@@ -10,12 +10,8 @@ type PlatformActionDialogProps = {
   reasonLabel: string;
   reasonPlaceholder: string;
   confirmLabel: string;
-  onConfirm: (reason: string, hardDelete?: boolean) => void;
-  onCancel: () => void;
-  /** When true, adds a "Permanently delete" checkbox. Soft-delete is the default. */
-  showHardDeleteToggle?: boolean;
-  hardDeleteLabel?: string;
-  hardDeleteHint?: string;
+  onConfirm: (reason: string) => void;
+    onCancel: () => void;
 };
 
 function PlatformActionDialog({
@@ -26,13 +22,9 @@ function PlatformActionDialog({
   confirmLabel,
   onConfirm,
   onCancel,
-  showHardDeleteToggle = false,
-  hardDeleteLabel,
-  hardDeleteHint,
 }: PlatformActionDialogProps) {
   const { t } = useTranslation("settings");
   const [reason, setReason] = useState("");
-  const [hardDelete, setHardDelete] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -49,7 +41,7 @@ function PlatformActionDialog({
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    onConfirm(reason.trim(), showHardDeleteToggle ? hardDelete : undefined);
+    onConfirm(reason.trim());
   }
 
   return createPortal(
@@ -77,32 +69,7 @@ function PlatformActionDialog({
             maxLength={500}
           />
 
-          {showHardDeleteToggle && (
-            <label
-              style={{
-                display: "flex",
-                alignItems: "flex-start",
-                gap: 8,
-                marginTop: 12,
-                fontSize: 13,
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={hardDelete}
-                onChange={(e) => setHardDelete(e.target.checked)}
-                style={{ marginTop: 2 }}
-              />
-              <span>
-                <strong>{hardDeleteLabel ?? t("permanentDelete")}</strong>
-                {hardDeleteHint && (
-                  <span className="settings-hint" style={{ display: "block", marginTop: 2 }}>
-                    {hardDeleteHint}
-                  </span>
-                )}
-              </span>
-            </label>
-          )}
+
 
           <div className="modal-actions">
             <button
