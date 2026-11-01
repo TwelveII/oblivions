@@ -794,3 +794,28 @@ func (h *AdminHandler) DeleteReportedMessage(w http.ResponseWriter, r *http.Requ
 
 	pkg.JSON(w, http.StatusOK, map[string]string{"message": "reported message deleted"})
 }
+
+
+// DeleteReport -- DELETE /api/admin/reports/{id}
+func (h *AdminHandler) DeleteReport(w http.ResponseWriter, r *http.Request) {
+	if _, ok := r.Context().Value(ctxkeys.User).(*models.User); !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" { pkg.ErrorWithMessage(w, http.StatusBadRequest, "report id is required"); return }
+	if err := h.reportService.DeleteReport(r.Context(), id); err != nil { pkg.Error(w, err); return }
+	pkg.JSON(w, http.StatusOK, map[string]string{"message": "report deleted"})
+}
+
+// DeleteServerReport -- DELETE /api/admin/server-reports/{id}
+func (h *AdminHandler) DeleteServerReport(w http.ResponseWriter, r *http.Request) {
+	if _, ok := r.Context().Value(ctxkeys.User).(*models.User); !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" { pkg.ErrorWithMessage(w, http.StatusBadRequest, "report id is required"); return }
+	if err := h.reportService.DeleteServerReport(r.Context(), id); err != nil { pkg.Error(w, err); return }
+	pkg.JSON(w, http.StatusOK, map[string]string{"message": "server report deleted"})
+}
