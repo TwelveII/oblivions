@@ -796,6 +796,7 @@ function Message({ message, isCompact, pending }: MessageProps) {
           user={profileTarget.user}
           position={{ top: profileTarget.top, left: profileTarget.left }}
           onClose={() => setProfileTarget(null)}
+          allowReporting={mode !== "dm"}
         />
       )}
     </div>
