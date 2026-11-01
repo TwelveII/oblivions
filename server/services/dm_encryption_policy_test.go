@@ -26,6 +26,7 @@ type policyDMRepo struct {
 	updated      int
 	pendingCalls int
 	pendingErr   error
+	lastMessage  *models.DMMessage
 }
 
 func (r *policyDMRepo) GetChannelByID(context.Context, string) (*models.DMChannel, error) {
@@ -36,8 +37,9 @@ func (r *policyDMRepo) GetMessageByID(context.Context, string) (*models.DMMessag
 	return r.message, nil
 }
 
-func (r *policyDMRepo) CreateMessage(context.Context, *models.DMMessage) error {
+func (r *policyDMRepo) CreateMessage(_ context.Context, message *models.DMMessage) error {
 	r.created++
+	r.lastMessage = message
 	return errReachedPersistence
 }
 
@@ -243,4 +245,25 @@ func (privacyRequestUserRepo) GetByID(_ context.Context, id string) (*models.Use
 		return &models.User{ID: id, DMPrivacy: "message_request"}, nil
 	}
 	return &models.User{ID: id}, nil
+}
+
+
+// Encrypted DM rows must never retain plaintext even if a client submits both fields.
+func TestDMSendDoesNotPersistPlaintextAlongsideCiphertext(t *testing.T) {
+	svc, repo := policyDMService(true)
+	_, _, err := svc.SendMessage(context.Background(), "alice", "c1", &models.CreateDMMessageRequest{
+		Content: "plaintext that must not reach storage",
+		EncryptionVersion: 1,
+		Ciphertext: encryptedField(1, "CIPHER"),
+		SenderDeviceID: encryptedField(1, "dev1"),
+	})
+	if !errors.Is(err, errReachedPersistence) {
+		t.Fatalf("send error = %v, want request to reach persistence", err)
+	}
+	if repo.lastMessage == nil {
+		t.Fatal("message was not passed to persistence")
+	}
+	if repo.lastMessage.Content != nil {
+		t.Fatalf("encrypted DM retained plaintext content %q", *repo.lastMessage.Content)
+	}
 }
