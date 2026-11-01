@@ -58,8 +58,7 @@ func TestSQLiteUserRepo_HardDeletePreservesPlatformBan(t *testing.T) {
 		t.Fatal("user ID platform ban was erased by account deletion")
 	}
 
-	// Deleting the moderator who issued the ban must detach attribution without
-	// deleting the ban itself.
+	// The issuer ID is intentionally retained as historical moderation attribution.
 	if err := repo.HardDeleteUser(ctx, "moderator", false); err != nil {
 		t.Fatalf("hard delete moderator: %v", err)
 	}
@@ -71,14 +70,14 @@ func TestSQLiteUserRepo_HardDeletePreservesPlatformBan(t *testing.T) {
 		t.Fatal("platform ban was erased when its issuing moderator was deleted")
 	}
 
-	var issuerIsNull int
+	var preservedIssuer int
 	if err := db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM platform_bans
-		WHERE email = 'blocked@example.test' AND banned_by IS NULL
-	`).Scan(&issuerIsNull); err != nil {
-		t.Fatalf("check detached moderator reference: %v", err)
+		WHERE email = 'blocked@example.test' AND banned_by = 'moderator'
+	`).Scan(&preservedIssuer); err != nil {
+		t.Fatalf("check historical moderator attribution: %v", err)
 	}
-	if issuerIsNull != 1 {
-		t.Fatalf("expected one preserved ban with detached issuer, got %d", issuerIsNull)
+	if preservedIssuer != 1 {
+		t.Fatalf("expected one preserved ban with historical issuer ID, got %d", preservedIssuer)
 	}
 }
