@@ -24,7 +24,7 @@ func recordAuditLog(ctx context.Context, db *sql.DB, actorID, targetID, serverID
 	if serverID != "" { sid = serverID }
 	_, _ = db.ExecContext(ctx,
 		`INSERT INTO app_logs (level, category, user_id, server_id, message, metadata)
-		 VALUES ('info', 'general', ?, ?, ?, ?)`,
+		 VALUES ('info', 'audit', ?, ?, ?, ?)`,
 		userID, sid, message, raw,
 	)
 }
