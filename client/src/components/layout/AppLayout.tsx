@@ -57,7 +57,6 @@ import { registerVoiceLeave } from "../../stores/shared/voiceControl";
 import { useMessageStore } from "../../stores/messageStore";
 import { useReadStateStore } from "../../stores/readStateStore";
 import { useInviteStore } from "../../stores/inviteStore";
-import { useSettingsStore } from "../../stores/settingsStore";
 import { useSoundboardStore } from "../../stores/soundboardStore";
 import { useNotificationBadge } from "../../hooks/useNotificationBadge";
 import { useReviewPrompt } from "../../hooks/useReviewPrompt";
