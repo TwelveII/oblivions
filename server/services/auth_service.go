@@ -287,6 +287,13 @@ func (s *authService) Register(ctx context.Context, req *models.CreateUserReques
 	}
 
 	err = database.WithTx(ctx, s.db, func(tx *sql.Tx) error {
+        // Expired reservations stop blocking registration automatically.
+        var reserved int
+        if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM username_reservations
+            WHERE username = ? COLLATE NOCASE AND reserved_until > CURRENT_TIMESTAMP`, req.Username).Scan(&reserved); err != nil {
+            return fmt.Errorf("check username reservation: %w", err)
+        }
+        if reserved > 0 { return fmt.Errorf("%w: username is temporarily reserved after account deletion", pkg.ErrAlreadyExists) }
 		// Claim first. This UPDATE acquires SQLite's write lock and only
 		// one concurrent registration can claim this code.
 		var inviterID string
