@@ -786,6 +786,28 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 	_ = byAdmin // retained for repository interface compatibility
 
 	return database.WithTx(ctx, db, func(tx *sql.Tx) error {
+		// Transfer every owned server to an existing member before removing the deleted
+		// owner's membership. If a server has no other members, delete that empty server.
+		ownedRows, err := tx.QueryContext(ctx, `SELECT id FROM servers WHERE owner_id = ? ORDER BY id`, userID)
+		if err != nil { return fmt.Errorf("failed to list owned servers: %w", err) }
+		var ownedServerIDs []string
+		for ownedRows.Next() {
+			var id string
+			if err := ownedRows.Scan(&id); err != nil { ownedRows.Close(); return fmt.Errorf("failed to read owned server: %w", err) }
+			ownedServerIDs = append(ownedServerIDs, id)
+		}
+		if err := ownedRows.Err(); err != nil { ownedRows.Close(); return fmt.Errorf("failed to iterate owned servers: %w", err) }
+		if err := ownedRows.Close(); err != nil { return fmt.Errorf("failed to close owned servers: %w", err) }
+		for _, serverID := range ownedServerIDs {
+			var successorID string
+			err := tx.QueryRowContext(ctx, `SELECT user_id FROM server_members WHERE server_id = ? AND user_id <> ? ORDER BY joined_at ASC, user_id ASC LIMIT 1`, serverID, userID).Scan(&successorID)
+			if errors.Is(err, sql.ErrNoRows) {
+				if _, err := tx.ExecContext(ctx, `DELETE FROM servers WHERE id = ?`, serverID); err != nil { return fmt.Errorf("failed to delete empty owned server %q: %w", serverID, err) }
+				continue
+			}
+			if err != nil { return fmt.Errorf("failed to select owner successor for server %q: %w", serverID, err) }
+			if _, err := tx.ExecContext(ctx, `UPDATE servers SET owner_id = ? WHERE id = ? AND owner_id = ?`, successorID, serverID, userID); err != nil { return fmt.Errorf("failed to transfer server %q: %w", serverID, err) }
+		}
 		// Clean account-specific rows that either lack a cascading FK or need explicit SET NULL
 		// behavior before the final DELETE. Remaining ON DELETE CASCADE relations are handled by SQLite.
 		manualCascadeDeletes := []string{
@@ -876,9 +898,6 @@ func (r *sqliteUserRepo) HardDeleteUser(ctx context.Context, userID string, byAd
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM dm_channels WHERE user1_id = ? OR user2_id = ?`, userID, userID); err != nil {
 			return fmt.Errorf("failed to delete DM conversations: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM servers WHERE owner_id = ?`, userID); err != nil {
-			return fmt.Errorf("failed to delete owned servers: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, userID); err != nil {
 			return fmt.Errorf("failed to permanently delete user row: %w", err)
