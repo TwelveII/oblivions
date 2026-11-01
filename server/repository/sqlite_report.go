@@ -112,7 +112,7 @@ func (r *sqliteReportRepo) listByStatus(ctx context.Context, status models.Repor
 	baseQuery := `
 		SELECT r.id, r.reporter_id, r.reported_user_id, r.reason, r.description,
 		       r.status, r.resolved_by, r.resolved_at, r.created_at,
-		       r.message_id, r.dm_message_id, r.voice_message_id, r.message_excerpt, r.excerpt_source,
+		       r.message_id, r.dm_message_id, (SELECT dm_channel_id FROM dm_messages WHERE id = r.dm_message_id), r.voice_message_id, r.message_excerpt, r.excerpt_source,
 		       reporter.username, reporter.display_name,
 		       reported.username, reported.display_name
 		FROM reports r
@@ -147,17 +147,21 @@ func (r *sqliteReportRepo) listByStatus(ctx context.Context, status models.Repor
 		var resolvedBy sql.NullString
 		var resolvedAt sql.NullString
 		var reporterDisplay, reportedDisplay sql.NullString
+		var dmChannelID sql.NullString
 
 		if err := rows.Scan(
 			&rw.ID, &rw.ReporterID, &rw.ReportedUserID, &rw.Reason, &rw.Description,
 			&rw.Status, &resolvedBy, &resolvedAt, &rw.CreatedAt,
-			&rw.MessageID, &rw.DMMessageID, &rw.VoiceMessageID, &rw.MessageExcerpt, &rw.ExcerptSource,
+			&rw.MessageID, &rw.DMMessageID, &dmChannelID, &rw.VoiceMessageID, &rw.MessageExcerpt, &rw.ExcerptSource,
 			&rw.ReporterUsername, &reporterDisplay,
 			&rw.ReportedUsername, &reportedDisplay,
 		); err != nil {
 			return nil, 0, fmt.Errorf("failed to scan report row: %w", err)
 		}
 
+		if dmChannelID.Valid {
+			rw.DMChannelID = &dmChannelID.String
+		}
 		if resolvedBy.Valid {
 			rw.ResolvedBy = &resolvedBy.String
 		}
