@@ -284,7 +284,7 @@ async function processPreKeyBundleLocked(
 
   // TOFU pinning: a server must not be able to silently replace a device identity.
   // A changed key requires an explicit, out-of-band re-verification by the user.
-  await assertTrustedIdentity(userId, deviceId, theirIdentityKey);
+  await rememberTrustedIdentityIfFirstSeen(userId, deviceId, theirIdentityKey);
 
   // Generate ephemeral key pair
   const ephemeralKeyPair = generateX25519KeyPair();
@@ -382,7 +382,7 @@ export async function processPreKeyMessage(
 
   // Authenticate the sender's long-term identity before using it in X3DH.
   // Without this check, a forged PreKey envelope could overwrite an existing TOFU pin.
-  await assertTrustedIdentity(senderUserId, senderDeviceId, senderIdentityKey);
+  await assertIdentityMatchesPin(senderUserId, senderDeviceId, senderIdentityKey);
 
   // Find signed prekey
   const signedPreKey = await keyStorage.getSignedPreKey(
@@ -482,13 +482,11 @@ export async function processPreKeyMessage(
 }
 
 /**
- * Trust on first use for a remote device identity.
- *
- * Existing pins are immutable here: a server-side key replacement must never be
- * silently accepted as a new identity. Key changes need an explicit user-facing
- * verification/reset flow; until that exists, refusing is the safe behaviour.
+ * Reject a changed identity whenever a pin already exists. First-seen inbound
+ * identities are not pinned until their first message authenticates successfully;
+ * otherwise a forged, undecryptable PreKey envelope could poison the TOFU record.
  */
-async function assertTrustedIdentity(
+async function assertIdentityMatchesPin(
   userId: string,
   deviceId: string,
   identityKey: Uint8Array
@@ -498,14 +496,22 @@ async function assertTrustedIdentity(
   }
 
   const trusted = await keyStorage.getTrustedIdentity(userId, deviceId);
-  if (trusted) {
-    if (!bytesEqual(trusted.identityKey, identityKey)) {
-      throw new Error(
-        `E2EE identity key changed for device ${deviceId} (user ${userId}); refusing the session to prevent a possible man-in-the-middle attack. Verify the device identity out of band before trusting a replacement key.`
-      );
-    }
-    return;
+  if (trusted && !bytesEqual(trusted.identityKey, identityKey)) {
+    throw new Error(
+      `E2EE identity key changed for device ${deviceId} (user ${userId}); refusing the session to prevent a possible man-in-the-middle attack. Verify the device identity out of band before trusting a replacement key.`
+    );
   }
+}
+
+/** Pin a first-seen identity after the relevant cryptographic proof succeeded. */
+async function rememberTrustedIdentityIfFirstSeen(
+  userId: string,
+  deviceId: string,
+  identityKey: Uint8Array
+): Promise<void> {
+  await assertIdentityMatchesPin(userId, deviceId, identityKey);
+  const trusted = await keyStorage.getTrustedIdentity(userId, deviceId);
+  if (trusted) return;
 
   await keyStorage.saveTrustedIdentity({
     userId,
@@ -721,6 +727,15 @@ async function decryptMessageLocked(
 
   const plaintext = await aesGcmDecrypt(messageKey, ciphertext, header);
   const decoded = new TextDecoder().decode(plaintext);
+
+  // Only a successfully authenticated first message may establish a TOFU pin.
+  if (wireMessage.type === SignalMessageType.PreKey && wireMessage.preKeyInfo) {
+    await rememberTrustedIdentityIfFirstSeen(
+      senderUserId,
+      senderDeviceId,
+      fromBase64(wireMessage.preKeyInfo.identityKey)
+    );
+  }
 
   session.state = state;
   session.updatedAt = Date.now();
