@@ -160,6 +160,7 @@ func main() {
 
 	// 10d. Cleanup worker — daily soft-delete TTL processing, orphan walk, retry queue
 	svcs.Cleanup.Start()
+	svcs.CrisisMode.Start()
 
 	// 12. Handler layer
 	h := initHandlers(svcs, repos, limiters, hub, cfg, encryptionKey, urlSigner)
@@ -287,6 +288,7 @@ func main() {
 	<-done
 	log.Println("[main] shutting down...")
 
+	svcs.CrisisMode.Stop()
 	svcs.Cleanup.Stop()
 	geoUpdater.Stop()
 	if err := geoReader.Close(); err != nil {
