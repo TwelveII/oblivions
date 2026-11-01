@@ -723,8 +723,9 @@ func (s *authService) EmergencyDeleteSelf(ctx context.Context, userID, password 
  if err := s.userRepo.HardDeleteUser(ctx, userID, false); err != nil {
   return fmt.Errorf("permanently delete account: %w", err)
  }
- s.fileCleanup.Execute(plan)
+ // Disconnect immediately after the database commit, before potentially slow disk cleanup.
  if s.hub != nil { s.hub.DisconnectUser(userID) }
+ s.fileCleanup.Execute(plan)
  return nil
 }
 
