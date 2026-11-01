@@ -165,7 +165,8 @@ function AdminUserList() {
         limit: pageSize,
         offset: page * pageSize,
         search: debouncedSearch || undefined,
-        statuses: statusFilter,
+        // Exclude legacy hard-delete tombstones from the admin UI entirely.
+        statuses: statusFilter.length ? statusFilter : ["active", "banned", "soft_deleted"],
         presences: presenceFilter,
         admin: adminFilter,
         sort: sortKey,
