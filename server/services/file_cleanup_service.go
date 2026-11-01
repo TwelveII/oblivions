@@ -37,7 +37,7 @@ type FileCleanupService interface {
 // CleanupPlan holds file references collected before a DB delete.
 type CleanupPlan struct {
 	refs     []fileRef      // files with per-user quota tracking
-	urls     []string       // standalone URLs without quota (avatars, wallpapers, icons)
+	urls     []string       // standalone URLs without quota (avatars, icons)
 	livekit  []livekitEntry // LiveKit instances to clean up (decrement or delete)
 	skipUser string         // if set, skip quota release for this user (being deleted)
 }
@@ -167,16 +167,13 @@ func (s *fileCleanupService) CollectServerFiles(ctx context.Context, serverID st
 func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string) (*CleanupPlan, error) {
 	plan := &CleanupPlan{skipUser: userID}
 
-	// Avatar + wallpaper (no quota tracking — profile images)
-	var avatarURL, wallpaperURL *string
-	if err := s.db.QueryRowContext(ctx, `SELECT avatar_url, wallpaper_url FROM users WHERE id = ?`, userID).Scan(&avatarURL, &wallpaperURL); err != nil {
-		return nil, fmt.Errorf("collect user avatar/wallpaper: %w", err)
+	// Avatar (no quota tracking — profile image)
+	var avatarURL *string
+	if err := s.db.QueryRowContext(ctx, `SELECT avatar_url FROM users WHERE id = ?`, userID).Scan(&avatarURL); err != nil {
+		return nil, fmt.Errorf("collect user avatar: %w", err)
 	}
 	if avatarURL != nil && *avatarURL != "" {
 		plan.urls = append(plan.urls, *avatarURL)
-	}
-	if wallpaperURL != nil && *wallpaperURL != "" {
-		plan.urls = append(plan.urls, *wallpaperURL)
 	}
 
 	// ─── Owned servers: collect ALL files (including other users' attachments) ───
