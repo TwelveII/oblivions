@@ -206,7 +206,7 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 		plan.livekit = append(plan.livekit, serverPlan.livekit...)
 	}
 
-	// ─── User's own message attachments (in servers they don't own) ───
+	// ─── User-authored message attachments not already collected with an empty server ───
 	msgRefs, err := s.queryFileRefs(ctx, true, `
 		SELECT a.file_url, COALESCE(a.file_size, 0), m.user_id, a.thumb_url, COALESCE(a.thumb_size, 0)
 		FROM attachments a
@@ -226,7 +226,7 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 	}
 	plan.refs = append(plan.refs, msgRefs...)
 
-	// ─── User voice attachments outside owned servers ───
+	// ─── User voice attachments not already collected with an empty server ───
 	voiceRefs, err := s.queryOwnedRefs(ctx, userID, false, `
 		SELECT vma.file_url, COALESCE(vma.file_size, 0)
 		FROM voice_message_attachments vma
@@ -236,6 +236,10 @@ func (s *fileCleanupService) CollectUserFiles(ctx context.Context, userID string
 			SELECT c.id FROM channels c
 			JOIN servers s ON c.server_id = s.id
 			WHERE s.owner_id = ?
+			  AND NOT EXISTS (
+			    SELECT 1 FROM server_members sm
+			    WHERE sm.server_id = s.id AND sm.user_id <> ?
+			  )
 		)`, userID, userID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("collect user voice files: %w", err)
