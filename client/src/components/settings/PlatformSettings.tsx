@@ -14,14 +14,52 @@ import {
 import InstanceForm from "./InstanceForm";
 import SettingsDetailBack from "./SettingsDetailBack";
 import { lazy, Suspense } from "react";
+import CrisisModePanel from "./CrisisModePanel";
+import AdminLogsPanel from "./AdminLogsPanel";
 
 // recharts is ~8 MB on disk and this panel is the only thing using it — admin-only, behind a
 // LiveKit instance selection. Lazy so it is not in every user's first load.
 const MetricsPanel = lazy(() => import("./MetricsPanel"));
 import type { LiveKitInstanceAdmin } from "../../types";
 
+type PlatformSection = "livekit" | "crisis" | "logs";
+
 function PlatformSettings() {
-  return <LiveKitTab />;
+  const [section, setSection] = useState<PlatformSection>("livekit");
+
+  const tabs: { id: PlatformSection; label: string }[] = [
+    { id: "livekit", label: "LiveKit Instances" },
+    { id: "crisis", label: "Crisis Mode" },
+    { id: "logs", label: "Logs (24h)" },
+  ];
+
+  return (
+    <div className="settings-section" style={{ display: "flex", flexDirection: "column", gap: 16, minHeight: 0, height: "100%" }}>
+      <div className="settings-section-header">
+        <h2>Platform</h2>
+        <p>Manage platform infrastructure, emergency controls, and application logs.</p>
+      </div>
+      <div className="settings-actions" role="tablist" aria-label="Platform settings">
+        {tabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            role="tab"
+            aria-selected={section === tab.id}
+            className={`settings-btn${section === tab.id ? " settings-btn-primary" : ""}`}
+            onClick={() => setSection(tab.id)}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+      <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+        {section === "livekit" && <LiveKitTab />}
+        {section === "crisis" && <CrisisModePanel />}
+        {section === "logs" && <AdminLogsPanel />}
+      </div>
+    </div>
+  );
 }
 
 

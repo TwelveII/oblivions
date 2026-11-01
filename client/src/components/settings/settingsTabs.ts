@@ -18,11 +18,11 @@ export const SETTINGS_TAB_LABEL_KEYS: Record<SettingsTab, string> = {
   invites: "invites",
   "join-requests": "joinRequests",
   platform: "platformLiveKitInstances",
-  "platform-crisis": "platformCrisisTab",
+  "platform-crisis": "platformSettings",
   "platform-servers": "platformServersTab",
   "platform-users": "platformUsersTab",
   "platform-reports": "platformReportsTab",
   "platform-server-reports": "platformServerReportsTab",
   "platform-feedback": "platformFeedbackTab",
-  "platform-logs": "platformLogsTab",
+  "platform-logs": "platformSettings",
 };
