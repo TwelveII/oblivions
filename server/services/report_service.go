@@ -180,6 +180,12 @@ func (s *reportService) CreateReport(ctx context.Context, reporterID, targetID s
 		return nil, fmt.Errorf("failed to look up user: %w", err)
 	}
 
+	// Direct-message reports are intentionally disabled. DMs are private conversations;
+	// this is enforced in the service layer so JSON and multipart clients cannot bypass it.
+	if req.DMMessageID != "" {
+		return nil, fmt.Errorf("%w: direct-message reporting is disabled", pkg.ErrForbidden)
+	}
+
 	excerptSource, err := s.resolveMessageContext(ctx, reporterID, targetID, req)
 	if err != nil {
 		return nil, err
