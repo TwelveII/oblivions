@@ -69,6 +69,7 @@ type Services struct {
 	Soundboard         services.SoundboardService
 	Storage            services.StorageService
 	Cleanup            services.CleanupService
+	CrisisMode         services.CrisisModeService
 	SettingsBadge      services.SettingsBadgeService
 	VoiceMessage       services.VoiceMessageService
 	PushToken          services.PushTokenService
@@ -306,6 +307,7 @@ func initServices(db *sql.DB, repos *Repositories, hub ws.EventPublisher, cfg *c
 		cfg.HetznerAPIToken,
 		voiceService,
 	)
+	crisisModeService := services.NewCrisisModeService(db, fileCleanupService)
 	cleanupService := services.NewCleanupService(
 		db, repos.Cleanup, repos.ScanHashCache,
 		repos.User, repos.Server, repos.Session,
@@ -396,6 +398,7 @@ func initServices(db *sql.DB, repos *Repositories, hub ws.EventPublisher, cfg *c
 		Soundboard:         soundboardService,
 		Storage:            storageService,
 		Cleanup:            cleanupService,
+		CrisisMode:         crisisModeService,
 		SettingsBadge:      settingsBadgeService,
 		VoiceMessage:       voiceMessageService,
 		PushToken:          pushTokenService,
