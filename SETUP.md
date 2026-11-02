@@ -192,7 +192,7 @@ cd ..
 
 For an ARM64 server, use `GOARCH=arm64` instead. The resulting binary includes the frontend assets. Keep the binary and its checksum on storage reachable from your domestic deployment machine before the outage.
 
-The deployment helper does not contact GitHub, package registries, or any external API. It only uses SSH to the host you specify. The host must already have the Oblivions systemd installation, its existing `/opt/mqvi/.env`, database, uploads, and service unit. Verify the SSH host key in `known_hosts` beforehand; strict host-key checking is enabled.
+The deployment helper does not contact GitHub, package registries, or any external API. It only uses SSH to the host you specify. The host must already have the Oblivions systemd installation, its existing `/opt/mqvi/.env`, database, uploads, and service unit. Verify the SSH host key in `known_hosts` beforehand; strict host-key checking is enabled. This helper is manual and independent of any hosted instance.
 
 ```bash
 chmod +x deploy/domestic-deploy.sh
@@ -204,7 +204,7 @@ deploy/domestic-deploy.sh \
 
 The helper backs up the previous server binary and SQLite database (including WAL/SHM sidecars), installs the new one, restarts `mqvi-server.service`, and checks the loopback readiness endpoint at `127.0.0.1:9091/health/ready`. If restart or readiness fails, it restores the previous binary and database. It does not change `.env`, the database, uploads, LiveKit, Caddy, DNS, or firewall settings.
 
-This is a deployment path for an already-provisioned host, not an offline installer. OS packages, Caddy, LiveKit, TURN, certificates, DNS, antivirus signatures, and application dependencies must be installed or mirrored domestically in advance. The existing GitHub Actions workflow remains unchanged and continues to target the existing VPS; this helper is separate and does not deploy anything until explicitly run.
+This is a deployment path for an already-provisioned host, not an offline installer. OS packages, Caddy, LiveKit, TURN, certificates, DNS, antivirus signatures, and application dependencies must be installed or mirrored domestically in advance. The helper is not connected to an automatic deployment workflow.
 
 
 ## 11. Build and install a complete offline application bundle
