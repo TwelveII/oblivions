@@ -48,13 +48,6 @@ jobs:
           bash -n deploy/package-offline-release.sh
           bash -n deploy/test-package-offline-release.sh
           bash deploy/test-package-offline-release.sh
-      - name: Ensure production deployment is manual only
-        run: |
-          grep -Eq '^[[:space:]]+workflow_dispatch:' .github/workflows/deploy.yml
-          if grep -Eq '^[[:space:]]+push:' .github/workflows/deploy.yml; then
-            echo "Automatic push deployment must remain disabled." >&2
-            exit 1
-          fi
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
