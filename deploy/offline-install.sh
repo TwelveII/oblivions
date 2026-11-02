@@ -97,6 +97,13 @@ EOF
   if [[ -n "$APP_URL" ]]; then printf "CORS_ORIGINS=%s\\n" "$APP_URL" >> "$APP_DIR/.env"; fi
 fi
 
+if [[ -n "$DOMAIN" ]]; then
+  for pair in "APP_URL=https://$DOMAIN" "CORS_ORIGINS=https://$DOMAIN"; do
+    key="${pair%%=*}"; value="${pair#*=}"
+    if grep -q "^${key}=" "$APP_DIR/.env"; then sed -i "s|^${key}=.*|${key}=$value|" "$APP_DIR/.env"; else printf "%s\\n" "$pair" >> "$APP_DIR/.env"; fi
+  done
+fi
+
 # Keep the backend SDK on the same public WSS endpoint that browser clients use.
 LIVEKIT_HOST="${LIVEKIT_URL#wss://}"
 if grep -Eq "^[[:space:]]*127\\.0\\.0\\.1[[:space:]].*([[:space:]]|^)${LIVEKIT_HOST}([[:space:]]|$)" /etc/hosts; then
