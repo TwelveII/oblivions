@@ -36,7 +36,7 @@ file is part of the work, not follow-up.
 | `database.md` | SQLite pragmas and pool, the migration runner, FTS5, repository conventions, the miscount and alias-shadowing traps, soft delete |
 | `files-and-uploads.md` | Upload pipeline, quota accounting, ClamAV + circuit breaker, thumbnails, the XHR transport split, cleanup |
 | `e2ee.md` | The three separate systems, sender keys, the ratchet session lock, devices and key backup, server-side policy, upgrade order |
-| `client-state.md` | Zustand stores and slices, mutations-through-stores, WS handlers and resync, caching decisions, mobile constraints, styling rules |
+| `client-state.md` | Zustand stores and slices, mutations-through-stores, WS handlers and resync, caching decisions, web layout and styling rules |
 | `packaging-and-release.md` | Electron/Capacitor shells, electron-builder rules, auto-update and blockmaps, CI release, native components, renderer priority |
 | `deploy-and-selfhost.md` | The two self-host modes, what `install.sh` does, the seeding chain, config, health, zero-downtime deploy, bandwidth budget |
 
@@ -90,12 +90,12 @@ append-only.
 has none of them. This folder is tracked precisely so it survives a clone.
 
 **Known-wrong statement in `CLAUDE.md`:** it says the server binary is not published to releases.
-It is — CI builds `mqvi-server-linux-{amd64,arm64}` (`.github/workflows/build-desktop.yml:226-231`)
+It is — CI builds `mqvi-server-linux-{amd64,arm64}` (`.github/workflows/release-server.yml`)
 and `deploy/install.sh` downloads it from `releases/latest/download/`. Verified against release
 v2.24.0. Do not act on that line.
 
 **Line endings are mixed.** Git stores LF; checkout produces CRLF for many files but not all
-(`electron/main.ts` is LF in the working tree, `client/.../AppLayout.tsx` is CRLF). Any script that
+(`client/.../AppLayout.tsx` is CRLF). Any script that
 matches multi-line text must normalise first, or anchors silently stop matching. Never run
 `gofmt`/`go fmt` across a package — format only the files you edited, by name.
 
