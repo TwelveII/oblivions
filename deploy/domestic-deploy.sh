@@ -108,12 +108,12 @@ rollback() {
   systemctl stop "$SERVICE" || true
   cp -a "$BACKUP" "$APP_DIR/mqvi-server.rollback"
   mv -f "$APP_DIR/mqvi-server.rollback" "$CURRENT"
-  if [ -s "$BACKUP.database" ]; then
+  if [ -s "$BACKUP.database/database" ]; then
     rm -f "$DB_FILE-wal" "$DB_FILE-shm"
-    cp -a "$BACKUP.database" "$DB_FILE"
+    cp -a "$BACKUP.database/database" "$DB_FILE"
     for suffix in -wal -shm; do
-      if [ -f "$BACKUP.database$suffix" ]; then
-        cp -a "$BACKUP.database$suffix" "$DB_FILE$suffix"
+      if [ -f "$BACKUP.database/database$suffix" ]; then
+        cp -a "$BACKUP.database/database$suffix" "$DB_FILE$suffix"
       fi
     done
   fi
@@ -123,9 +123,10 @@ rollback() {
 trap 'status=$?; if [ "$status" -ne 0 ]; then rollback; fi; exit "$status"' EXIT
 
 # The application is stopped, so the database and any WAL/SHM sidecars form a consistent backup.
-cp -a "$DB_FILE" "$DB_BACKUP_TMP"
+install -d -o root -g root -m 700 "$DB_BACKUP_TMP"
+cp -a "$DB_FILE" "$DB_BACKUP_TMP/database"
 for suffix in -wal -shm; do
-  if [ -f "$DB_FILE$suffix" ]; then cp -a "$DB_FILE$suffix" "$DB_BACKUP_TMP$suffix"; fi
+  if [ -f "$DB_FILE$suffix" ]; then cp -a "$DB_FILE$suffix" "$DB_BACKUP_TMP/database$suffix"; fi
 done
 mv -f "$DB_BACKUP_TMP" "$BACKUP.database"
 
