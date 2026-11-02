@@ -223,7 +223,7 @@ The resulting archive is written under `dist/offline/`. Transfer the archive and
 sudo bash deploy/offline-install.sh \
   --bundle oblivions-offline-linux-amd64-VERSION.tar.gz \
   --public-ip YOUR_DOMESTIC_PUBLIC_IPV4 \
-  --domain chat.example.ir \\
+  --domain chat.example.ir \
   --livekit-url wss://livekit.example.ir
 ```
 
