@@ -90,8 +90,8 @@ LIVEKIT_URL=$LIVEKIT_URL
 LIVEKIT_API_KEY=$LK_API_KEY
 LIVEKIT_API_SECRET=$LK_API_SECRET
 APP_URL=$APP_URL
-CORS_ORIGINS=$APP_URL
 EOF
+  if [[ -n "$APP_URL" ]]; then printf "CORS_ORIGINS=%s\\n" "$APP_URL" >> "$APP_DIR/.env"; fi
 fi
 
 # Keep the backend SDK on the same public WSS endpoint that browser clients use.
