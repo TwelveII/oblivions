@@ -95,6 +95,14 @@ EOF
 fi
 
 # Keep the backend SDK on the same public WSS endpoint that browser clients use.
+LIVEKIT_HOST="${LIVEKIT_URL#wss://}"
+if grep -Eq "^[[:space:]]*127\\.0\\.0\\.1[[:space:]].*([[:space:]]|^)${LIVEKIT_HOST}([[:space:]]|$)" /etc/hosts; then
+  :
+elif grep -Eq "^[^#]*[[:space:]]${LIVEKIT_HOST}([[:space:]]|$)" /etc/hosts; then
+  die "LiveKit hostname already has a non-loopback /etc/hosts entry; resolve it to 127.0.0.1 manually."
+else
+  printf "127.0.0.1 %s # Oblivions local LiveKit proxy\\n" "$LIVEKIT_HOST" >> /etc/hosts
+fi
 if grep -q "^LIVEKIT_URL=" "$APP_DIR/.env"; then
   sed -i "s|^LIVEKIT_URL=.*|LIVEKIT_URL=$LIVEKIT_URL|" "$APP_DIR/.env"
 else
