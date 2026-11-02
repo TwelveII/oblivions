@@ -57,7 +57,6 @@
     "react-zoom-pan-pinch": "^4.0.3",
     "recharts": "^3.8.0",
     "remark-gfm": "^4.0.1",
-    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz",
     "zustand": "^5.0.11"
   },
   "overrides": {
