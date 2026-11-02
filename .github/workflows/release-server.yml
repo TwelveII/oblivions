@@ -1,0 +1,56 @@
+name: Release Linux server
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Build frontend
+        working-directory: client
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Linux server binaries
+        working-directory: server
+        run: |
+          set -euo pipefail
+          rm -rf static/dist
+          mkdir -p static/dist "$GITHUB_WORKSPACE/release"
+          cp -a ../client/dist/. static/dist/
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags="-s -w" \
+              -o "$GITHUB_WORKSPACE/release/mqvi-server-linux-$arch" .
+          done
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --title "Oblivions $GITHUB_REF_NAME" \
+            --generate-notes
