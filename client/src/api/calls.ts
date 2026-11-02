@@ -37,8 +37,7 @@ async function fetchIceServersOrNull(): Promise<RTCIceServer[] | null> {
 /**
  * Fetches the ICE server list (STUN + TURN with fresh short-lived credentials)
  * for the start of a P2P call. Must be called once the call is "active" — the
- * backend gates this on an accepted call. On any failure/timeout it returns
- * STUN-only so the call is not held up by TURN.
+ * backend gates this on an accepted call. On any failure/timeout it returns no external ICE servers so the call is not held up by a provider.
  */
 export async function fetchIceServers(): Promise<RTCIceServer[]> {
   const servers = await fetchIceServersOrNull();
