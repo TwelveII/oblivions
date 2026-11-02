@@ -2,7 +2,7 @@
 # mqvi — One-command installer for Linux servers.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/akinalpfdn/Mqvi/main/deploy/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/TwelveII/oblivions/main/deploy/install.sh | sudo bash
 #
 # Optional flags (any combination):
 #   --domain <host>       Public hostname (e.g. demo.oblivions.ir). If omitted, sslip.io
