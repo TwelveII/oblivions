@@ -202,6 +202,6 @@ deploy/domestic-deploy.sh \
   --artifact deploy/package/mqvi-server
 ```
 
-The helper backs up the previous server binary, installs the new one, restarts `mqvi-server.service`, and checks the loopback readiness endpoint at `127.0.0.1:9091/health/ready`. If restart or readiness fails, it restores the previous binary. It does not change `.env`, the database, uploads, LiveKit, Caddy, DNS, or firewall settings.
+The helper backs up the previous server binary and SQLite database (including WAL/SHM sidecars), installs the new one, restarts `mqvi-server.service`, and checks the loopback readiness endpoint at `127.0.0.1:9091/health/ready`. If restart or readiness fails, it restores the previous binary and database. It does not change `.env`, the database, uploads, LiveKit, Caddy, DNS, or firewall settings.
 
 This is a deployment path for an already-provisioned host, not an offline installer. OS packages, Caddy, LiveKit, TURN, certificates, DNS, antivirus signatures, and application dependencies must be installed or mirrored domestically in advance. The existing GitHub Actions workflow remains unchanged and continues to target the existing VPS; this helper is separate and does not deploy anything until explicitly run.
