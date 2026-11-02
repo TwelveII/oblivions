@@ -361,6 +361,10 @@ UPLOAD_MAX_SIZE=104857600
 MQVI_SIGNED_URL_SECRET=${SIGNED_URL_SECRET}
 
 MQVI_ANTIVIRUS_ENABLED=${AV_ENABLED}
+# Keep optional international lookups disabled for domestic-network resilience.
+MQVI_PASSWORD_BREACH_CHECK=false
+MQVI_GEOIP_AUTO_UPDATE=false
+STUN_URLS=
 # Debian/Ubuntu clamav-daemon listens on this Unix socket by default.
 MQVI_CLAMAV_ADDR=unix:/run/clamav/clamd.ctl
 MQVI_ANTIVIRUS_TIMEOUT_SECONDS=10
