@@ -166,3 +166,41 @@ Before inviting the public:
 - [ ] Review the security limitations: the project has not received an independent security audit.
 
 Self-hosting gives the operator control of the infrastructure; it does not make the application or endpoint devices invulnerable.
+
+
+## 10. Deploy a prebuilt binary during an international outage
+
+GitHub Actions and public package registries may be unreachable during an international route shutdown. For an already-provisioned domestic server, prepare a Linux server binary before the outage and transfer it directly over the domestic network.
+
+Build the artifact while dependencies are reachable (or from your own npm/Go mirrors):
+
+```bash
+cd client
+npm ci
+npm run build
+cd ..
+
+rm -rf server/static/dist
+mkdir -p server/static/dist
+cp -a client/dist/. server/static/dist/
+
+cd server
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../deploy/package/mqvi-server .
+cd ..
+```
+
+For an ARM64 server, use `GOARCH=arm64` instead. The resulting binary includes the frontend assets. Keep the binary and its checksum on storage reachable from your domestic deployment machine before the outage.
+
+The deployment helper does not contact GitHub, package registries, or any external API. It only uses SSH to the host you specify. The host must already have the Oblivions systemd installation, its existing `/opt/mqvi/.env`, database, uploads, and service unit. Verify the SSH host key in `known_hosts` beforehand; strict host-key checking is enabled.
+
+```bash
+chmod +x deploy/domestic-deploy.sh
+deploy/domestic-deploy.sh \
+  --host YOUR_DOMESTIC_SERVER_IP \
+  --user root \
+  --artifact deploy/package/mqvi-server
+```
+
+The helper backs up the previous server binary, installs the new one, restarts `mqvi-server.service`, and checks the loopback readiness endpoint at `127.0.0.1:9091/health/ready`. If restart or readiness fails, it restores the previous binary. It does not change `.env`, the database, uploads, LiveKit, Caddy, DNS, or firewall settings.
+
+This is a deployment path for an already-provisioned host, not an offline installer. OS packages, Caddy, LiveKit, TURN, certificates, DNS, antivirus signatures, and application dependencies must be installed or mirrored domestically in advance. The existing GitHub Actions workflow remains unchanged and continues to target the existing VPS; this helper is separate and does not deploy anything until explicitly run.
