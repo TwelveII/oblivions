@@ -50,42 +50,8 @@ jobs:
       - name: Build offline runtime bundles
         env:
           LIVEKIT_VERSION: v1.9.12
-        run: |
-          set -euo pipefail
-          for arch in amd64 arm64; do
-            stage="$(mktemp -d)"
-            trap 'rm -rf "$stage"' EXIT
-            install -m 0755 "release/mqvi-server-linux-$arch" "$stage/mqvi-server"
-            lk_archive="$stage/livekit.tar.gz"
-            curl -fsSL --retry 3 \
-              "https://github.com/livekit/livekit/releases/download/$LIVEKIT_VERSION/livekit_${LIVEKIT_VERSION#v}_linux_${arch}.tar.gz" \
-              -o "$lk_archive"
-            tar -xzf "$lk_archive" -C "$stage" livekit-server
-            rm -f "$lk_archive"
-            chmod 0755 "$stage/livekit-server"
-            cat > "$stage/README.txt" <<EOF
-          Oblivions offline runtime bundle
-          Source revision: $GITHUB_SHA
-          Target: linux/$arch
-          LiveKit version: $LIVEKIT_VERSION
-
-          Contents:
-          - mqvi-server: Oblivions server with embedded frontend
-          - livekit-server: local LiveKit SFU
-
-          This archive does not include OS packages, Caddy, certificates, DNS,
-          firewall configuration, or coturn. Provision those domestically in advance.
-          EOF
-            (
-              cd "$stage"
-              sha256sum README.txt mqvi-server livekit-server > SHA256SUMS
-            )
-            tar -C "$stage" -czf "release/oblivions-offline-linux-$arch.tar.gz" .
-            (cd release && sha256sum "oblivions-offline-linux-$arch.tar.gz" \
-              > "oblivions-offline-linux-$arch.tar.gz.sha256")
-            rm -rf "$stage"
-            trap - EXIT
-          done
+          GITHUB_SHA: ${{ github.sha }}
+        run: bash deploy/package-offline-release.sh release
 
       - name: Publish release assets
         env:
