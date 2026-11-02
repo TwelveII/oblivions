@@ -1,8 +1,8 @@
 name: Deploy MQVI to VPS
 
 on:
-  push:
-    branches: [main]
+  # Deliberately manual: merging code must never silently restart the overseas VPS.
+  # Deploy explicitly only after choosing the intended host and maintenance window.
   workflow_dispatch:
 
 permissions:
