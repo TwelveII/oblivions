@@ -81,8 +81,8 @@ jobs:
               sha256sum README.txt mqvi-server livekit-server > SHA256SUMS
             )
             tar -C "$stage" -czf "release/oblivions-offline-linux-$arch.tar.gz" .
-            sha256sum "release/oblivions-offline-linux-$arch.tar.gz" \
-              > "release/oblivions-offline-linux-$arch.tar.gz.sha256"
+            (cd release && sha256sum "oblivions-offline-linux-$arch.tar.gz" \
+              > "oblivions-offline-linux-$arch.tar.gz.sha256")
             rm -rf "$stage"
             trap - EXIT
           done
