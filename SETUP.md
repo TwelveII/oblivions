@@ -223,7 +223,8 @@ The resulting archive is written under `dist/offline/`. Transfer the archive and
 sudo bash deploy/offline-install.sh \
   --bundle oblivions-offline-linux-amd64-VERSION.tar.gz \
   --public-ip YOUR_DOMESTIC_PUBLIC_IPV4 \
-  --domain chat.example.ir
+  --domain chat.example.ir \\
+  --livekit-url wss://livekit.example.ir
 ```
 
 Use the actual public IPv4 address that clients can reach. LiveKit is configured with `use_external_ip: false` and an explicit `node_ip`, so it does not need STUN-based public-IP discovery. Its media ports must be routed to that address. Configure an already-installed Caddy or other TLS reverse proxy to forward `chat.example.ir` to `127.0.0.1:9090` and `livekit.example.ir` to `127.0.0.1:7880`; install browser-trusted certificates for both names before the outage. The installer pins the LiveKit hostname to loopback in the server's `/etc/hosts` so backend SDK calls use the local TLS proxy, while domestic clients resolve it to the domestic public IP. The script intentionally does not install packages, modify firewall rules, request certificates, or configure DNS.
