@@ -395,6 +395,8 @@ EOF
 else
     log "Existing .env found — keeping it. (Flags --port/--domain do not modify it.)"
     ensure_env_value "${INSTALL_DIR}/.env" "MQVI_ANTIVIRUS_ENABLED" "${AV_ENABLED}"
+    ensure_env_value "${INSTALL_DIR}/.env" "MQVI_PASSWORD_BREACH_CHECK" "false"
+    ensure_env_value "${INSTALL_DIR}/.env" "MQVI_GEOIP_AUTO_UPDATE" "false"
     ensure_env_value "${INSTALL_DIR}/.env" "MQVI_CLAMAV_ADDR" "unix:/run/clamav/clamd.ctl"
     ensure_env_value "${INSTALL_DIR}/.env" "MQVI_ANTIVIRUS_TIMEOUT_SECONDS" "10"
     ensure_env_value "${INSTALL_DIR}/.env" "MQVI_ANTIVIRUS_MAX_SCAN_SIZE_MB" "25"
