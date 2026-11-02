@@ -244,3 +244,8 @@ livekit.example.ir {
 Use certificates already installed on the host (or provision them before the outage). Keep the LiveKit signalling port 7880 blocked from direct public access; Caddy exposes it over WSS.
 
 The offline installer starts the application and LiveKit only. It does not install coturn; restrictive carrier NATs may therefore prevent some calls until a domestic TURN relay is provisioned and `TURN_SECRET`/`TURN_URLS` are configured. It also leaves antivirus disabled unless you separately provision and configure ClamAV. Review the generated `/opt/mqvi/.env` before opening registration.
+
+
+### Prebuilt offline bundles in GitHub Releases
+
+When a version tag (`v*`) is published, the release workflow also creates ready-to-transfer offline runtime archives for Linux AMD64 and ARM64. Each archive contains the compiled Oblivions server, the matching pinned LiveKit server binary, a README with the target architecture, and an internal SHA-256 manifest; a separate `.sha256` file verifies the whole archive. Download the correct architecture archive while connectivity is available, transfer it to the domestic host, and pass it to `deploy/offline-install.sh`. This is the simplest way to prepare the application payload before an international outage. It still does not provision OS packages, TLS, DNS, firewall rules, or coturn.
