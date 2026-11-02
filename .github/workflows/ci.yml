@@ -40,6 +40,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate domestic deployment script syntax
+        run: bash -n deploy/domestic-deploy.sh
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
