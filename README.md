@@ -2,7 +2,7 @@
 
 **A self-hostable communication platform for communities — text, voice and video.**
 
-Oblivions is an open-source project built around the MQVI communication server. It brings together community servers, channels, direct messages, voice/video calls and desktop/mobile clients, with a focus on user control and privacy.
+Oblivions is an open-source project built around the MQVI communication server. It brings together community servers, channels, direct messages, voice/video calls through a web browser, with a focus on user control and privacy.
 
 > **Status: pre-release / beta.** The project is being prepared for its first public release. It has not received an independent security audit. Do not rely on it as the sole channel for sensitive or safety-critical communications.
 
@@ -14,9 +14,9 @@ Oblivions is an open-source project built around the MQVI communication server. 
 - Encrypted voice/video calls
 - Optional end-to-end encryption for supported message conversations
 - File uploads, user profiles, invitations and platform administration
-- Web client and cross-platform client code
+- Browser-based web client
 
-Feature availability can differ between the web, desktop and mobile clients. See [the setup guide](SETUP.md) before deploying.
+Oblivions is currently a web-only service. Use a supported web browser to access it. See [the setup guide](SETUP.md) before deploying.
 
 ## Try it
 
@@ -72,7 +72,7 @@ For a production build, build the client first, copy `client/dist/` into `server
 - A self-hosted operator controls that server's infrastructure, availability, backups and metadata. Self-hosting does not automatically protect devices, network endpoints or account recovery.
 - Report suspected vulnerabilities privately. Please do not publish exploit details in public issues. See [SECURITY.md](SECURITY.md).
 
-Read the in-app Privacy and Terms pages before using a deployment.
+Read the Privacy and Terms pages on the website before using a deployment.
 
 ## Contributing
 
