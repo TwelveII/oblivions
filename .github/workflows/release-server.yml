@@ -47,6 +47,12 @@ jobs:
               -o "$GITHUB_WORKSPACE/release/mqvi-server-linux-$arch" .
           done
 
+      - name: Build offline runtime bundles
+        env:
+          LIVEKIT_VERSION: v1.9.12
+          GITHUB_SHA: ${{ github.sha }}
+        run: bash deploy/package-offline-release.sh release
+
       - name: Publish release assets
         env:
           GH_TOKEN: ${{ github.token }}

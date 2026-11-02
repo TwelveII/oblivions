@@ -45,6 +45,9 @@ jobs:
           bash -n deploy/domestic-deploy.sh
           bash -n deploy/prepare-offline-bundle.sh
           bash -n deploy/offline-install.sh
+          bash -n deploy/package-offline-release.sh
+          bash -n deploy/test-package-offline-release.sh
+          bash deploy/test-package-offline-release.sh
       - name: Ensure production deployment is manual only
         run: |
           grep -Eq '^[[:space:]]+workflow_dispatch:' .github/workflows/deploy.yml
