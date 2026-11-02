@@ -1,4 +1,4 @@
-# Using Oblivions on desktop and mobile
+# using oblivions on the web
 
 Oblivions is currently available through your web browser.
 
@@ -10,9 +10,9 @@ https://msg.oblivions.ir
 
 Sign in or create an account to start using Oblivions.
 
-## Desktop and mobile apps
+## apps
 
-Dedicated Oblivions desktop and mobile downloads are not currently available. Be careful with download links from older project documentation; they may point to apps that are not operated by Oblivions.
+Oblivions is currently a web-only service. There are no official desktop, iOS, or Android apps. Avoid unofficial downloads claiming to be Oblivions.
 
 ## Browser installation
 
