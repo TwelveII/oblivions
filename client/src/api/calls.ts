@@ -4,12 +4,10 @@
 
 import { apiClient } from "./client";
 
-// STUN-only fallback. Used when the backend fetch fails (offline, 403, 429) so a
-// call still attempts to connect — it just loses the relay fallback.
-const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-];
+// Never fall back to a public STUN provider. The browser's host candidates can still
+// connect peers on reachable networks; reliable cross-NAT calling requires a self-hosted,
+// domestically reachable TURN service configured by the instance operator.
+const FALLBACK_ICE_SERVERS: RTCIceServer[] = [];
 
 // Bound the wait so a hung server/proxy can't block the call forever. The timer
 // aborts the actual request (not just our wait), so a timed-out fetch doesn't keep
@@ -45,7 +43,7 @@ async function fetchIceServersOrNull(): Promise<RTCIceServer[] | null> {
 export async function fetchIceServers(): Promise<RTCIceServer[]> {
   const servers = await fetchIceServersOrNull();
   if (servers) return servers;
-  console.warn("[p2p] ICE server fetch failed/timed out, falling back to STUN-only");
+  console.warn("[p2p] ICE server fetch failed/timed out, continuing without external ICE servers");
   return FALLBACK_ICE_SERVERS;
 }
 
