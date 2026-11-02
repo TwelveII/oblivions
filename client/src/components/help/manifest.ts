@@ -127,7 +127,6 @@ export const HELP_CATEGORIES: HelpCategory[] = [
     articles: [
       { slug: "themes-appearance", titleKey: "art_themes-appearance" },
       { slug: "notifications", titleKey: "art_notifications" },
-      { slug: "desktop-app", titleKey: "art_desktop-app" },
     ],
   },
   {
