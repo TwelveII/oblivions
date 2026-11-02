@@ -95,6 +95,7 @@ test -f "$APP_DIR/.env"
 install -d -o root -g root -m 700 "$BACKUPS"
 cp -a "$CURRENT" "$BACKUP"
 
+DB_BACKUP_TMP="$BACKUP.database.tmp"
 DB_REL="$(sed -n 's/^DATABASE_PATH=//p' "$APP_DIR/.env" | tail -n 1 | sed 's/^"//; s/"$//; s/\r$//')"
 DB_REL="${DB_REL:-./data/mqvi.db}"
 if [[ "$DB_REL" = /* ]]; then DB_FILE="$DB_REL"; else DB_FILE="$APP_DIR/$DB_REL"; fi
@@ -117,15 +118,16 @@ rollback() {
     done
   fi
   systemctl start "$SERVICE" || true
-  rm -f "$NEW_BINARY"
+  rm -f "$NEW_BINARY" "$DB_BACKUP_TMP"
 }
 trap 'status=$?; if [ "$status" -ne 0 ]; then rollback; fi; exit "$status"' EXIT
 
 # The application is stopped, so the database and any WAL/SHM sidecars form a consistent backup.
-cp -a "$DB_FILE" "$BACKUP.database"
+cp -a "$DB_FILE" "$DB_BACKUP_TMP"
 for suffix in -wal -shm; do
-  if [ -f "$DB_FILE$suffix" ]; then cp -a "$DB_FILE$suffix" "$BACKUP.database$suffix"; fi
+  if [ -f "$DB_FILE$suffix" ]; then cp -a "$DB_FILE$suffix" "$DB_BACKUP_TMP$suffix"; fi
 done
+mv -f "$DB_BACKUP_TMP" "$BACKUP.database"
 
 install -o root -g root -m 755 "$NEW_BINARY" "$APP_DIR/mqvi-server.installing"
 mv -f "$APP_DIR/mqvi-server.installing" "$CURRENT"
