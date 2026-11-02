@@ -31,6 +31,12 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 [[ -n "$BUNDLE" && -s "$BUNDLE" ]] || die "--bundle must point to a non-empty bundle archive."
 [[ "$LIVEKIT_URL" =~ ^wss://[A-Za-z0-9.-]+$ ]] || die "--livekit-url must be a WSS hostname without a path or port."
 [[ "$PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "--public-ip must be the server's public IPv4 address."
+[[ -z "$DOMAIN" || "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "Invalid domain name."
+[[ "$APP_DIR" =~ ^/[A-Za-z0-9._/-]+$ && "$APP_DIR" != *"/../"* ]] || die "APP_DIR must be an absolute path without spaces or parent traversal."
+IFS=. read -r IP1 IP2 IP3 IP4 <<< "$PUBLIC_IP"
+for octet in "$IP1" "$IP2" "$IP3" "$IP4"; do
+  [[ "$octet" =~ ^[0-9]{1,3}$ ]] && ((10#$octet <= 255)) || die "Invalid IPv4 address."
+done
 [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT > 0 && PORT < 65536)) || die "Invalid port."
 for tool in systemctl useradd install tar sha256sum openssl curl; do
   command -v "$tool" >/dev/null 2>&1 || die "Missing preinstalled requirement: $tool"
@@ -57,9 +63,6 @@ if ! id mqvi >/dev/null 2>&1; then
   useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin mqvi
 fi
 install -d -o mqvi -g mqvi -m 0750 "$APP_DIR" "$APP_DIR/data" "$APP_DIR/data/uploads"
-install -o root -g root -m 0755 "$TMP/mqvi-server" "$APP_DIR/mqvi-server"
-install -o root -g root -m 0755 "$TMP/livekit-server" "$APP_DIR/livekit-server"
-
 if [[ ! -s "$APP_DIR/.env" ]]; then
   JWT_SECRET="$(openssl rand -hex 32)"
   ENCRYPTION_KEY="$(openssl rand -hex 32)"
@@ -109,8 +112,17 @@ else
   printf "LIVEKIT_URL=%s\\n" "$LIVEKIT_URL" >> "$APP_DIR/.env"
 fi
 
+if ! grep -q "^LIVEKIT_API_KEY=." "$APP_DIR/.env"; then
+  LK_NEW_KEY="APIkey$(openssl rand -hex 6)"
+  if grep -q "^LIVEKIT_API_KEY=" "$APP_DIR/.env"; then sed -i "s|^LIVEKIT_API_KEY=.*|LIVEKIT_API_KEY=$LK_NEW_KEY|" "$APP_DIR/.env"; else printf "LIVEKIT_API_KEY=%s\\n" "$LK_NEW_KEY" >> "$APP_DIR/.env"; fi
+fi
+if ! grep -q "^LIVEKIT_API_SECRET=." "$APP_DIR/.env"; then
+  LK_NEW_SECRET="$(openssl rand -hex 32)"
+  if grep -q "^LIVEKIT_API_SECRET=" "$APP_DIR/.env"; then sed -i "s|^LIVEKIT_API_SECRET=.*|LIVEKIT_API_SECRET=$LK_NEW_SECRET|" "$APP_DIR/.env"; else printf "LIVEKIT_API_SECRET=%s\\n" "$LK_NEW_SECRET" >> "$APP_DIR/.env"; fi
+fi
+
 if [[ ! -s "$APP_DIR/livekit.yaml" ]]; then
-  # Explicit node_ip disables LiveKit's external-IP/STUN discovery.
+  # Explicit node_ip disables LiveKit external-IP discovery.
   LK_KEY="$(grep '^LIVEKIT_API_KEY=' "$APP_DIR/.env" | tail -n1 | cut -d= -f2-)"
   LK_SECRET="$(grep '^LIVEKIT_API_SECRET=' "$APP_DIR/.env" | tail -n1 | cut -d= -f2-)"
   [[ -n "$LK_KEY" && -n "$LK_SECRET" ]] || die "Existing .env must define LIVEKIT_API_KEY and LIVEKIT_API_SECRET."
@@ -128,6 +140,9 @@ logging:
   level: info
 EOF
 fi
+
+install -o root -g root -m 0755 "$TMP/mqvi-server" "$APP_DIR/mqvi-server"
+install -o root -g root -m 0755 "$TMP/livekit-server" "$APP_DIR/livekit-server"
 
 chown root:mqvi "$APP_DIR/.env" "$APP_DIR/livekit.yaml"
 chmod 0640 "$APP_DIR/.env" "$APP_DIR/livekit.yaml"
