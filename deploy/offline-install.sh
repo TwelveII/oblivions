@@ -41,8 +41,14 @@ trap cleanup EXIT
 tar -xzf "$BUNDLE" -C "$TMP"
 [[ -s "$TMP/mqvi-server" && -x "$TMP/mqvi-server" ]] || die "Bundle is missing mqvi-server."
 [[ -s "$TMP/livekit-server" && -x "$TMP/livekit-server" ]] || die "Bundle is missing livekit-server."
-[[ -s "$TMP/SHA256SUMS" ]] || die "Bundle is missing SHA256SUMS."
+[[ -s "$TMP/SHA256SUMS" && -s "$TMP/README.txt" ]] || die "Bundle is missing SHA256SUMS or README.txt."
 (cd "$TMP" && sha256sum --check --strict SHA256SUMS) || die "Bundle integrity check failed."
+case "$(uname -m)" in
+  x86_64|amd64) HOST_ARCH=amd64 ;;
+  aarch64|arm64) HOST_ARCH=arm64 ;;
+  *) die "Unsupported host architecture: $(uname -m)" ;;
+esac
+grep -Fxq "Target: linux/$HOST_ARCH" "$TMP/README.txt" || die "Bundle architecture does not match host $HOST_ARCH."
 
 if ! id mqvi >/dev/null 2>&1; then
   useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin mqvi
