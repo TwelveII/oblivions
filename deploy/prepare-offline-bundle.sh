@@ -82,7 +82,7 @@ or coturn. Those must be provisioned on the domestic host before an outage.
 EOF
 (
   cd "$STAGE"
-  sha256sum mqvi-server livekit-server > SHA256SUMS
+  sha256sum README.txt mqvi-server livekit-server > SHA256SUMS
 )
 
 echo "[4/4] Creating archive..."
