@@ -38,6 +38,9 @@ type Config struct {
 	// PasswordBreachCheck optionally queries Have I Been Pwned. Disabled by default so
 	// password creation never depends on an international service.
 	PasswordBreachCheck bool
+	// LinkPreviewEnabled allows the server to fetch arbitrary public URLs for Open Graph previews.
+	// Disabled by default to avoid outbound requests during domestic-only operation.
+	LinkPreviewEnabled bool
 	// GeoIPDir holds the DB-IP city database behind the devices screen's locations.
 	GeoIPDir string
 	// GeoIPAutoUpdate optionally downloads the database monthly from DB-IP. Disabled by
@@ -314,6 +317,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid MQVI_GEOIP_AUTO_UPDATE: %w", err)
 	}
+	linkPreviewEnabled, err := strconv.ParseBool(getEnv("MQVI_LINK_PREVIEWS_ENABLED", "false"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_LINK_PREVIEWS_ENABLED: %w", err)
+	}
 	avTimeout, err := strconv.Atoi(getEnv("MQVI_ANTIVIRUS_TIMEOUT_SECONDS", "10"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_TIMEOUT_SECONDS: %w", err)
@@ -523,6 +530,7 @@ func Load() (*Config, error) {
 		EncryptionKey:       encKey,
 		HetznerAPIToken:     getEnv("HETZNER_API_TOKEN", ""),
 		PasswordBreachCheck: breachCheck,
+		LinkPreviewEnabled:  linkPreviewEnabled,
 		GeoIPDir:            getEnv("MQVI_GEOIP_DIR", filepath.Join(filepath.Dir(getEnv("DATABASE_PATH", "./data/mqvi.db")), "geoip")),
 		GeoIPAutoUpdate:     geoAutoUpdate,
 	}
