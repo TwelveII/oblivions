@@ -37,7 +37,6 @@ file is part of the work, not follow-up.
 | `files-and-uploads.md` | Upload pipeline, quota accounting, ClamAV + circuit breaker, thumbnails, the XHR transport split, cleanup |
 | `e2ee.md` | The three separate systems, sender keys, the ratchet session lock, devices and key backup, server-side policy, upgrade order |
 | `client-state.md` | Zustand stores and slices, mutations-through-stores, WS handlers and resync, caching decisions, web layout and styling rules |
-| `packaging-and-release.md` | Electron/Capacitor shells, electron-builder rules, auto-update and blockmaps, CI release, native components, renderer priority |
 | `deploy-and-selfhost.md` | The two self-host modes, what `install.sh` does, the seeding chain, config, health, zero-downtime deploy, bandwidth budget |
 
 ## Project shape
