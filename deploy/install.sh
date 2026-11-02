@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/akinalpfdn/Mqvi/main/deploy/install.sh | sudo bash
 #
 # Optional flags (any combination):
-#   --domain <host>       Public hostname (e.g. demo.mqvi.net). If omitted, sslip.io
+#   --domain <host>       Public hostname (e.g. demo.oblivions.ir). If omitted, sslip.io
 #                         is used automatically based on the public IP.
 #   --port <number>       Internal port mqvi-server binds to. Default: 9090.
 #   --no-tls              Skip Caddy entirely; expose mqvi-server directly on --port.
@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-REPO="akinalpfdn/Mqvi"
+REPO="TwelveII/oblivions"
 INSTALL_DIR="/opt/mqvi"
 DATA_DIR="${INSTALL_DIR}/data"
 SERVICE_USER="mqvi"
