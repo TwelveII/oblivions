@@ -211,7 +211,7 @@ This is a deployment path for an already-provisioned host, not an offline instal
 
 For a new, already-provisioned domestic Linux host, the repository now includes a bundle builder and a no-download installer. This avoids GitHub Actions and public registries during the actual installation. It does **not** replace provisioning the operating system, TLS, DNS, firewall, or TURN relay.
 
-Before the outage, prepare a local LiveKit binary matching the target architecture (the regular installer currently uses LiveKit v1.9.12), and warm the npm and Go dependency caches. The SheetJS dependency is pinned to the SheetJS CDN tarball, so it must already be in npm's local cache. The builder deliberately runs npm and Go in offline mode and fails rather than silently reaching the internet:
+Before the outage, prepare a local LiveKit binary matching the target architecture (the regular installer currently uses LiveKit v1.9.12), and warm the npm and Go dependency caches while internet is available. From the repository root, run `cd client && npm ci && cd ../server && go mod download`; this caches the exact SheetJS tarball dependency and Go modules. The builder deliberately runs npm and Go in offline mode and fails rather than silently reaching the internet:
 
 ```bash
 LIVEKIT_BINARY=/path/to/livekit-server bash deploy/prepare-offline-bundle.sh
@@ -231,10 +231,12 @@ Use the actual public IPv4 address that clients can reach. LiveKit is configured
 
 ```caddyfile
 chat.example.ir {
+    tls /etc/ssl/oblivions/chat-fullchain.pem /etc/ssl/oblivions/chat-key.pem
     reverse_proxy 127.0.0.1:9090
 }
 
 livekit.example.ir {
+    tls /etc/ssl/oblivions/livekit-fullchain.pem /etc/ssl/oblivions/livekit-key.pem
     reverse_proxy 127.0.0.1:7880
 }
 ```
