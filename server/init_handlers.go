@@ -98,7 +98,7 @@ func initHandlers(svcs *Services, repos *Repositories, limiters *RateLimiters, h
 		AASA:              handlers.NewAASAHandler(cfg.AppLinks.IOSAppID),
 		Device:            handlers.NewDeviceHandler(svcs.Device),
 		E2EE:              handlers.NewE2EEHandler(svcs.E2EE),
-		LinkPreview:       handlers.NewLinkPreviewHandler(svcs.LinkPreview),
+		LinkPreview:       handlers.NewLinkPreviewHandler(svcs.LinkPreview, cfg.LinkPreviewEnabled),
 		Badge:             handlers.NewBadgeHandler(svcs.Badge, svcs.UploadPipeline),
 		Preferences:       handlers.NewPreferencesHandler(svcs.Preferences),
 		DownloadPrompt:    handlers.NewDownloadPromptHandler(repos.User),
