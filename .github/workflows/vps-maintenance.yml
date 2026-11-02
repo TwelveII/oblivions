@@ -1,0 +1,68 @@
+name: VPS maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Stop or start the production website"
+        required: true
+        type: choice
+        options:
+          - stop
+          - start
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqvi-production-maintenance
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -y -f ~/.ssh/id_ed25519 >/dev/null
+
+      - name: ${{ inputs.action }} production services
+        env:
+          ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            root@185.249.9.132 "bash -s -- '$ACTION'" <<'REMOTE'
+          set -Eeuo pipefail
+          ACTION="$1"
+          case "$ACTION" in
+            stop)
+              systemctl stop caddy.service mqvi-server.service mqvi-livekit.service
+              ;;
+            start)
+              systemctl start mqvi-livekit.service
+              systemctl start mqvi-server.service
+              systemctl start caddy.service
+              for attempt in $(seq 1 30); do
+                if curl --fail --silent --max-time 3 http://127.0.0.1:9091/health/ready >/dev/null; then
+                  echo "Application is ready."
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "Application readiness check failed." >&2
+              exit 1
+              ;;
+            *)
+              echo "Unsupported action." >&2
+              exit 2
+              ;;
+          esac
+          echo "Completed: $ACTION"
+          REMOTE
