@@ -1,0 +1,1034 @@
+/**
+ * VoiceStateManager — Bidirectional voiceStore <-> LiveKit sync.
+ * Renders inside LiveKitRoom. No visual output (returns null).
+ *
+ * Syncs: mic mute, screen share, PTT, per-user volume, noise reduction,
+ * speaking detection, screen share subscriptions, and RTT polling.
+ */
+
+import { useEffect, useRef, useCallback } from "react";
+import { useTranslation } from "react-i18next";
+import { useLocalParticipant, useRoomContext } from "@livekit/components-react";
+import { RoomEvent, ParticipantEvent, ConnectionState, Track, LocalAudioTrack as LKLocalAudioTrack } from "livekit-client";
+import type {
+  LocalAudioTrack,
+  LocalTrackPublication,
+  Participant,
+  RemoteTrack,
+  RemoteTrackPublication,
+  RemoteParticipant,
+} from "livekit-client";
+import { useVoiceStore } from "../../stores/voiceStore";
+import { applyMicSubscriptions, shouldReceiveMic as receiveMic, silencedMicsKey } from "../../utils/micSubscription";
+import { isStartFailureWorthReporting } from "../../utils/shareStartFailure";
+import type { NoiseReductionMode } from "../../stores/slices/voiceSettingsSlice";
+import { usePushToTalk } from "../../hooks/usePushToTalk";
+import { RNNoiseProcessor } from "../../audio/RNNoiseProcessor";
+import { GtcrnProcessor } from "../../audio/GtcrnProcessor";
+import { GtcrnUnsupportedSampleRateError } from "../../audio/gtcrnSampleRate";
+import { VadGateProcessor } from "../../audio/VadGateProcessor";
+import { useSystemAudioCapture } from "../../hooks/useSystemAudioCapture";
+import { startShareAudioRun } from "../../utils/shareAudioRun";
+import { isElectron, isCapacitor, resolveUserId } from "../../utils/constants";
+import { startNativeScreenShare, stopNativeScreenShare, onNativeScreenShareStopped } from "../../utils/nativePlugins";
+import * as voiceApi from "../../api/voice";
+import { useServerStore } from "../../stores/serverStore";
+import { useToastStore } from "../../stores/toastStore";
+import i18n from "../../i18n";
+
+/** Both processors expose setMicSensitivity and setInputVolume */
+type AudioProcessor = RNNoiseProcessor | GtcrnProcessor | VadGateProcessor;
+
+/** Which processor the current settings call for. "none" means publish the track untouched. */
+type ProcessorKind = "rnnoise" | "gtcrn" | "vadgate" | "none";
+
+/**
+ * One place that turns a kind into an instance. Both application sites (the settings effect and
+ * the first-publish handler) go through it, so a new engine cannot be wired into one and forgotten
+ * in the other.
+ */
+function createProcessor(
+  kind: Exclude<ProcessorKind, "none">,
+  sensitivity: number,
+  inputVolume: number
+): AudioProcessor {
+  switch (kind) {
+    case "rnnoise":
+      return new RNNoiseProcessor(sensitivity, inputVolume);
+    case "gtcrn":
+      return new GtcrnProcessor(sensitivity, inputVolume);
+    case "vadgate":
+      return new VadGateProcessor(sensitivity, inputVolume);
+  }
+}
+
+/**
+ * Reports a share started here — the browser's or the phone's — that ended without the stop button.
+ * The voice channel's own server, not the one on screen: the user may be browsing another server
+ * while in voice. Helper engines report their own — see voiceStore.endNativeCaptureByHelper.
+ */
+function reportShareStoppedItself(
+  reason: voiceApi.ScreenShareStopReason,
+  startedAt: number | null,
+  detail?: string,
+  engine: voiceApi.StopReportEngine = "browser"
+) {
+  const { currentVoiceServerId, currentVoiceChannelId } = useVoiceStore.getState();
+  const serverId = currentVoiceServerId ?? useServerStore.getState().activeServerId;
+  if (!serverId || !currentVoiceChannelId) return;
+  const aliveMs = startedAt === null ? 0 : Date.now() - startedAt;
+  void voiceApi.reportScreenShareStop(serverId, currentVoiceChannelId, engine, reason, aliveMs, detail);
+}
+
+/** See utils/micSubscription — a silenced mic is never received, or it plays for ~1s on join. */
+function shouldReceiveMic(identity: string): boolean {
+  return receiveMic(useVoiceStore.getState(), identity);
+}
+
+function VoiceStateManager() {
+  const { t: tVoice } = useTranslation("voice");
+  const room = useRoomContext();
+  const { localParticipant, isScreenShareEnabled } = useLocalParticipant();
+  const isMuted = useVoiceStore((s) => s.isMuted);
+  const isStreaming = useVoiceStore((s) => s.isStreaming);
+  const inputMode = useVoiceStore((s) => s.inputMode);
+  const isServerMuted = useVoiceStore((s) => s.isServerMuted);
+  const isServerDeafened = useVoiceStore((s) => s.isServerDeafened);
+  const userVolumes = useVoiceStore((s) => s.userVolumes);
+  const screenShareVolumes = useVoiceStore((s) => s.screenShareVolumes);
+  const masterVolume = useVoiceStore((s) => s.masterVolume);
+  const isDeafened = useVoiceStore((s) => s.isDeafened);
+  const watchingScreenShares = useVoiceStore((s) => s.watchingScreenShares);
+  const screenShareAudio = useVoiceStore((s) => s.screenShareAudio);
+  const pickedShareSourceId = useVoiceStore((s) => s.pickedShareSourceId);
+  const noiseReductionMode = useVoiceStore((s) => s.noiseReductionMode);
+  const micSensitivity = useVoiceStore((s) => s.micSensitivity);
+  const inputVolume = useVoiceStore((s) => s.inputVolume);
+  const outputDevice = useVoiceStore((s) => s.outputDevice);
+
+  // Skip effects until initial connection sync is done
+  const initialSyncDone = useRef(false);
+
+  // PTT: bypass store, toggle mic directly on LiveKit participant
+  const setMicEnabled = useCallback(
+    (enabled: boolean) => {
+      localParticipant.setMicrophoneEnabled(enabled).catch((err: unknown) => {
+        console.error("[VoiceStateManager] PTT mic toggle failed:", err);
+      });
+    },
+    [localParticipant]
+  );
+
+  usePushToTalk({ setMicEnabled });
+
+  // Sync mute/input-mode state -> LiveKit mic enabled.
+  // PTT keeps the mic off while idle — usePushToTalk enables it only while the
+  // key is held. Server mute overrides local state.
+  useEffect(() => {
+    if (!initialSyncDone.current) return;
+
+    const shouldEnable =
+      inputMode === "push_to_talk" ? false : !isMuted && !isServerMuted;
+    localParticipant.setMicrophoneEnabled(shouldEnable).catch((err: unknown) => {
+      console.error("[VoiceStateManager] Failed to toggle microphone:", err);
+    });
+  }, [isMuted, isServerMuted, inputMode, localParticipant]);
+
+  // Screen share audio capture (Electron only) — see the effect further down.
+  const systemAudioCapture = useSystemAudioCapture();
+  const systemAudioCaptureRef = useRef(systemAudioCapture);
+  systemAudioCaptureRef.current = systemAudioCapture;
+
+  /** When the current browser or phone share went live; null while none is. */
+  const sharePublishedAtRef = useRef<number | null>(null);
+  /** Which run of the screen-share audio effect owns the capture process — see that effect. */
+  const audioRunRef = useRef(0);
+
+  // Sync isStreaming -> LiveKit screen share video.
+  // Capacitor (iOS/Android): native plugin via separate LiveKit connection.
+  //   iOS: ReplayKit + LiveKit Swift SDK. Android: MediaProjection + LiveKit Android SDK.
+  // Electron/Browser: getDisplayMedia. Share audio is its own effect below — on Electron it
+  // belongs to the share, not to this engine (the helper engines draw video without it).
+  useEffect(() => {
+    if (!initialSyncDone.current) return;
+
+    let cancelled = false;
+    const useNativeScreenShare = isCapacitor();
+
+    async function toggleScreenShare() {
+      if (cancelled) return;
+
+      if (isStreaming) {
+        if (useNativeScreenShare) {
+          // Capacitor (iOS/Android): native screen share plugin. The voice channel's server, not the
+          // one on screen — a token asked of the server being browsed is refused.
+          const serverId =
+            useVoiceStore.getState().currentVoiceServerId ?? useServerStore.getState().activeServerId;
+          const channelId = useVoiceStore.getState().currentVoiceChannelId;
+          if (!serverId || !channelId) return;
+
+          const response = await voiceApi.getScreenShareToken(serverId, channelId);
+          if (cancelled || !response.success || !response.data) {
+            console.error("[VoiceStateManager] Failed to get screen share token:", response.error);
+            return;
+          }
+
+          await startNativeScreenShare(response.data.url, response.data.token);
+          if (!cancelled) sharePublishedAtRef.current = Date.now();
+        } else {
+          const ssq = useVoiceStore.getState().screenShareQuality;
+          const ssRes = ssq === "720p"
+            ? { width: 1280, height: 720, frameRate: 30 }
+            : { width: 1920, height: 1080, frameRate: 30 };
+          await localParticipant.setScreenShareEnabled(true, {
+            // Electron takes share audio from the native capture instead: getDisplayMedia's
+            // loopback would carry our own voice chat back into the stream.
+            audio: isElectron() ? false : screenShareAudio,
+            resolution: ssRes,
+            contentHint: "motion",
+          });
+        }
+
+        // External stop (OS "stop sharing" overlay or captured window/game closing):
+        // LiveKit doesn't auto-unpublish on track end, so flip the store ourselves.
+        if (!useNativeScreenShare && !cancelled) {
+          sharePublishedAtRef.current = Date.now();
+          const mst = localParticipant
+            .getTrackPublication(Track.Source.ScreenShare)
+            ?.track?.mediaStreamTrack;
+          mst?.addEventListener("ended", () => {
+            if (useVoiceStore.getState().isStreaming) {
+              reportShareStoppedItself("track_ended", sharePublishedAtRef.current);
+              useVoiceStore.getState().setStreaming(false);
+            }
+          }, { once: true });
+        }
+      } else {
+        sharePublishedAtRef.current = null;
+        if (useNativeScreenShare) {
+          // Capacitor: stop native screen share
+          await stopNativeScreenShare();
+        } else {
+          await localParticipant.setScreenShareEnabled(false);
+        }
+      }
+    }
+
+    toggleScreenShare().catch((err: unknown) => {
+      if (cancelled) return;
+      // A helper engine takes the share by deliberately cancelling getDisplayMedia — that
+      // rejection is expected, not a failure.
+      if (!useVoiceStore.getState().isNativeCapturing) {
+        console.error("[VoiceStateManager] Failed to toggle screen share:", err);
+        const worthReporting = isStartFailureWorthReporting({
+          platform: useNativeScreenShare ? "mobile" : isElectron() ? "electron" : "web",
+          pickedShareSourceId: useVoiceStore.getState().pickedShareSourceId,
+          err,
+        });
+        if (isStreaming && worthReporting) {
+          const detail = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+          reportShareStoppedItself("start_failed", null, detail, useNativeScreenShare ? "mobile" : "browser");
+        }
+      }
+      // Either way the JS engine isn't streaming. Presence stays up via isNativeCapturing.
+      if (isStreaming) {
+        useVoiceStore.getState().setStreaming(false);
+      }
+    });
+
+    return () => { cancelled = true; };
+  }, [isStreaming, screenShareAudio, localParticipant]);
+
+  // Mirror local streaming state to the server on every change, whatever the
+  // trigger (button, OS "stop sharing", window/game close, track drop). Other
+  // clients only learn we stopped through this — the button alone wasn't enough.
+  // One sharing concept, two places a share runs: getDisplayMedia, or the native helper ("Smooth
+  // Video", and "Sharp Video" on an HDR display) — presence follows either being live.
+  const isNativeCapturing = useVoiceStore((s) => s.isNativeCapturing);
+
+  // Two different questions, and they were the same flag until now.
+  //
+  // isSharing = "the user wants to share". True from the button click, before the picker even
+  // opens. Share audio and the picked-source bookkeeping below need this one: the source id is
+  // recorded at pick time, and clearing it on anything narrower would leave the audio unscoped.
+  //
+  // isSharePublished = "a track is actually on the wire". `isScreenShareEnabled` is the SDK's own
+  // !!getTrackPublication(ScreenShare), so it flips only once getDisplayMedia has resolved — i.e.
+  // after the user picked. `isNativeCapturing` is already publish-accurate: the helper sets it
+  // after it reports ready.
+  //
+  // Only presence uses the second one. Sending intent told the whole channel someone was streaming
+  // while they were still reading window titles in the picker — and told them again that it
+  // stopped if the picker was cancelled.
+  const isSharing = isStreaming || isNativeCapturing;
+  const isSharePublished = isScreenShareEnabled || isNativeCapturing;
+
+  // Screen share audio (Electron). Scoped to the picked source by the native capture: a shared
+  // window contributes only its own audio — not the film playing next to it — while a shared
+  // monitor contributes everything except our own tree (which would echo voice chat back).
+  // It follows isSharing, not isStreaming: with a helper engine the helper draws the video and
+  // getDisplayMedia is cancelled, but this track is still published by us.
+  useEffect(() => {
+    if (!isElectron() || !initialSyncDone.current) return;
+
+    const shouldCapture = isSharing && screenShareAudio && pickedShareSourceId !== null;
+    // There is one capture process behind the hook, so only its current owner may stop it.
+    const myRun = ++audioRunRef.current;
+
+    const run = shouldCapture
+      ? startShareAudioRun<LKLocalAudioTrack>({
+          start: (onEnded) => systemAudioCaptureRef.current.start(pickedShareSourceId, onEnded),
+          stopCapture: () => systemAudioCaptureRef.current.stop(),
+          publish: async (track) => {
+            const lkTrack = new LKLocalAudioTrack(track, undefined, false);
+            await localParticipant.publishTrack(lkTrack, { source: Track.Source.ScreenShareAudio });
+            return lkTrack;
+          },
+          unpublish: async (lkTrack) => {
+            await localParticipant.unpublishTrack(lkTrack);
+          },
+          isCurrentOwner: () => audioRunRef.current === myRun,
+          notify: (notice) => useToastStore.getState().addToast("warning", i18n.t(`voice:${notice}`), 10_000),
+          logError: (what, err) => console.error(`[VoiceStateManager] ${what}`, err),
+        })
+      : null;
+
+    // No share, no source: a leftover id would scope the next share's audio to the old window.
+    if (!isSharing && pickedShareSourceId !== null) {
+      useVoiceStore.getState().setPickedShareSourceId(null);
+    }
+
+    // Stopping belongs here rather than in an else-branch above: leaving voice clears isSharing and
+    // unmounts us in the same commit, so the effect never runs again — only this does. Without it
+    // the capture process outlives the share and keeps recording the machine's audio.
+    return () => run?.cancel();
+  }, [isSharing, screenShareAudio, pickedShareSourceId, localParticipant]);
+
+  // The helper ends on its own when it crashes, or when the source it was capturing goes away (the
+  // game exits, the window closes, a display is unplugged). Nothing else notices: isNativeCapturing
+  // would stay true, so the button would claim we're sharing and presence would keep telling
+  // everyone so, with nothing on the wire.
+  useEffect(() => {
+    if (!isElectron() || !window.electronAPI) return;
+
+    window.electronAPI.onGameCaptureStopped((code, said) => {
+      useVoiceStore.getState().endNativeCaptureByHelper(code, said);
+    });
+
+    return () => window.electronAPI?.removeGameCaptureListeners();
+  }, []);
+
+  const streamingSentRef = useRef(isSharePublished);
+  useEffect(() => {
+    if (!initialSyncDone.current) return;
+    if (streamingSentRef.current === isSharePublished) return;
+    streamingSentRef.current = isSharePublished;
+    useVoiceStore.getState()._wsSend?.("voice_state_update_request", {
+      is_streaming: isSharePublished,
+      // The ceiling the sharer picked, sent only when starting — the server clears it on stop.
+      share_quality: isSharePublished ? useVoiceStore.getState().screenShareQuality : undefined,
+    });
+  }, [isSharePublished]);
+
+  // Capacitor: listen for native screen share stopped (user stops externally)
+  useEffect(() => {
+    if (!isCapacitor()) return;
+
+    let removeListener: (() => void) | null = null;
+
+    onNativeScreenShareStopped(() => {
+      // Sync store state — native screen share was stopped externally (Control Center on iOS, the
+      // system notification on Android). Stopping it from the app clears isStreaming first, so a
+      // share still marked live here ended on its own — reported like the browser's.
+      const { isStreaming: currentlyStreaming } = useVoiceStore.getState();
+      if (currentlyStreaming) {
+        reportShareStoppedItself("track_ended", sharePublishedAtRef.current, undefined, "mobile");
+        useVoiceStore.getState().setStreaming(false);
+      }
+    }).then((cleanup) => {
+      removeListener = cleanup;
+    });
+
+    return () => {
+      removeListener?.();
+    };
+  }, []);
+
+  // Raise EventEmitter limit — we attach many room listeners here + SDK internals
+  useEffect(() => {
+    if (typeof room.setMaxListeners === "function") {
+      room.setMaxListeners(20);
+    }
+    return () => {
+      if (typeof room.setMaxListeners === "function") {
+        room.setMaxListeners(10);
+      }
+    };
+  }, [room]);
+
+  // Initial sync on room connect — apply store state to LiveKit
+  useEffect(() => {
+    function handleConnected() {
+      // PTT: mic starts disabled. Voice activity: respect store isMuted + server mute.
+      const { isMuted: currentMuted, inputMode: currentMode, isServerMuted: srvMuted,
+              watchingScreenShares: wsShares } = useVoiceStore.getState();
+      const shouldEnable = currentMode === "push_to_talk" ? false : (!currentMuted && !srvMuted);
+
+      localParticipant.setMicrophoneEnabled(shouldEnable).catch((err: unknown) => {
+        console.error("[VoiceStateManager] Failed to set initial mic state:", err);
+      });
+
+      // With autoSubscribe=false, nothing is subscribed by default. Subscribe
+      // existing participants' mic (unless deafened or muted for us) and any screen shares the
+      // user has opted into. Screen share stays unsubscribed by default.
+      room.remoteParticipants.forEach((p) => {
+        const watching = wsShares[resolveUserId(p.identity)] ?? false;
+        p.trackPublications.forEach((pub) => {
+          const rpub = pub as RemoteTrackPublication;
+          if (pub.source === Track.Source.Microphone) {
+            rpub.setSubscribed(shouldReceiveMic(p.identity));
+          } else if (
+            pub.source === Track.Source.ScreenShare ||
+            pub.source === Track.Source.ScreenShareAudio
+          ) {
+            rpub.setSubscribed(watching);
+          }
+        });
+      });
+
+      initialSyncDone.current = true;
+    }
+
+    // Restore mic and volumes after SDK internal reconnect.
+    // RoomEvent.Reconnected fires when LiveKit reconnects without our intervention.
+    function handleReconnected() {
+      const { isMuted: currentMuted, inputMode: currentMode, isServerMuted: srvMuted } = useVoiceStore.getState();
+      const shouldEnable = currentMode === "push_to_talk" ? false : (!currentMuted && !srvMuted);
+
+      // Wait for PeerConnection to stabilize before re-enabling mic
+      setTimeout(() => {
+        localParticipant.setMicrophoneEnabled(shouldEnable).catch((err: unknown) => {
+          console.error("[VoiceStateManager] Failed to restore mic after reconnect:", err);
+        });
+
+        // Re-apply volumes and screen share subscriptions — RemoteParticipant objects may have been recreated
+        const { userVolumes: vols, screenShareVolumes: ssVols, masterVolume: master, isDeafened: deaf, isServerDeafened: srvDeaf, watchingScreenShares: wsShares } =
+          useVoiceStore.getState();
+        const masterFactor = master / 100;
+        const fullyDeaf = deaf || srvDeaf;
+
+        room.remoteParticipants.forEach((participant) => {
+          const micVol = vols[participant.identity] ?? 100;
+          participant.setVolume(fullyDeaf ? 0 : (micVol / 100) * masterFactor, Track.Source.Microphone);
+
+          const ssVol = ssVols[participant.identity] ?? 100;
+          participant.setVolume(fullyDeaf ? 0 : (ssVol / 100) * masterFactor, Track.Source.ScreenShareAudio);
+
+          // Restore subscription state.
+          // Mic: follow deafen and local mute. Screen share: follow user opt-in.
+          const watching = wsShares[resolveUserId(participant.identity)] ?? false;
+          participant.trackPublications.forEach((pub) => {
+            if (pub.source === Track.Source.Microphone) {
+              (pub as RemoteTrackPublication).setSubscribed(shouldReceiveMic(participant.identity));
+            } else if (
+              pub.source === Track.Source.ScreenShare ||
+              pub.source === Track.Source.ScreenShareAudio
+            ) {
+              (pub as RemoteTrackPublication).setSubscribed(watching);
+            }
+          });
+        });
+      }, 1000);
+    }
+
+    // Server-mute is enforced at the SFU by changing our publish permission. On unmute the
+    // WS flag (isServerMuted=false) can reach us before the SFU grants mic-publish back, so
+    // the flag-driven setMicrophoneEnabled can race ahead and fail. Re-assert mic when our
+    // permissions actually change so the track is restored once mic-publish is granted.
+    function handleLocalPermissionsChanged(_prev: unknown, participant: Participant) {
+      if (participant.identity !== localParticipant.identity) return;
+      const { isMuted: currentMuted, inputMode: currentMode, isServerMuted: srvMuted } = useVoiceStore.getState();
+      const shouldEnable = currentMode === "push_to_talk" ? false : (!currentMuted && !srvMuted);
+      localParticipant.setMicrophoneEnabled(shouldEnable).catch((err: unknown) => {
+        console.error("[VoiceStateManager] Failed to re-assert mic after permission change:", err);
+      });
+    }
+
+    if (room.state === ConnectionState.Connected) {
+      handleConnected();
+    }
+
+    room.on(RoomEvent.Connected, handleConnected);
+    room.on(RoomEvent.Reconnected, handleReconnected);
+    room.on(RoomEvent.ParticipantPermissionsChanged, handleLocalPermissionsChanged);
+
+    return () => {
+      room.off(RoomEvent.Connected, handleConnected);
+      room.off(RoomEvent.Reconnected, handleReconnected);
+      room.off(RoomEvent.ParticipantPermissionsChanged, handleLocalPermissionsChanged);
+      initialSyncDone.current = false;
+    };
+  }, [room, localParticipant]);
+
+  // Apply output device (sinkId) to all LiveKit audio elements.
+  // Runs on every outputDevice change and on (re)connect — switchActiveDevice
+  // stores the preference on the Room so new tracks also honor it.
+  useEffect(() => {
+    if (!outputDevice) return;
+
+    async function applyOutputDevice() {
+      try {
+        await room.switchActiveDevice("audiooutput", outputDevice);
+      } catch (err) {
+        console.error("[VoiceStateManager] Failed to switch output device:", err);
+      }
+    }
+
+    if (room.state === ConnectionState.Connected) {
+      applyOutputDevice();
+    }
+
+    function handleConnected() {
+      applyOutputDevice();
+    }
+    room.on(RoomEvent.Connected, handleConnected);
+    room.on(RoomEvent.Reconnected, handleConnected);
+
+    return () => {
+      room.off(RoomEvent.Connected, handleConnected);
+      room.off(RoomEvent.Reconnected, handleConnected);
+    };
+  }, [room, outputDevice]);
+
+  // RTT polling: try signaling RTT first, fall back to WebRTC stats ICE candidate-pair
+  useEffect(() => {
+    if (room.state !== ConnectionState.Connected) return;
+    let cancelled = false;
+
+    async function pollRtt() {
+      if (cancelled) return;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const engine = (room as any).engine;
+
+        const signalRtt = engine?.client?.rtt as number | undefined;
+        if (typeof signalRtt === "number" && signalRtt > 0) {
+          useVoiceStore.getState().setRtt(Math.round(signalRtt));
+          return;
+        }
+
+        const pc = engine?.pcManager?.subscriber?.pc as RTCPeerConnection | undefined;
+        if (!pc) return;
+        const stats = await pc.getStats();
+        if (cancelled) return;
+
+        stats.forEach((report: Record<string, unknown>) => {
+          if (
+            report.type === "candidate-pair" &&
+            report.nominated === true &&
+            typeof report.currentRoundTripTime === "number" &&
+            report.currentRoundTripTime > 0
+          ) {
+            useVoiceStore.getState().setRtt(Math.round((report.currentRoundTripTime as number) * 1000));
+          }
+        });
+      } catch {
+        // engine/client not ready yet
+      }
+    }
+
+    pollRtt();
+    const interval = setInterval(pollRtt, 3000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [room, room.state]);
+
+  // Speaking detection -> store (for sidebar outside LiveKit context).
+  // 300ms hold timer prevents flickering on speech pauses.
+  useEffect(() => {
+    const HOLD_MS = 150;
+    const setActiveSpeakers = useVoiceStore.getState().setActiveSpeakers;
+
+    const heldSpeakers = new Map<string, boolean>();
+    const holdTimers = new Map<string, number>();
+
+    function updateStore() {
+      const ids: string[] = [];
+      heldSpeakers.forEach((speaking, identity) => {
+        if (speaking) ids.push(identity);
+      });
+      setActiveSpeakers(ids);
+    }
+
+    function setSpeakerRaw(identity: string, speaking: boolean) {
+      if (speaking) {
+        const existing = holdTimers.get(identity);
+        if (existing) {
+          clearTimeout(existing);
+          holdTimers.delete(identity);
+        }
+        if (!heldSpeakers.get(identity)) {
+          heldSpeakers.set(identity, true);
+          updateStore();
+        }
+      } else {
+        if (heldSpeakers.get(identity) && !holdTimers.has(identity)) {
+          const timerId = window.setTimeout(() => {
+            holdTimers.delete(identity);
+            heldSpeakers.delete(identity);
+            updateStore();
+          }, HOLD_MS);
+          holdTimers.set(identity, timerId);
+        }
+      }
+    }
+
+    function handleActiveSpeakers(speakers: Participant[]) {
+      const activeSpeakerIds = new Set(speakers.map((s) => s.identity));
+
+      for (const s of speakers) {
+        if (s.identity !== localParticipant.identity) {
+          setSpeakerRaw(s.identity, true);
+        }
+      }
+      heldSpeakers.forEach((_speaking, identity) => {
+        if (identity !== localParticipant.identity && !activeSpeakerIds.has(identity)) {
+          setSpeakerRaw(identity, false);
+        }
+      });
+
+      setSpeakerRaw(localParticipant.identity, localParticipant.isSpeaking);
+    }
+
+    room.on(RoomEvent.ActiveSpeakersChanged, handleActiveSpeakers);
+
+    // Clear a participant's speaking state the instant they leave this room
+    // (e.g. admin move/disconnect). ActiveSpeakersChanged isn't guaranteed to
+    // fire on removal, so without this their "speaking" entry can stay stuck —
+    // freezing a green ring on their new channel's tile and keeping the local
+    // AFK reporter from ever seeing the room go silent.
+    function handleSpeakerLeft(participant: RemoteParticipant) {
+      const identity = participant.identity;
+      const pending = holdTimers.get(identity);
+      if (pending) {
+        clearTimeout(pending);
+        holdTimers.delete(identity);
+      }
+      if (heldSpeakers.has(identity)) {
+        heldSpeakers.delete(identity);
+        updateStore();
+      }
+    }
+    room.on(RoomEvent.ParticipantDisconnected, handleSpeakerLeft);
+
+    function handleLocalSpeaking(speaking: boolean) {
+      setSpeakerRaw(localParticipant.identity, speaking);
+    }
+    localParticipant.on(ParticipantEvent.IsSpeakingChanged, handleLocalSpeaking);
+
+    return () => {
+      room.off(RoomEvent.ActiveSpeakersChanged, handleActiveSpeakers);
+      room.off(RoomEvent.ParticipantDisconnected, handleSpeakerLeft);
+      localParticipant.off(ParticipantEvent.IsSpeakingChanged, handleLocalSpeaking);
+      holdTimers.forEach((timerId) => clearTimeout(timerId));
+      holdTimers.clear();
+      heldSpeakers.clear();
+      setActiveSpeakers([]);
+    };
+  }, [room, localParticipant]);
+
+  // Volume sync: per-user + master + deafen -> RemoteParticipant.setVolume()
+  // Requires webAudioMix: true for >100% amplification via GainNode.
+
+  // Latest-ref for volume state — avoids re-registering TrackSubscribed listener on every change
+  const volumeRef = useRef({ userVolumes, screenShareVolumes, masterVolume, isDeafened, isServerDeafened });
+  volumeRef.current = { userVolumes, screenShareVolumes, masterVolume, isDeafened, isServerDeafened };
+
+  // Server deafen overrides local state — all audio is silenced when server deafened
+  const effectiveDeafened = isDeafened || isServerDeafened;
+
+  useEffect(() => {
+    room.remoteParticipants.forEach((participant) => {
+      const masterFactor = masterVolume / 100;
+
+      const micVol = userVolumes[participant.identity] ?? 100;
+      const effectiveMic = effectiveDeafened ? 0 : (micVol / 100) * masterFactor;
+      participant.setVolume(effectiveMic, Track.Source.Microphone);
+
+      const ssVol = screenShareVolumes[participant.identity] ?? 100;
+      const effectiveSS = effectiveDeafened ? 0 : (ssVol / 100) * masterFactor;
+      participant.setVolume(effectiveSS, Track.Source.ScreenShareAudio);
+    });
+  }, [userVolumes, screenShareVolumes, masterVolume, effectiveDeafened, room]);
+
+  const applyVolumeToParticipant = useCallback(
+    (participant: RemoteParticipant) => {
+      const {
+        userVolumes: vols,
+        screenShareVolumes: ssVols,
+        masterVolume: master,
+        isDeafened: deaf,
+        isServerDeafened: srvDeaf,
+      } = volumeRef.current;
+      const masterFactor = master / 100;
+      const fullyDeaf = deaf || srvDeaf;
+
+      const micVol = vols[participant.identity] ?? 100;
+      const effectiveMic = fullyDeaf ? 0 : (micVol / 100) * masterFactor;
+      participant.setVolume(effectiveMic, Track.Source.Microphone);
+
+      const ssVol = ssVols[participant.identity] ?? 100;
+      const effectiveSS = fullyDeaf ? 0 : (ssVol / 100) * masterFactor;
+      participant.setVolume(effectiveSS, Track.Source.ScreenShareAudio);
+    },
+    []
+  );
+
+  // Apply volume when new tracks are subscribed.
+  // Retry after 300ms — webAudioMix pipeline may not be ready at subscribe time.
+  useEffect(() => {
+    function handleTrackSubscribed(
+      _track: RemoteTrack,
+      _publication: RemoteTrackPublication,
+      participant: RemoteParticipant
+    ): void {
+      if (_track.kind !== Track.Kind.Audio) return;
+
+      applyVolumeToParticipant(participant);
+      setTimeout(() => applyVolumeToParticipant(participant), 300);
+    }
+
+    room.on(RoomEvent.TrackSubscribed, handleTrackSubscribed);
+
+    return () => {
+      room.off(RoomEvent.TrackSubscribed, handleTrackSubscribed);
+    };
+  }, [room, applyVolumeToParticipant]);
+
+  // Apply volume on participant reconnect (new RemoteParticipant object)
+  useEffect(() => {
+    function handleParticipantConnected(participant: RemoteParticipant) {
+      setTimeout(() => applyVolumeToParticipant(participant), 500);
+    }
+
+    room.on(RoomEvent.ParticipantConnected, handleParticipantConnected);
+
+    return () => {
+      room.off(RoomEvent.ParticipantConnected, handleParticipantConnected);
+    };
+  }, [room, applyVolumeToParticipant]);
+
+  // [DEBUG] Trace every LiveKit connection lifecycle event for disconnect investigation.
+  // Remove once root cause of sporadic disconnects is identified.
+  useEffect(() => {
+    function stamp(event: string, extra?: Record<string, unknown>) {
+      console.warn(`[LKDebug] ${event}`, {
+        timestamp: new Date().toISOString(),
+        roomState: room.state,
+        sid: room.localParticipant?.sid,
+        identity: room.localParticipant?.identity,
+        remoteCount: room.remoteParticipants.size,
+        ...extra,
+      });
+    }
+
+    const onConnStateChanged = (state: ConnectionState) => stamp("ConnectionStateChanged", { newState: state });
+    const onSignalConnected = () => stamp("SignalConnected");
+    const onReconnecting = () => stamp("Reconnecting");
+    const onReconnected = () => stamp("Reconnected");
+    const onDisconnected = (reason?: unknown) => stamp("Disconnected (room event)", { reason });
+    const onMediaDevicesError = (err: Error) => stamp("MediaDevicesError", { message: err.message });
+    const onConnectionQualityChanged = (quality: unknown, participant?: Participant) => {
+      if (participant?.isLocal) stamp("LocalConnectionQualityChanged", { quality });
+    };
+
+    room.on(RoomEvent.ConnectionStateChanged, onConnStateChanged);
+    room.on(RoomEvent.SignalConnected, onSignalConnected);
+    room.on(RoomEvent.Reconnecting, onReconnecting);
+    room.on(RoomEvent.Reconnected, onReconnected);
+    room.on(RoomEvent.Disconnected, onDisconnected);
+    room.on(RoomEvent.MediaDevicesError, onMediaDevicesError);
+    room.on(RoomEvent.ConnectionQualityChanged, onConnectionQualityChanged);
+
+    stamp("Listeners attached");
+
+    return () => {
+      room.off(RoomEvent.ConnectionStateChanged, onConnStateChanged);
+      room.off(RoomEvent.SignalConnected, onSignalConnected);
+      room.off(RoomEvent.Reconnecting, onReconnecting);
+      room.off(RoomEvent.Reconnected, onReconnected);
+      room.off(RoomEvent.Disconnected, onDisconnected);
+      room.off(RoomEvent.MediaDevicesError, onMediaDevicesError);
+      room.off(RoomEvent.ConnectionQualityChanged, onConnectionQualityChanged);
+    };
+  }, [room]);
+
+  // Audio processor management: NR on -> RNNoise, NR off + sens<100 -> VadGate, else none
+  const processorRef = useRef<AudioProcessor | null>(null);
+  const noiseReductionRef = useRef(noiseReductionMode);
+  noiseReductionRef.current = noiseReductionMode;
+  const micSensitivityRef = useRef(micSensitivity);
+  micSensitivityRef.current = micSensitivity;
+  const inputVolumeRef = useRef(inputVolume);
+  inputVolumeRef.current = inputVolume;
+
+  /**
+   * "Strong" cannot run on this machine's audio hardware. Moves the **setting**, not just the
+   * engine: leaving the slider on Strong while Standard runs is a state the user cannot see and
+   * cannot correct. The toast is what makes the change theirs rather than something that happened
+   * to them. Returns whether it handled the error.
+   */
+  function handleStrongUnavailable(err: unknown): boolean {
+    if (!(err instanceof GtcrnUnsupportedSampleRateError)) return false;
+    useToastStore
+      .getState()
+      .addToast("warning", tVoice("strongUnavailableHere", { rate: err.sampleRate }));
+    useVoiceStore.getState().setNoiseReductionMode("standard");
+    reportProcessorFailure("gtcrn", "unsupported_sample_rate", `${err.sampleRate} Hz`);
+    return true;
+  }
+
+  /**
+   * Sends an attach failure to the operator's log. The user is told nothing here — for the
+   * unsupported-rate case they already got a toast, and for anything else there is nothing they
+   * could act on. What matters is that it stops being invisible on this side.
+   */
+  function reportProcessorFailure(
+    engine: voiceApi.NoiseReductionEngine,
+    reason: voiceApi.NoiseReductionFailureReason,
+    detail: string
+  ) {
+    const serverId = useServerStore.getState().activeServerId;
+    const channelId = useVoiceStore.getState().currentVoiceChannelId;
+    if (!serverId || !channelId) return;
+    void voiceApi.reportNoiseReductionFailure(serverId, channelId, engine, reason, detail);
+  }
+
+  /** The processor kinds the server knows about — "none" never reaches an attach. */
+  function engineOf(kind: ProcessorKind): voiceApi.NoiseReductionEngine | null {
+    return kind === "none" ? null : kind;
+  }
+
+  function getDesiredProcessor(mode: NoiseReductionMode, sens: number): ProcessorKind {
+    if (mode === "standard") return "rnnoise";
+    if (mode === "strong") return "gtcrn";
+    // Denoising off, but the sensitivity gate is a separate control and still applies.
+    if (sens < 100) return "vadgate";
+    return "none";
+  }
+
+  function getCurrentProcessorType(): ProcessorKind {
+    if (!processorRef.current) return "none";
+    if (processorRef.current instanceof RNNoiseProcessor) return "rnnoise";
+    if (processorRef.current instanceof GtcrnProcessor) return "gtcrn";
+    return "vadgate";
+  }
+
+  // Switch processor when noiseReduction or micSensitivity changes
+  useEffect(() => {
+    if (!initialSyncDone.current) return;
+
+    const pub = localParticipant.getTrackPublication(Track.Source.Microphone);
+    const audioTrack = pub?.track as LocalAudioTrack | undefined;
+    if (!audioTrack) return;
+
+    const desired = getDesiredProcessor(noiseReductionMode, micSensitivity);
+    const current = getCurrentProcessorType();
+
+    if (desired === current) {
+      if (processorRef.current && desired !== "none") {
+        processorRef.current.setMicSensitivity(micSensitivity);
+        processorRef.current.setInputVolume(inputVolume);
+      }
+      return;
+    }
+
+    let cancelled = false;
+
+    async function switchProcessor() {
+      if (cancelled) return;
+
+      if (processorRef.current) {
+        await audioTrack!.stopProcessor();
+        processorRef.current = null;
+        // Previous processor removed
+      }
+
+      if (cancelled) return;
+
+      if (desired !== "none") {
+        const processor = createProcessor(desired, micSensitivity, inputVolume);
+        processorRef.current = processor;
+        try {
+          await audioTrack!.setProcessor(processor);
+        } catch (err) {
+          // init() failed, so nothing is attached to the track. Drop the reference before the next
+          // run mistakes it for a live processor and tries to stop it.
+          processorRef.current = null;
+          throw err;
+        }
+      }
+    }
+
+    switchProcessor().catch((err) => {
+      if (cancelled) return;
+      if (handleStrongUnavailable(err)) return;
+      console.error("[VoiceStateManager] Failed to switch audio processor:", err);
+      const engine = engineOf(desired);
+      if (engine) {
+        reportProcessorFailure(engine, "attach_failed", err instanceof Error ? err.message : String(err));
+      }
+    });
+
+    return () => { cancelled = true; };
+  }, [noiseReductionMode, micSensitivity, inputVolume, localParticipant]);
+
+  // Apply processor when mic track is first published (settings already active on join).
+  // The effect above won't catch this since noiseReduction/micSensitivity haven't changed.
+  useEffect(() => {
+    function handleLocalTrackPublished(pub: LocalTrackPublication) {
+      if (pub.source !== Track.Source.Microphone) return;
+      if (processorRef.current) return; // already applied
+
+      const desired = getDesiredProcessor(noiseReductionRef.current, micSensitivityRef.current);
+      if (desired === "none") return;
+
+      const audioTrack = pub.track as LocalAudioTrack | undefined;
+      if (!audioTrack) return;
+
+      const processor = createProcessor(
+        desired,
+        micSensitivityRef.current,
+        inputVolumeRef.current
+      );
+      processorRef.current = processor;
+      audioTrack.setProcessor(processor)
+        .then(() => { /* processor applied */ })
+        .catch((err) => {
+          processorRef.current = null;
+          if (handleStrongUnavailable(err)) return;
+          console.error("[VoiceStateManager] Failed to apply processor on publish:", err);
+          const engine = engineOf(desired);
+          if (engine) {
+            reportProcessorFailure(engine, "attach_failed", err instanceof Error ? err.message : String(err));
+          }
+        });
+    }
+
+    room.on(RoomEvent.LocalTrackPublished, handleLocalTrackPublished);
+    return () => {
+      room.off(RoomEvent.LocalTrackPublished, handleLocalTrackPublished);
+    };
+  }, [room]);
+
+  // Screen share subscription control.
+  // autoSubscribe stays true (audio tracks auto-subscribe).
+  // Screen share tracks are manually controlled: unsubscribe on publish,
+  // subscribe when user clicks in sidebar.
+  //
+  // Microphone tracks are also controlled: when deafened, or a participant is at volume 0 (local
+  // mute), we refuse the subscription entirely — see shouldReceiveMic.
+
+  // Effect A: Explicitly subscribe newly published tracks.
+  // With autoSubscribe=false, nothing subscribes unless we say so.
+  // Mic follows deafen state; screen share follows user opt-in.
+  useEffect(() => {
+    function handleTrackPublished(
+      publication: RemoteTrackPublication,
+      participant: RemoteParticipant
+    ) {
+      if (
+        publication.source === Track.Source.ScreenShare ||
+        publication.source === Track.Source.ScreenShareAudio
+      ) {
+        const watching = useVoiceStore.getState().watchingScreenShares[resolveUserId(participant.identity)] ?? false;
+        publication.setSubscribed(watching);
+      } else if (publication.source === Track.Source.Microphone) {
+        publication.setSubscribed(shouldReceiveMic(participant.identity));
+      }
+    }
+
+    room.on(RoomEvent.TrackPublished, handleTrackPublished);
+    return () => {
+      room.off(RoomEvent.TrackPublished, handleTrackPublished);
+    };
+  }, [room]);
+
+  // Effect C: Toggle microphone subscriptions when deafen or local mute changes.
+  // Also applies on (re)mount — handles the "join already deafened" case
+  // where existing participants' mic tracks would otherwise auto-subscribe.
+  //
+  // Keyed on who is silenced, not on the volumes themselves: every setSubscribed is a signal message,
+  // and dragging a volume slider must not send one per step.
+  const silencedMics = useVoiceStore((s) => silencedMicsKey(s.userVolumes));
+  const isMasterSilent = masterVolume === 0;
+  useEffect(() => {
+    applyMicSubscriptions(room.remoteParticipants.values(), useVoiceStore.getState());
+  }, [effectiveDeafened, silencedMics, isMasterSilent, room]);
+
+  // Sync isStreaming when screen share track is lost (reconnect, SFU drop).
+  // Without this, store stays isStreaming=true but track is gone — user has
+  // to stop+start instead of just clicking start once.
+  useEffect(() => {
+    function handleLocalTrackUnpublished(pub: LocalTrackPublication) {
+      if (pub.source !== Track.Source.ScreenShare) return;
+      const { isStreaming: streaming } = useVoiceStore.getState();
+      if (streaming) {
+        reportShareStoppedItself("unpublished", sharePublishedAtRef.current);
+        useVoiceStore.getState().setStreaming(false);
+      }
+    }
+
+    room.on(RoomEvent.LocalTrackUnpublished, handleLocalTrackUnpublished);
+    return () => {
+      room.off(RoomEvent.LocalTrackUnpublished, handleLocalTrackUnpublished);
+    };
+  }, [room]);
+
+  // Clear watch state when a remote streamer stops sharing or disconnects.
+  // Without this, watchingScreenShares keeps the entry → grid stays in compact
+  // mode (icons stuck top-aligned + small) even though no share is visible.
+  useEffect(() => {
+    function handleRemoteTrackUnpublished(
+      publication: RemoteTrackPublication,
+      participant: RemoteParticipant
+    ) {
+      if (publication.source !== Track.Source.ScreenShare) return;
+      useVoiceStore.getState().removeWatchScreenShare(resolveUserId(participant.identity));
+    }
+
+    function handleParticipantDisconnected(participant: RemoteParticipant) {
+      useVoiceStore.getState().removeWatchScreenShare(resolveUserId(participant.identity));
+    }
+
+    room.on(RoomEvent.TrackUnpublished, handleRemoteTrackUnpublished);
+    room.on(RoomEvent.ParticipantDisconnected, handleParticipantDisconnected);
+    return () => {
+      room.off(RoomEvent.TrackUnpublished, handleRemoteTrackUnpublished);
+      room.off(RoomEvent.ParticipantDisconnected, handleParticipantDisconnected);
+    };
+  }, [room]);
+
+  // Effect B: Subscribe/unsubscribe when watchingScreenShares changes.
+  useEffect(() => {
+    room.remoteParticipants.forEach((participant) => {
+      const watching = watchingScreenShares[resolveUserId(participant.identity)] ?? false;
+
+      participant.trackPublications.forEach((pub) => {
+        if (
+          pub.source === Track.Source.ScreenShare ||
+          pub.source === Track.Source.ScreenShareAudio
+        ) {
+          (pub as RemoteTrackPublication).setSubscribed(watching);
+        }
+      });
+    });
+  }, [watchingScreenShares, room]);
+
+  return null;
+}
+
+export default VoiceStateManager;

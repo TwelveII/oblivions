@@ -1,0 +1,897 @@
+/**
+ * Signal Protocol — DM (1-1) encryption layer.
+ *
+ * X3DH + Double Ratchet implementation for all DM E2EE operations.
+ *
+ * Crypto primitives: X25519 (ECDH), Ed25519 (signatures), HKDF-SHA-256,
+ * HMAC-SHA-256 (chain ratchet), AES-256-GCM (message encryption).
+ *
+ * Uses @noble/curves because Electron ^33 (Chrome 130) lacks Web Crypto
+ * X25519 support (added in Chrome 133). Audited by Cure53 + Trail of Bits.
+ *
+ * Refs: signal.org/docs/specifications/x3dh/, .../doubleratchet/
+ */
+
+import { x25519, ed25519 } from "@noble/curves/ed25519.js";
+import { hkdf } from "@noble/hashes/hkdf.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { hmac } from "@noble/hashes/hmac.js";
+import * as keyStorage from "./keyStorage";
+import { withSessionLock, signalSessionKey } from "./sessionLock";
+import {
+  type StoredIdentityKeyPair,
+  type StoredSignedPreKey,
+  type StoredPreKey,
+  type StoredSession,
+  type SessionState,
+  type MessageHeader,
+  type SignalWireMessage,
+  type PreKeyMessageInfo,
+  SignalMessageType,
+  MAX_SKIP,
+  PREKEY_BATCH_SIZE,
+  HKDF_INFO,
+} from "./types";
+
+// ──────────────────────────────────
+// Base64 Utilities
+// ──────────────────────────────────
+
+/** Uint8Array → base64 string. Used for network transfer and IndexedDB keys. */
+export function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+/** base64 string → Uint8Array. */
+export function fromBase64(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+// ──────────────────────────────────
+// Key Generation
+// ──────────────────────────────────
+
+/** Generate a new X25519 key pair for Diffie-Hellman key agreement. */
+function generateX25519KeyPair(): StoredIdentityKeyPair {
+  const privateKey = x25519.utils.randomSecretKey();
+  const publicKey = x25519.getPublicKey(privateKey);
+  return { publicKey, privateKey };
+}
+
+/**
+ * Generate all E2EE keys for new device setup and save to IndexedDB.
+ * Returns public keys for server upload.
+ */
+export async function generateAllKeys(): Promise<{
+  identityPublicKey: string;
+  signingPublicKey: string;
+  signedPreKey: {
+    id: number;
+    publicKey: string;
+    signature: string;
+  };
+  oneTimePreKeys: Array<{ id: number; publicKey: string }>;
+  registrationId: number;
+}> {
+  // 1. Identity key pair (X25519)
+  const identityKeyPair = generateX25519KeyPair();
+  await keyStorage.saveIdentityKeyPair(identityKeyPair);
+
+  // 2. Ed25519 signing key pair — same seed, different public key format
+  const signingPublicKey = ed25519.getPublicKey(identityKeyPair.privateKey);
+  await keyStorage.saveSigningKeyPair({
+    publicKey: signingPublicKey,
+    privateKey: identityKeyPair.privateKey,
+  });
+
+  // 3. Signed prekey
+  const signedPreKey = await generateSignedPreKey(
+    identityKeyPair.privateKey,
+    1
+  );
+  await keyStorage.saveSignedPreKey(signedPreKey);
+
+  // 4. One-time prekeys (100)
+  const preKeys = generatePreKeys(1, PREKEY_BATCH_SIZE);
+  await keyStorage.savePreKeys(preKeys);
+
+  // 5. Registration ID — random 16-bit device identifier
+  const registrationId = crypto.getRandomValues(new Uint16Array(1))[0];
+
+  return {
+    identityPublicKey: toBase64(identityKeyPair.publicKey),
+    signingPublicKey: toBase64(signingPublicKey),
+    signedPreKey: {
+      id: signedPreKey.id,
+      publicKey: toBase64(signedPreKey.publicKey),
+      signature: toBase64(signedPreKey.signature),
+    },
+    oneTimePreKeys: preKeys.map((pk) => ({
+      id: pk.id,
+      publicKey: toBase64(pk.publicKey),
+    })),
+    registrationId,
+  };
+}
+
+/** Generate a signed prekey, signed with Ed25519 identity key (MITM protection). */
+async function generateSignedPreKey(
+  identityPrivateKey: Uint8Array,
+  id: number
+): Promise<StoredSignedPreKey> {
+  const keyPair = generateX25519KeyPair();
+
+  // Ed25519 signature proves prekey authenticity
+  const signature = ed25519.sign(keyPair.publicKey, identityPrivateKey);
+
+  return {
+    id,
+    publicKey: keyPair.publicKey,
+    privateKey: keyPair.privateKey,
+    signature,
+    createdAt: Date.now(),
+  };
+}
+
+/** Generate a batch of one-time prekeys. */
+function generatePreKeys(start: number, count: number): StoredPreKey[] {
+  const preKeys: StoredPreKey[] = [];
+  for (let i = 0; i < count; i++) {
+    const keyPair = generateX25519KeyPair();
+    preKeys.push({
+      id: start + i,
+      publicKey: keyPair.publicKey,
+      privateKey: keyPair.privateKey,
+    });
+  }
+  return preKeys;
+}
+
+/** Generate additional one-time prekeys when server signals prekey_low. */
+export async function generateMorePreKeys(
+  startId: number,
+  count: number = PREKEY_BATCH_SIZE
+): Promise<Array<{ id: number; publicKey: string }>> {
+  const preKeys = generatePreKeys(startId, count);
+  await keyStorage.savePreKeys(preKeys);
+  return preKeys.map((pk) => ({
+    id: pk.id,
+    publicKey: toBase64(pk.publicKey),
+  }));
+}
+
+/** Rotate signed prekey. Called periodically (e.g., weekly). */
+export async function rotateSignedPreKey(newId: number): Promise<{
+  id: number;
+  publicKey: string;
+  signature: string;
+}> {
+  const identityKeyPair = await keyStorage.getIdentityKeyPair();
+  if (!identityKeyPair) {
+    throw new Error("Identity key pair not found — device not initialized");
+  }
+
+  const newSignedPreKey = await generateSignedPreKey(
+    identityKeyPair.privateKey,
+    newId
+  );
+  await keyStorage.saveSignedPreKey(newSignedPreKey);
+
+  return {
+    id: newSignedPreKey.id,
+    publicKey: toBase64(newSignedPreKey.publicKey),
+    signature: toBase64(newSignedPreKey.signature),
+  };
+}
+
+// ──────────────────────────────────
+// X3DH Key Agreement
+// ──────────────────────────────────
+
+/** Verify signed prekey signature with Ed25519. */
+function verifySignedPreKey(
+  identityKey: Uint8Array,
+  signedPrekey: Uint8Array,
+  signature: Uint8Array
+): boolean {
+  // Server stores the Ed25519 signing key separately; verify against it
+  try {
+    return ed25519.verify(signature, signedPrekey, identityKey);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * X3DH key agreement — sender side (Alice).
+ * Computes shared secret from recipient's prekey bundle via 3-DH or 4-DH,
+ * then initializes a Double Ratchet session.
+ */
+type PreKeyBundleInput = {
+  identityKey: string;       // base64 X25519 public
+  signingKey: string;        // base64 Ed25519 public
+  signedPrekeyId: number;
+  signedPrekey: string;      // base64 X25519 public
+  signedPrekeySignature: string;  // base64 Ed25519 signature
+  oneTimePrekeyId?: number;
+  oneTimePrekey?: string;    // base64 X25519 public (optional)
+  registrationId: number;
+};
+
+/**
+ * Establish a session if there is not one already, then encrypt — as a single critical section.
+ *
+ * The caller must not compose this itself out of `hasSessionFor` + `processPreKeyBundle` +
+ * `encryptMessage`. Those are three separate critical sections, and a concurrent send to the same
+ * device can delete or replace the session in the gaps between them: the loser then encrypts
+ * against a session that no longer exists (`encryptMessage` throws and the send fails) or rides a
+ * chain the recipient never establishes. Reachable through self-fanout, where two sends to
+ * *different* people both target the sender's own other devices.
+ *
+ * `forceNewSession` is for self-fanout: after a recovery restore only key material survives, with
+ * no session state, so the message has to be a PreKey message the peer can establish from.
+ */
+export function establishAndEncrypt(
+  userId: string,
+  deviceId: string,
+  bundle: PreKeyBundleInput,
+  plaintext: string,
+  opts?: { forceNewSession?: boolean }
+): Promise<SignalWireMessage> {
+  return withSessionLock(signalSessionKey(userId, deviceId), async () => {
+    if (opts?.forceNewSession) {
+      // Check the pin before discarding a working session. A rejected key change
+      // must not destroy the last known-good ratchet state.
+      await assertIdentityMatchesPin(userId, deviceId, fromBase64(bundle.identityKey));
+      await keyStorage.deleteSession(userId, deviceId);
+    }
+    if (!(await keyStorage.hasSession(userId, deviceId))) {
+      await processPreKeyBundleLocked(userId, deviceId, bundle);
+    }
+    return encryptMessageLocked(userId, deviceId, plaintext);
+  });
+}
+
+async function processPreKeyBundleLocked(
+  userId: string,
+  deviceId: string,
+  bundle: PreKeyBundleInput
+): Promise<void> {
+  const identityKeyPair = await keyStorage.getIdentityKeyPair();
+  if (!identityKeyPair) {
+    throw new Error("Identity key pair not found — device not initialized");
+  }
+
+  // Decode bundle
+  const theirIdentityKey = fromBase64(bundle.identityKey);
+  const theirSigningKey = fromBase64(bundle.signingKey);
+  const theirSignedPrekey = fromBase64(bundle.signedPrekey);
+  const theirSignature = fromBase64(bundle.signedPrekeySignature);
+  const theirOneTimePrekey = bundle.oneTimePrekey
+    ? fromBase64(bundle.oneTimePrekey)
+    : null;
+
+  // Verify signed prekey signature before trusting any material in the bundle.
+  if (!verifySignedPreKey(theirSigningKey, theirSignedPrekey, theirSignature)) {
+    throw new Error("Signed prekey signature verification failed");
+  }
+
+  // TOFU pinning: a server must not be able to silently replace a device identity.
+  // A changed key requires an explicit, out-of-band re-verification by the user.
+  await rememberTrustedIdentityIfFirstSeen(userId, deviceId, theirIdentityKey);
+
+  // Generate ephemeral key pair
+  const ephemeralKeyPair = generateX25519KeyPair();
+
+  // DH calculations
+  const dh1 = x25519.getSharedSecret(
+    identityKeyPair.privateKey,
+    theirSignedPrekey
+  );
+  const dh2 = x25519.getSharedSecret(
+    ephemeralKeyPair.privateKey,
+    theirIdentityKey
+  );
+  const dh3 = x25519.getSharedSecret(
+    ephemeralKeyPair.privateKey,
+    theirSignedPrekey
+  );
+
+  // Concatenate shared secrets
+  let dhConcat: Uint8Array;
+  if (theirOneTimePrekey) {
+    const dh4 = x25519.getSharedSecret(
+      ephemeralKeyPair.privateKey,
+      theirOneTimePrekey
+    );
+    dhConcat = concatBytes(dh1, dh2, dh3, dh4);
+  } else {
+    dhConcat = concatBytes(dh1, dh2, dh3);
+  }
+
+  // Derive root key + chain key via HKDF
+  const masterSecret = hkdf(
+    sha256,
+    dhConcat,
+    new Uint8Array(32), // salt (zeros — X3DH spec)
+    new TextEncoder().encode(HKDF_INFO.ROOT_KEY),
+    64 // 32 bytes root key + 32 bytes chain key
+  );
+
+  const rootKey = masterSecret.slice(0, 32);
+  const chainKey = masterSecret.slice(32, 64);
+
+  // Create session state
+  const sessionState: SessionState = {
+    rootKey,
+    sendingChainKey: chainKey,
+    receivingChainKey: null,
+    sendingRatchetKeyPair: ephemeralKeyPair,
+    receivingRatchetKey: theirSignedPrekey,
+    sendMessageNumber: 0,
+    receiveMessageNumber: 0,
+    previousSendChainLength: 0,
+    skippedMessageKeys: [],
+  };
+
+  // Identity was pinned (or first-seen) before any session state was created.
+
+  const session: StoredSession = {
+    userId,
+    deviceId,
+    state: sessionState,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+
+  // Store PreKey info as metadata (used by encryptMessage for first message)
+  await keyStorage.setMetadata(`prekey_info:${userId}:${deviceId}`, {
+    registrationId: (await keyStorage.getRegistrationData())?.registrationId ?? 0,
+    identityKey: toBase64(identityKeyPair.publicKey),
+    ephemeralKey: toBase64(ephemeralKeyPair.publicKey),
+    signedPrekeyId: bundle.signedPrekeyId,
+    oneTimePrekeyId: bundle.oneTimePrekeyId,
+  });
+
+  await keyStorage.saveSession(session);
+}
+
+/**
+ * X3DH key agreement — receiver side (Bob).
+ * Called when receiving a PreKey message; computes the same shared secret
+ * using the sender's ephemeral key and local prekey private keys.
+ */
+export async function processPreKeyMessage(
+  senderUserId: string,
+  senderDeviceId: string,
+  preKeyInfo: PreKeyMessageInfo
+): Promise<SessionState> {
+  const identityKeyPair = await keyStorage.getIdentityKeyPair();
+  if (!identityKeyPair) {
+    throw new Error("Identity key pair not found");
+  }
+
+  const senderIdentityKey = fromBase64(preKeyInfo.identityKey);
+  const senderEphemeralKey = fromBase64(preKeyInfo.ephemeralKey);
+
+  // Authenticate the sender's long-term identity before using it in X3DH.
+  // Without this check, a forged PreKey envelope could overwrite an existing TOFU pin.
+  await assertIdentityMatchesPin(senderUserId, senderDeviceId, senderIdentityKey);
+
+  // Find signed prekey
+  const signedPreKey = await keyStorage.getSignedPreKey(
+    preKeyInfo.signedPrekeyId
+  );
+  if (!signedPreKey) {
+    throw new Error(
+      `Signed prekey ${preKeyInfo.signedPrekeyId} not found`
+    );
+  }
+
+  // DH calculations (Bob side — reversed order from Alice)
+  const dh1 = x25519.getSharedSecret(
+    signedPreKey.privateKey,
+    senderIdentityKey
+  );
+  const dh2 = x25519.getSharedSecret(
+    identityKeyPair.privateKey,
+    senderEphemeralKey
+  );
+  const dh3 = x25519.getSharedSecret(
+    signedPreKey.privateKey,
+    senderEphemeralKey
+  );
+
+  let dhConcat: Uint8Array;
+
+  // Include one-time prekey if used
+  if (preKeyInfo.oneTimePrekeyId !== undefined) {
+    const otpk = await keyStorage.getPreKey(preKeyInfo.oneTimePrekeyId);
+    if (otpk) {
+      const dh4 = x25519.getSharedSecret(
+        otpk.privateKey,
+        senderEphemeralKey
+      );
+      dhConcat = concatBytes(dh1, dh2, dh3, dh4);
+      // Don't delete OTP — recovery backup includes all prekeys anyway,
+      // so forward secrecy is already compromised by backup mechanism
+    } else {
+      dhConcat = concatBytes(dh1, dh2, dh3);
+    }
+  } else {
+    dhConcat = concatBytes(dh1, dh2, dh3);
+  }
+
+  // Derive root key + chain key via HKDF
+  const masterSecret = hkdf(
+    sha256,
+    dhConcat,
+    new Uint8Array(32),
+    new TextEncoder().encode(HKDF_INFO.ROOT_KEY),
+    64
+  );
+
+  const rootKey = masterSecret.slice(0, 32);
+  const chainKey = masterSecret.slice(32, 64);
+
+  // Bob's session state — starts with Alice's ratchet key
+  const newRatchetKeyPair = generateX25519KeyPair();
+
+  // Bob performs DH ratchet step
+  const dhOutput = x25519.getSharedSecret(
+    newRatchetKeyPair.privateKey,
+    senderEphemeralKey
+  );
+  const ratchetResult = hkdf(
+    sha256,
+    dhOutput,
+    rootKey,
+    new TextEncoder().encode(HKDF_INFO.ROOT_KEY),
+    64
+  );
+
+  const sessionState: SessionState = {
+    rootKey: ratchetResult.slice(0, 32),
+    sendingChainKey: ratchetResult.slice(32, 64),
+    receivingChainKey: chainKey,
+    sendingRatchetKeyPair: newRatchetKeyPair,
+    receivingRatchetKey: senderEphemeralKey,
+    sendMessageNumber: 0,
+    receiveMessageNumber: 0,
+    previousSendChainLength: 0,
+    skippedMessageKeys: [],
+  };
+
+  // Existing pins were checked before X3DH; first-seen pins wait for AEAD authentication.
+
+  await keyStorage.saveSession({
+    userId: senderUserId,
+    deviceId: senderDeviceId,
+    state: sessionState,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+
+  return sessionState;
+}
+
+/**
+ * Reject a changed identity whenever a pin already exists. First-seen inbound
+ * identities are not pinned until their first message authenticates successfully;
+ * otherwise a forged, undecryptable PreKey envelope could poison the TOFU record.
+ */
+async function assertIdentityMatchesPin(
+  userId: string,
+  deviceId: string,
+  identityKey: Uint8Array
+): Promise<void> {
+  if (identityKey.length !== 32) {
+    throw new Error("Invalid E2EE identity key length");
+  }
+
+  const trusted = await keyStorage.getTrustedIdentity(userId, deviceId);
+  if (trusted && !bytesEqual(trusted.identityKey, identityKey)) {
+    throw new Error(
+      `E2EE identity key changed for device ${deviceId} (user ${userId}); refusing the session to prevent a possible man-in-the-middle attack. Verify the device identity out of band before trusting a replacement key.`
+    );
+  }
+}
+
+/** Pin a first-seen identity after the relevant cryptographic proof succeeded. */
+async function rememberTrustedIdentityIfFirstSeen(
+  userId: string,
+  deviceId: string,
+  identityKey: Uint8Array
+): Promise<void> {
+  await assertIdentityMatchesPin(userId, deviceId, identityKey);
+  const trusted = await keyStorage.getTrustedIdentity(userId, deviceId);
+  if (trusted) return;
+
+  await keyStorage.saveTrustedIdentity({
+    userId,
+    deviceId,
+    identityKey: identityKey.slice(),
+    firstSeen: Date.now(),
+    verified: false,
+  });
+}
+
+// ──────────────────────────────────
+// Double Ratchet — Encryption
+// ──────────────────────────────────
+
+/** Encrypt a message using Double Ratchet. Chain key advances per message (forward secrecy). */
+export function encryptMessage(
+  userId: string,
+  deviceId: string,
+  plaintext: string
+): Promise<SignalWireMessage> {
+  return withSessionLock(signalSessionKey(userId, deviceId), () =>
+    encryptMessageLocked(userId, deviceId, plaintext)
+  );
+}
+
+async function encryptMessageLocked(
+  userId: string,
+  deviceId: string,
+  plaintext: string
+): Promise<SignalWireMessage> {
+  const session = await keyStorage.getSession(userId, deviceId);
+  if (!session) {
+    throw new Error(`No session found for ${userId}:${deviceId}`);
+  }
+
+  const state = session.state;
+
+  if (!state.sendingChainKey) {
+    throw new Error("Sending chain key not initialized");
+  }
+
+  const { messageKey, newChainKey } = deriveMessageKey(state.sendingChainKey);
+  state.sendingChainKey = newChainKey;
+
+  const header: MessageHeader = {
+    ratchetKey: toBase64(state.sendingRatchetKeyPair.publicKey),
+    previousChainLength: state.previousSendChainLength,
+    messageNumber: state.sendMessageNumber,
+  };
+
+  // Encrypt with AES-256-GCM
+  const plaintextBytes = new TextEncoder().encode(plaintext);
+  const ciphertext = await aesGcmEncrypt(messageKey, plaintextBytes, header);
+
+  state.sendMessageNumber++;
+
+  session.state = state;
+  session.updatedAt = Date.now();
+  await keyStorage.saveSession(session);
+
+  // Check if this is a PreKey message (first message in session)
+  const preKeyInfo = await keyStorage.getMetadata<PreKeyMessageInfo>(
+    `prekey_info:${userId}:${deviceId}`
+  );
+
+  if (preKeyInfo) {
+    // Clear PreKey info — only used for first message
+    await keyStorage.setMetadata(`prekey_info:${userId}:${deviceId}`, null);
+
+    return {
+      type: SignalMessageType.PreKey,
+      header,
+      ciphertext: toBase64(new Uint8Array(ciphertext)),
+      preKeyInfo,
+    };
+  }
+
+  return {
+    type: SignalMessageType.Whisper,
+    header,
+    ciphertext: toBase64(new Uint8Array(ciphertext)),
+  };
+}
+
+/** Decrypt a message using Double Ratchet. Performs DH ratchet step if ratchet key changed. */
+export function decryptMessage(
+  senderUserId: string,
+  senderDeviceId: string,
+  wireMessage: SignalWireMessage
+): Promise<string> {
+  return withSessionLock(signalSessionKey(senderUserId, senderDeviceId), () =>
+    decryptMessageLocked(senderUserId, senderDeviceId, wireMessage)
+  );
+}
+
+/**
+ * The session re-establishment below runs INSIDE this lock on purpose: processPreKeyMessage saves
+ * a session, and a concurrent decrypt reading between that save and the load below would work
+ * from a session that is about to be replaced. It must stay unlocked itself — this is the only
+ * caller, and taking the same key again here would deadlock.
+ */
+async function decryptMessageLocked(
+  senderUserId: string,
+  senderDeviceId: string,
+  wireMessage: SignalWireMessage
+): Promise<string> {
+  // PreKey message?
+  if (
+    wireMessage.type === SignalMessageType.PreKey &&
+    wireMessage.preKeyInfo
+  ) {
+    // Always re-establish session on PreKey messages.
+    // Self-fanout messages are always PreKey for recovery compatibility.
+    await processPreKeyMessage(
+      senderUserId,
+      senderDeviceId,
+      wireMessage.preKeyInfo
+    );
+  }
+
+  const session = await keyStorage.getSession(senderUserId, senderDeviceId);
+  if (!session) {
+    throw new Error(
+      `No session found for ${senderUserId}:${senderDeviceId}`
+    );
+  }
+
+  const state = session.state;
+  const header = wireMessage.header;
+  const ciphertext = fromBase64(wireMessage.ciphertext);
+
+  // Check skipped message keys
+  const skippedIdx = state.skippedMessageKeys.findIndex(
+    (sk) =>
+      sk.ratchetKey === header.ratchetKey &&
+      sk.messageNumber === header.messageNumber
+  );
+
+  if (skippedIdx >= 0) {
+    const skipped = state.skippedMessageKeys[skippedIdx];
+    state.skippedMessageKeys.splice(skippedIdx, 1);
+
+    const plaintext = await aesGcmDecrypt(skipped.messageKey, ciphertext, header);
+    const decoded = new TextDecoder().decode(plaintext);
+
+    session.state = state;
+    session.updatedAt = Date.now();
+    await keyStorage.saveSession(session);
+
+    return decoded;
+  }
+
+  // DH ratchet step needed?
+  const headerRatchetKey = fromBase64(header.ratchetKey);
+  const currentReceivingKey = state.receivingRatchetKey;
+
+  if (
+    !currentReceivingKey ||
+    !bytesEqual(headerRatchetKey, currentReceivingKey)
+  ) {
+    // New DH ratchet key — save skipped message keys
+    await skipMessageKeys(state, header.previousChainLength);
+
+    // DH ratchet step
+    state.receivingRatchetKey = headerRatchetKey;
+    state.previousSendChainLength = state.sendMessageNumber;
+    state.sendMessageNumber = 0;
+    state.receiveMessageNumber = 0;
+
+    // New receiving chain key
+    const dhOutput = x25519.getSharedSecret(
+      state.sendingRatchetKeyPair.privateKey,
+      headerRatchetKey
+    );
+    const rkResult = hkdf(
+      sha256,
+      dhOutput,
+      state.rootKey,
+      new TextEncoder().encode(HKDF_INFO.ROOT_KEY),
+      64
+    );
+    state.rootKey = rkResult.slice(0, 32);
+    state.receivingChainKey = rkResult.slice(32, 64);
+
+    // New sending ratchet key pair
+    const newRatchetKeyPair = generateX25519KeyPair();
+    const dhOutput2 = x25519.getSharedSecret(
+      newRatchetKeyPair.privateKey,
+      headerRatchetKey
+    );
+    const rkResult2 = hkdf(
+      sha256,
+      dhOutput2,
+      state.rootKey,
+      new TextEncoder().encode(HKDF_INFO.ROOT_KEY),
+      64
+    );
+    state.rootKey = rkResult2.slice(0, 32);
+    state.sendingChainKey = rkResult2.slice(32, 64);
+    state.sendingRatchetKeyPair = newRatchetKeyPair;
+  }
+
+  // Save skipped message keys
+  await skipMessageKeys(state, header.messageNumber);
+
+  if (!state.receivingChainKey) {
+    throw new Error("Receiving chain key not initialized");
+  }
+
+  const { messageKey, newChainKey } = deriveMessageKey(state.receivingChainKey);
+  state.receivingChainKey = newChainKey;
+  state.receiveMessageNumber++;
+
+  const plaintext = await aesGcmDecrypt(messageKey, ciphertext, header);
+  const decoded = new TextDecoder().decode(plaintext);
+
+  // Only a successfully authenticated first message may establish a TOFU pin.
+  if (wireMessage.type === SignalMessageType.PreKey && wireMessage.preKeyInfo) {
+    await rememberTrustedIdentityIfFirstSeen(
+      senderUserId,
+      senderDeviceId,
+      fromBase64(wireMessage.preKeyInfo.identityKey)
+    );
+  }
+
+  session.state = state;
+  session.updatedAt = Date.now();
+  await keyStorage.saveSession(session);
+
+  return decoded;
+}
+
+// ──────────────────────────────────
+// Session Management
+// ──────────────────────────────────
+
+// hasSessionFor used to live here. It was the "check" half of a check-then-act that
+// establishAndEncrypt now does under one lock; leaving it exported would only invite the same
+// composition back. Callers that need the answer should be inside the lock already.
+
+/** Delete session for a specific user/device pair. */
+export async function deleteSessionFor(
+  userId: string,
+  deviceId: string
+): Promise<void> {
+  await keyStorage.deleteSession(userId, deviceId);
+}
+
+/** Delete all sessions for a user. */
+export async function deleteAllSessionsFor(userId: string): Promise<void> {
+  await keyStorage.deleteAllSessionsForUser(userId);
+}
+
+// ──────────────────────────────────
+// Internal Helpers
+// ──────────────────────────────────
+
+/**
+ * Derive message key from chain key (Signal KDF_CK).
+ * message_key = HMAC(chain_key, 0x01), new_chain_key = HMAC(chain_key, 0x02).
+ * Forward secrecy: old message keys cannot be derived from new chain key.
+ */
+function deriveMessageKey(chainKey: Uint8Array): {
+  messageKey: Uint8Array;
+  newChainKey: Uint8Array;
+} {
+  const messageKey = hmac(sha256, chainKey, new Uint8Array([0x01]));
+  const newChainKey = hmac(sha256, chainKey, new Uint8Array([0x02]));
+  return { messageKey, newChainKey };
+}
+
+/**
+ * Save skipped message keys for out-of-order messages.
+ * MAX_SKIP (1000) limit prevents memory exhaustion DoS.
+ */
+async function skipMessageKeys(
+  state: SessionState,
+  until: number
+): Promise<void> {
+  if (!state.receivingChainKey) return;
+
+  if (until - state.receiveMessageNumber > MAX_SKIP) {
+    throw new Error(
+      `Too many skipped messages (${until - state.receiveMessageNumber} > ${MAX_SKIP})`
+    );
+  }
+
+  while (state.receiveMessageNumber < until) {
+    const { messageKey, newChainKey } = deriveMessageKey(
+      state.receivingChainKey
+    );
+    state.receivingChainKey = newChainKey;
+
+    state.skippedMessageKeys.push({
+      ratchetKey: state.receivingRatchetKey
+        ? toBase64(state.receivingRatchetKey)
+        : "",
+      messageNumber: state.receiveMessageNumber,
+      messageKey,
+    });
+
+    state.receiveMessageNumber++;
+  }
+}
+
+/** AES-256-GCM encrypt. Returns nonce (12B) + ciphertext + auth tag (16B). */
+async function aesGcmEncrypt(
+  key: Uint8Array,
+  plaintext: Uint8Array,
+  associatedData: MessageHeader
+): Promise<ArrayBuffer> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ad = new TextEncoder().encode(JSON.stringify(associatedData));
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    key as BufferSource,
+    "AES-GCM",
+    false,
+    ["encrypt"]
+  );
+
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv, additionalData: ad },
+    cryptoKey,
+    plaintext as BufferSource
+  );
+
+  // iv (12) + ciphertext + tag (16)
+  const result = new Uint8Array(iv.length + encrypted.byteLength);
+  result.set(iv, 0);
+  result.set(new Uint8Array(encrypted), iv.length);
+  return result.buffer;
+}
+
+/** AES-256-GCM decrypt. */
+async function aesGcmDecrypt(
+  key: Uint8Array,
+  data: Uint8Array,
+  associatedData: MessageHeader
+): Promise<ArrayBuffer> {
+  const iv = data.slice(0, 12);
+  const ciphertext = data.slice(12);
+  const ad = new TextEncoder().encode(JSON.stringify(associatedData));
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    key as BufferSource,
+    "AES-GCM",
+    false,
+    ["decrypt"]
+  );
+
+  return crypto.subtle.decrypt(
+    { name: "AES-GCM", iv, additionalData: ad },
+    cryptoKey,
+    ciphertext as BufferSource
+  );
+}
+
+/** Concatenate multiple Uint8Arrays. */
+function concatBytes(...arrays: Uint8Array[]): Uint8Array {
+  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const arr of arrays) {
+    result.set(arr, offset);
+    offset += arr.length;
+  }
+  return result;
+}
+
+/** Compare two Uint8Arrays. Not timing-safe (OK for public key comparison). */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}

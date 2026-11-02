@@ -1,0 +1,368 @@
+package services
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
+	"github.com/akinalp/mqvi/repository"
+	"github.com/akinalp/mqvi/ws"
+)
+
+// VoiceServerPermissionEnforcer re-applies voice permissions at the SFU for users already
+// in voice across a server, after a role's permissions change or a role is deleted.
+type VoiceServerPermissionEnforcer interface {
+	EnforceServerVoicePermissions(serverID string)
+}
+
+// RoleService handles role CRUD. All operations are server-scoped.
+type RoleService interface {
+	GetAllByServer(ctx context.Context, serverID string) ([]models.Role, error)
+	Create(ctx context.Context, serverID, actorID string, req *models.CreateRoleRequest) (*models.Role, error)
+	Update(ctx context.Context, serverID, actorID, roleID string, req *models.UpdateRoleRequest) (*models.Role, error)
+	Delete(ctx context.Context, serverID, actorID, roleID string) error
+	ReorderRoles(ctx context.Context, serverID, actorID string, items []models.PositionUpdate) ([]models.Role, error)
+	// SetVoiceEnforcer wires the voice enforcer post-construction.
+	SetVoiceEnforcer(enforcer VoiceServerPermissionEnforcer)
+	// SetPermCacheInvalidator wires the permission-cache invalidator post-construction.
+	SetPermCacheInvalidator(inv PermissionCacheInvalidator)
+}
+
+type roleService struct {
+	roleRepo       repository.RoleRepository
+	userRepo       repository.UserRepository
+	hub            ws.Broadcaster
+	voiceEnforcer  VoiceServerPermissionEnforcer // set post-construction, may be nil
+	permInvalidator PermissionCacheInvalidator   // set post-construction, may be nil
+}
+
+func NewRoleService(
+	roleRepo repository.RoleRepository,
+	userRepo repository.UserRepository,
+	hub ws.Broadcaster,
+) RoleService {
+	return &roleService{
+		roleRepo: roleRepo,
+		userRepo: userRepo,
+		hub:      hub,
+	}
+}
+
+func (s *roleService) SetVoiceEnforcer(enforcer VoiceServerPermissionEnforcer) {
+	s.voiceEnforcer = enforcer
+}
+
+func (s *roleService) SetPermCacheInvalidator(inv PermissionCacheInvalidator) {
+	s.permInvalidator = inv
+}
+
+// invalidatePermCache flushes cached permissions after a role's bits change or it is
+// deleted (affects every holder). No-op if unwired.
+func (s *roleService) invalidatePermCache() {
+	if s.permInvalidator != nil {
+		s.permInvalidator.InvalidateAllPermissions()
+	}
+}
+
+// enforceServerVoice re-checks the server's voice participants after a permission change.
+// Fire-and-forget so the request isn't blocked on LiveKit I/O.
+func (s *roleService) enforceServerVoice(serverID string) {
+	if s.voiceEnforcer != nil {
+		go s.voiceEnforcer.EnforceServerVoicePermissions(serverID)
+	}
+}
+
+func (s *roleService) GetAllByServer(ctx context.Context, serverID string) ([]models.Role, error) {
+	return s.roleRepo.GetAllByServer(ctx, serverID)
+}
+
+func (s *roleService) Create(ctx context.Context, serverID, actorID string, req *models.CreateRoleRequest) (*models.Role, error) {
+	if err := req.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", pkg.ErrBadRequest, err)
+	}
+
+	// Permission escalation check
+	actorPerms, permErr := s.getActorEffectivePermissions(ctx, actorID, serverID)
+	if permErr != nil {
+		return nil, permErr
+	}
+	if !actorPerms.Has(models.PermAdmin) {
+		escalated := req.Permissions &^ actorPerms
+		if escalated != 0 {
+			return nil, fmt.Errorf("%w: cannot grant permissions you do not have", pkg.ErrForbidden)
+		}
+	}
+
+	allRoles, err := s.roleRepo.GetAllByServer(ctx, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get all roles: %w", err)
+	}
+
+	// Shift all non-default roles up by 1 to make room at position 2
+	var shifts []models.PositionUpdate
+	for _, r := range allRoles {
+		if r.IsDefault {
+			continue
+		}
+		shifts = append(shifts, models.PositionUpdate{ID: r.ID, Position: r.Position + 1})
+	}
+	if len(shifts) > 0 {
+		if err := s.roleRepo.UpdatePositions(ctx, shifts); err != nil {
+			return nil, fmt.Errorf("failed to shift role positions: %w", err)
+		}
+	}
+
+	newPosition := 2
+
+	mentionable := true
+	if req.Mentionable != nil {
+		mentionable = *req.Mentionable
+	}
+
+	role := &models.Role{
+		ServerID:    serverID,
+		Name:        req.Name,
+		Color:       req.Color,
+		Position:    newPosition,
+		Permissions: req.Permissions,
+		Mentionable: mentionable,
+	}
+
+	if err := s.roleRepo.Create(ctx, role); err != nil {
+		return nil, fmt.Errorf("failed to create role: %w", err)
+	}
+
+	s.hub.BroadcastToAll(ws.Event{
+		Op:   ws.OpRoleCreate,
+		Data: role,
+	})
+
+	return role, nil
+}
+
+func (s *roleService) Update(ctx context.Context, serverID, actorID, roleID string, req *models.UpdateRoleRequest) (*models.Role, error) {
+	if err := req.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %v", pkg.ErrBadRequest, err)
+	}
+
+	role, err := s.roleRepo.GetByID(ctx, roleID)
+	if err != nil {
+		return nil, err
+	}
+	// IDOR guard: the role must belong to the route's server.
+	if role == nil || role.ServerID != serverID {
+		return nil, fmt.Errorf("%w: role does not belong to this server", pkg.ErrForbidden)
+	}
+
+	// Owner role: only server owner can edit name/color; permissions are immutable
+	if role.IsOwner {
+		actorRoles, roleErr := s.roleRepo.GetByUserIDAndServer(ctx, actorID, serverID)
+		if roleErr != nil {
+			return nil, fmt.Errorf("failed to get actor roles: %w", roleErr)
+		}
+		if !models.HasOwnerRole(actorRoles) {
+			return nil, fmt.Errorf("%w: only the server owner can modify the Owner role", pkg.ErrForbidden)
+		}
+		if req.Permissions != nil {
+			return nil, fmt.Errorf("%w: Owner role permissions cannot be changed", pkg.ErrForbidden)
+		}
+		if req.Name != nil {
+			role.Name = *req.Name
+		}
+		if req.Color != nil {
+			role.Color = *req.Color
+		}
+		if req.Mentionable != nil {
+			role.Mentionable = *req.Mentionable
+		}
+		if err := s.roleRepo.Update(ctx, role); err != nil {
+			return nil, fmt.Errorf("failed to update role: %w", err)
+		}
+		s.hub.BroadcastToServer(serverID, ws.Event{
+			Op:   ws.OpRoleUpdate,
+			Data: role,
+		})
+		return role, nil
+	}
+
+	actorMaxPos, err := s.getActorMaxPosition(ctx, actorID, serverID)
+	if err != nil {
+		return nil, err
+	}
+
+	if role.Position >= actorMaxPos {
+		return nil, fmt.Errorf("%w: cannot modify a role with equal or higher position", pkg.ErrForbidden)
+	}
+
+	if req.Permissions != nil {
+		actorPerms, permErr := s.getActorEffectivePermissions(ctx, actorID, serverID)
+		if permErr != nil {
+			return nil, permErr
+		}
+		newPerms := models.Permission(*req.Permissions)
+		if !actorPerms.Has(models.PermAdmin) {
+			escalated := newPerms &^ actorPerms
+			if escalated != 0 {
+				return nil, fmt.Errorf("%w: cannot grant permissions you do not have", pkg.ErrForbidden)
+			}
+		}
+	}
+
+	if req.Name != nil {
+		role.Name = *req.Name
+	}
+	if req.Color != nil {
+		role.Color = *req.Color
+	}
+	if req.Permissions != nil {
+		role.Permissions = *req.Permissions
+	}
+	if req.Mentionable != nil {
+		role.Mentionable = *req.Mentionable
+	}
+
+	if err := s.roleRepo.Update(ctx, role); err != nil {
+		return nil, fmt.Errorf("failed to update role: %w", err)
+	}
+
+	// A permissions change can revoke ConnectVoice/Speak for anyone holding this role —
+	// enforce it live for users already in voice (S3) and drop stale cached perms so the
+	// change takes effect immediately for join/send gates too. Name/color/mentionable-only
+	// edits don't touch permissions, so skip them.
+	if req.Permissions != nil {
+		s.invalidatePermCache()
+		s.enforceServerVoice(serverID)
+	}
+
+	s.hub.BroadcastToServer(serverID, ws.Event{
+		Op:   ws.OpRoleUpdate,
+		Data: role,
+	})
+
+	return role, nil
+}
+
+func (s *roleService) Delete(ctx context.Context, serverID, actorID, roleID string) error {
+	role, err := s.roleRepo.GetByID(ctx, roleID)
+	if err != nil {
+		return err
+	}
+	// IDOR guard: the role must belong to the route's server.
+	if role == nil || role.ServerID != serverID {
+		return fmt.Errorf("%w: role does not belong to this server", pkg.ErrForbidden)
+	}
+
+	if role.IsOwner {
+		return fmt.Errorf("%w: the Owner role cannot be deleted", pkg.ErrForbidden)
+	}
+
+	if role.IsDefault {
+		return fmt.Errorf("%w: cannot delete the default role", pkg.ErrBadRequest)
+	}
+
+	actorMaxPos, err := s.getActorMaxPosition(ctx, actorID, serverID)
+	if err != nil {
+		return err
+	}
+
+	if role.Position >= actorMaxPos {
+		return fmt.Errorf("%w: cannot delete a role with equal or higher position", pkg.ErrForbidden)
+	}
+
+	if err := s.roleRepo.Delete(ctx, roleID); err != nil {
+		return fmt.Errorf("failed to delete role: %w", err)
+	}
+
+	// Users lose this role's grants — flush stale cached perms and enforce live for anyone
+	// already in voice (S3).
+	s.invalidatePermCache()
+	s.enforceServerVoice(serverID)
+
+	s.hub.BroadcastToAll(ws.Event{
+		Op:   ws.OpRoleDelete,
+		Data: map[string]string{"id": roleID},
+	})
+
+	return nil
+}
+
+func (s *roleService) ReorderRoles(ctx context.Context, serverID, actorID string, items []models.PositionUpdate) ([]models.Role, error) {
+	if len(items) == 0 {
+		return nil, fmt.Errorf("%w: items cannot be empty", pkg.ErrBadRequest)
+	}
+
+	actorRoles, err := s.roleRepo.GetByUserIDAndServer(ctx, actorID, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get actor roles: %w", err)
+	}
+	actorMaxPos := models.HighestPosition(actorRoles)
+
+	isOwner := models.HasOwnerRole(actorRoles)
+
+	for _, item := range items {
+		role, err := s.roleRepo.GetByID(ctx, item.ID)
+		if err != nil {
+			return nil, err
+		}
+		// IDOR guard: the role must belong to the route's server — checked before the
+		// isOwner short-circuit so a foreign role can't bypass the position rules below.
+		if role == nil || role.ServerID != serverID {
+			return nil, fmt.Errorf("%w: role does not belong to this server", pkg.ErrForbidden)
+		}
+
+		if role.IsOwner {
+			return nil, fmt.Errorf("%w: the Owner role cannot be reordered", pkg.ErrForbidden)
+		}
+
+		if role.IsDefault {
+			return nil, fmt.Errorf("%w: cannot reorder the default role", pkg.ErrBadRequest)
+		}
+
+		if !isOwner {
+			if role.Position >= actorMaxPos {
+				return nil, fmt.Errorf("%w: cannot reorder a role with equal or higher position", pkg.ErrForbidden)
+			}
+			if item.Position >= actorMaxPos {
+				return nil, fmt.Errorf("%w: cannot move a role to equal or higher position than your own", pkg.ErrForbidden)
+			}
+		}
+	}
+
+	if err := s.roleRepo.UpdatePositions(ctx, items); err != nil {
+		return nil, fmt.Errorf("failed to update role positions: %w", err)
+	}
+
+	roles, err := s.roleRepo.GetAllByServer(ctx, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reload roles after reorder: %w", err)
+	}
+
+	s.hub.BroadcastToAll(ws.Event{
+		Op:   ws.OpRolesReorder,
+		Data: roles,
+	})
+
+	return roles, nil
+}
+
+func (s *roleService) getActorMaxPosition(ctx context.Context, actorID, serverID string) (int, error) {
+	actorRoles, err := s.roleRepo.GetByUserIDAndServer(ctx, actorID, serverID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get actor roles: %w", err)
+	}
+	return models.HighestPosition(actorRoles), nil
+}
+
+func (s *roleService) getActorEffectivePermissions(ctx context.Context, actorID, serverID string) (models.Permission, error) {
+	roles, err := s.roleRepo.GetByUserIDAndServer(ctx, actorID, serverID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get actor roles: %w", err)
+	}
+
+	var perms models.Permission
+	for _, r := range roles {
+		perms |= r.Permissions
+	}
+	return perms, nil
+}

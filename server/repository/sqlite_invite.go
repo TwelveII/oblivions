@@ -1,0 +1,149 @@
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"github.com/akinalp/mqvi/database"
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
+)
+
+type sqliteInviteRepo struct {
+	db database.TxQuerier
+}
+
+func NewSQLiteInviteRepo(db database.TxQuerier) InviteRepository {
+	return &sqliteInviteRepo{db: db}
+}
+
+func (r *sqliteInviteRepo) GetByCode(ctx context.Context, code string) (*models.Invite, error) {
+	query := `
+		SELECT code, server_id, created_by, max_uses, uses, expires_at, created_at
+		FROM invites WHERE code = ?`
+
+	invite := &models.Invite{}
+	err := r.db.QueryRowContext(ctx, query, code).Scan(
+		&invite.Code, &invite.ServerID, &invite.CreatedBy, &invite.MaxUses,
+		&invite.Uses, &invite.ExpiresAt, &invite.CreatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, pkg.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get invite: %w", err)
+	}
+
+	return invite, nil
+}
+
+// ListByServer returns a server's invites with creator info via LEFT JOIN.
+func (r *sqliteInviteRepo) ListByServer(ctx context.Context, serverID string) ([]models.InviteWithCreator, error) {
+	query := `
+		SELECT i.code, i.server_id, i.created_by, i.max_uses, i.uses, i.expires_at, i.created_at,
+		       COALESCE(u.username, ''), u.display_name
+		FROM invites i
+		LEFT JOIN users u ON u.id = i.created_by
+		WHERE i.server_id = ?
+		ORDER BY i.created_at DESC`
+
+	rows, err := r.db.QueryContext(ctx, query, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list invites: %w", err)
+	}
+	defer rows.Close()
+
+	var invites []models.InviteWithCreator
+	for rows.Next() {
+		var inv models.InviteWithCreator
+		if err := rows.Scan(
+			&inv.Code, &inv.ServerID, &inv.CreatedBy, &inv.MaxUses,
+			&inv.Uses, &inv.ExpiresAt, &inv.CreatedAt,
+			&inv.CreatorUsername, &inv.CreatorDisplayName,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan invite: %w", err)
+		}
+		invites = append(invites, inv)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate invites: %w", err)
+	}
+
+	return invites, nil
+}
+
+func (r *sqliteInviteRepo) Create(ctx context.Context, invite *models.Invite) error {
+	query := `
+		INSERT INTO invites (code, server_id, created_by, max_uses, uses, expires_at)
+		VALUES (?, ?, ?, ?, 0, ?)`
+
+	_, err := r.db.ExecContext(ctx, query,
+		invite.Code, invite.ServerID, invite.CreatedBy, invite.MaxUses, invite.ExpiresAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create invite: %w", err)
+	}
+
+	return nil
+}
+
+// Delete removes an invite scoped to its server. The server_id predicate is the IDOR
+// guard: invite codes are globally unique, so an unscoped delete-by-code would let a
+// member of any server delete another server's invite. A code belonging to a different
+// server matches 0 rows → ErrNotFound (indistinguishable from a missing code, no oracle).
+func (r *sqliteInviteRepo) Delete(ctx context.Context, serverID, code string) error {
+	query := `DELETE FROM invites WHERE code = ? AND server_id = ?`
+
+	result, err := r.db.ExecContext(ctx, query, code, serverID)
+	if err != nil {
+		return fmt.Errorf("failed to delete invite: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if affected == 0 {
+		return pkg.ErrNotFound
+	}
+
+	return nil
+}
+
+// IncrementUses atomically consumes one use only while a slot remains (max_uses=0 is
+// unlimited). The conditional WHERE closes the check-then-increment race: two concurrent
+// joins on a max_uses=1 invite serialize on the row, and the loser matches 0 rows.
+// Callers resolve the row via GetByCode first, so 0 rows affected means capacity was
+// exhausted concurrently — surfaced as ErrConflict, not ErrNotFound.
+func (r *sqliteInviteRepo) IncrementUses(ctx context.Context, code string) error {
+	query := `UPDATE invites SET uses = uses + 1 WHERE code = ? AND (max_uses = 0 OR uses < max_uses)`
+
+	result, err := r.db.ExecContext(ctx, query, code)
+	if err != nil {
+		return fmt.Errorf("failed to increment invite uses: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if affected == 0 {
+		return pkg.ErrConflict
+	}
+
+	return nil
+}
+
+// DecrementUses gives back one consumed use (compensation for a join that failed after
+// IncrementUses). Guarded by uses > 0 so it can never go negative; 0 rows is a no-op (not
+// an error) since this is best-effort cleanup.
+func (r *sqliteInviteRepo) DecrementUses(ctx context.Context, code string) error {
+	query := `UPDATE invites SET uses = uses - 1 WHERE code = ? AND uses > 0`
+	if _, err := r.db.ExecContext(ctx, query, code); err != nil {
+		return fmt.Errorf("failed to decrement invite uses: %w", err)
+	}
+	return nil
+}

@@ -1,0 +1,269 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"mime/multipart"
+	"net/http"
+	"strconv"
+
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
+	"github.com/akinalp/mqvi/pkg/ctxkeys"
+	"github.com/akinalp/mqvi/pkg/ratelimit"
+	"github.com/akinalp/mqvi/services"
+)
+
+const maxMessageUploadFiles = 10
+
+// MessageHandler handles message endpoints.
+// messageLimiter is shared with DMHandler (user-based, controls total message rate).
+type MessageHandler struct {
+	messageService services.MessageService
+	uploadService  services.UploadService
+	storageService services.StorageService
+	maxUploadSize  int64
+	messageLimiter *ratelimit.MessageRateLimiter
+	urlSigner      services.FileURLSigner
+}
+
+func NewMessageHandler(
+	messageService services.MessageService,
+	uploadService services.UploadService,
+	storageService services.StorageService,
+	maxUploadSize int64,
+	messageLimiter *ratelimit.MessageRateLimiter,
+	urlSigner services.FileURLSigner,
+) *MessageHandler {
+	return &MessageHandler{
+		messageService: messageService,
+		uploadService:  uploadService,
+		storageService: storageService,
+		maxUploadSize:  maxUploadSize,
+		messageLimiter: messageLimiter,
+		urlSigner:      urlSigner,
+	}
+}
+
+// List handles GET /api/channels/{id}/messages?before=ID&limit=50
+// Cursor-based pagination: before=messageID for older messages, limit max 100.
+func (h *MessageHandler) List(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("id")
+
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	beforeID := r.URL.Query().Get("before")
+
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 100 {
+			limit = parsed
+		}
+	}
+
+	page, err := h.messageService.GetByChannelID(r.Context(), channelID, user.ID, beforeID, limit)
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, page)
+}
+
+// Create handles POST /api/channels/{id}/messages
+// Accepts JSON or multipart/form-data (for file attachments).
+func (h *MessageHandler) Create(w http.ResponseWriter, r *http.Request) {
+	channelID := r.PathValue("id")
+
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	if h.messageLimiter != nil && !h.messageLimiter.Allow(user.ID) {
+		retryAfter := h.messageLimiter.CooldownSeconds(user.ID)
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfter))
+		pkg.ErrorWithMessage(w, http.StatusTooManyRequests,
+			fmt.Sprintf("too many messages, please wait %s",
+				ratelimit.FormatRetryMessage(retryAfter)))
+		return
+	}
+
+	contentType := r.Header.Get("Content-Type")
+
+	var req models.CreateMessageRequest
+
+	if isMultipart(contentType) {
+		limitMultipartBody(w, r, h.maxUploadSize, maxMessageUploadFiles)
+		if err := r.ParseMultipartForm(h.maxUploadSize); err != nil {
+			pkg.ErrorWithMessage(w, http.StatusBadRequest, "failed to parse multipart form")
+			return
+		}
+		if r.MultipartForm != nil && len(r.MultipartForm.File["files"]) > maxMessageUploadFiles {
+			pkg.ErrorWithMessage(w, http.StatusBadRequest, "too many files")
+			return
+		}
+
+		req.Content = r.FormValue("content")
+		req.ClientNonce = r.FormValue("client_nonce")
+		if replyTo := r.FormValue("reply_to_id"); replyTo != "" {
+			req.ReplyToID = &replyTo
+		}
+
+		// E2EE fields from multipart
+		if ev := r.FormValue("encryption_version"); ev == "1" {
+			req.EncryptionVersion = 1
+			if ct := r.FormValue("ciphertext"); ct != "" {
+				req.Ciphertext = &ct
+			}
+			if sd := r.FormValue("sender_device_id"); sd != "" {
+				req.SenderDeviceID = &sd
+			}
+			if em := r.FormValue("e2ee_metadata"); em != "" {
+				req.E2EEMetadata = &em
+			}
+		}
+
+		if r.MultipartForm != nil && len(r.MultipartForm.File["files"]) > 0 {
+			req.HasFiles = true
+		}
+	} else {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+
+	// Reserve storage quota before creating the message so a 413 doesn't
+	// leave an orphan message in the DB.
+	var reservedBytes int64
+	if isMultipart(contentType) && r.MultipartForm != nil && len(r.MultipartForm.File["files"]) > 0 {
+		for _, fh := range r.MultipartForm.File["files"] {
+			reservedBytes += fh.Size
+		}
+		// Previews are stored bytes too. Leaving them out made them an unmetered store: trivial
+		// files with large "thumbnails" cost the uploader nothing.
+		reservedBytes += thumbnailBytes(r.MultipartForm, len(r.MultipartForm.File["files"]))
+		if err := h.storageService.Reserve(r.Context(), user.ID, reservedBytes); err != nil {
+			pkg.Error(w, err)
+			return
+		}
+	}
+
+	message, repeat, err := h.messageService.Create(r.Context(), channelID, user.ID, &req)
+	if err != nil {
+		releaseQuota(r.Context(), h.storageService, "message", user.ID, reservedBytes)
+		pkg.Error(w, err)
+		return
+	}
+	// A retry of a send that went through: same answer as the first time, and nothing else — its
+	// files were (or are being) stored by the first request, which also did the broadcast.
+	if repeat {
+		releaseQuota(r.Context(), h.storageService, "message", user.ID, reservedBytes)
+		message.ServerID = r.PathValue("serverId")
+		pkg.JSON(w, http.StatusCreated, message)
+		return
+	}
+
+	// Upload files after message creation
+	if reservedBytes > 0 {
+		isEncrypted := req.EncryptionVersion == 1
+
+		attachments, uploadedBytes, err := uploadEachFile(
+			r.Context(), r.MultipartForm.File["files"], r.MultipartForm,
+			func(ctx context.Context, file multipart.File, header *multipart.FileHeader, thumb *services.ThumbnailUpload) (*models.Attachment, error) {
+				attachment, err := h.uploadService.Upload(ctx, message.ID, file, header, isEncrypted, thumb)
+				if err != nil {
+					return nil, err
+				}
+				services.SignAttachmentURLs(h.urlSigner, attachment)
+				return attachment, nil
+			},
+			func(a *models.Attachment) int64 { return storedSize(a.FileSize, a.ThumbSize) },
+		)
+		message.Attachments = append(message.Attachments, attachments...)
+
+		if err != nil {
+			// The message goes too: a partial set would mis-key every attachment after the missing
+			// one. See uploadEachFile. Not on the request's context: a client that hung up is the
+			// usual cause of this failure, and its cancelled context would fail the cleanup too —
+			// leaving a message without its files that a retry under the same nonce then returns
+			// as sent.
+			cleanup := context.WithoutCancel(r.Context())
+			if delErr := h.messageService.Delete(cleanup, r.PathValue("serverId"), message.ID, user.ID, models.PermManageMessages); delErr != nil {
+				log.Printf("[message] failed to remove message %s after its upload failed: %v", message.ID, delErr)
+			}
+			releaseQuota(cleanup, h.storageService, "message", user.ID, reservedBytes-uploadedBytes)
+			respondUploadFailure(w, err)
+			return
+		}
+
+		// Release unused reservation (declared sizes are only an estimate)
+		releaseQuota(r.Context(), h.storageService, "message", user.ID, reservedBytes-uploadedBytes)
+	}
+
+	// Set transient server_id so clients can route cross-server notifications
+	message.ServerID = r.PathValue("serverId")
+
+	// Broadcast after uploads so all clients see attachments
+	h.messageService.BroadcastCreate(message)
+
+	pkg.JSON(w, http.StatusCreated, message)
+}
+
+// Update handles PATCH /api/messages/{id} (owner only).
+func (h *MessageHandler) Update(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	var req models.UpdateMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	message, err := h.messageService.Update(r.Context(), id, user.ID, &req)
+	if err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, message)
+}
+
+// Delete handles DELETE /api/messages/{id} (owner or MANAGE_MESSAGES permission).
+func (h *MessageHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	user, ok := r.Context().Value(ctxkeys.User).(*models.User)
+	if !ok {
+		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
+		return
+	}
+
+	perms, _ := r.Context().Value(ctxkeys.Permissions).(models.Permission)
+	serverID := r.PathValue("serverId")
+
+	if err := h.messageService.Delete(r.Context(), serverID, id, user.ID, perms); err != nil {
+		pkg.Error(w, err)
+		return
+	}
+
+	pkg.JSON(w, http.StatusOK, map[string]string{"message": "message deleted"})
+}
+
+func isMultipart(contentType string) bool {
+	return len(contentType) >= 19 && contentType[:19] == "multipart/form-data"
+}

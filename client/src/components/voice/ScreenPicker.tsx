@@ -1,0 +1,341 @@
+/**
+ * ScreenPicker — Screen share source selection modal (Electron only).
+ *
+ * Flow: main process sends "show-screen-picker" IPC with desktopCapturer sources ->
+ * user picks a source -> "screen-picker-result" IPC sends source ID back ->
+ * cancel sends null -> main callback({}) cancels the stream.
+ *
+ * One share flow, two modes — picked here alongside audio:
+ * - "Smooth Video" (smooth): the native WGC + hardware-encode helper. Selecting a source cancels
+ *   getDisplayMedia and hands the share to the helper (falls back to sharp if it can't start).
+ * - "Sharp Video" (sharp): getDisplayMedia — or, on an HDR display, the helper's tone-mapped
+ *   software VP9, because the browser clips HDR content. See utils/publishEngine.
+ */
+
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import { useVoiceStore, type NativeCaptureResult } from "../../stores/voiceStore";
+import { useToastStore } from "../../stores/toastStore";
+import { hasCaptureHelper, resolvePublishEngine } from "../../utils/publishEngine";
+
+interface PickerSource {
+  id: string;
+  name: string;
+  thumbnail: string;
+}
+
+function ScreenPicker() {
+  const { t } = useTranslation("voice");
+  const [sources, setSources] = useState<PickerSource[] | null>(null);
+  const [activeTab, setActiveTab] = useState<"screens" | "windows">("screens");
+  /** Source id whose helper is starting up — blocks a second pick. */
+  const [startingId, setStartingId] = useState<string | null>(null);
+  /** Set when the user cancels while a helper is starting, so the pick in flight aborts. */
+  const cancelledRef = useRef(false);
+  /** Set from the first moment of a pick: `startingId` lands a render later, too late for a double click. */
+  const pickingRef = useRef(false);
+  /**
+   * Whether any monitor is in HDR, for this opening. Asked up front when the share will be sharp, so
+   * the answer is usually in by the click; a smooth share never needs it, and spawning the helper
+   * for nothing on every opening is not free. HDR is a Windows toggle, flipped at will, so it is
+   * never carried from one opening to the next. null = not asked yet.
+   */
+  const hdrRef = useRef<Promise<boolean | null> | null>(null);
+  const askAnyHdr = useCallback((): Promise<boolean | null> => {
+    hdrRef.current ??= window.electronAPI?.getHdrActive().catch(() => null) ?? Promise.resolve(null);
+    return hdrRef.current;
+  }, []);
+  const screenShareAudio = useVoiceStore((s) => s.screenShareAudio);
+  const setScreenShareAudio = useVoiceStore((s) => s.setScreenShareAudio);
+  const screenShareMode = useVoiceStore((s) => s.screenShareMode);
+  const setScreenShareMode = useVoiceStore((s) => s.setScreenShareMode);
+  const startNativeCapture = useVoiceStore((s) => s.startNativeCapture);
+  const stopNativeCapture = useVoiceStore((s) => s.stopNativeCapture);
+  const setPickedShareSourceId = useVoiceStore((s) => s.setPickedShareSourceId);
+  const reportNativeFallback = useVoiceStore((s) => s.reportNativeFallback);
+  const smoothCaptureSupported = useVoiceStore((s) => s.smoothCaptureSupported);
+  const loadSmoothCaptureSupport = useVoiceStore((s) => s.loadSmoothCaptureSupport);
+  const shareAudioSupported = useVoiceStore((s) => s.shareAudioSupported);
+  const loadShareAudioSupport = useVoiceStore((s) => s.loadShareAudioSupport);
+
+  // The helper ships on Windows and macOS only. Offering the choice everywhere meant a Linux user
+  // could pick "Smooth Video", get "Sharp Video" on every single share, and never be told why — the
+  // same silent lie this whole arc has been closing, just on a platform nobody here tests on.
+  const smoothOffered = hasCaptureHelper(window.electronAPI?.platform);
+  // A Windows machine with no hardware encoder is the same lie: every share tried the helper,
+  // waited for it to fail, and fell back with a warning. It is shown disabled there, with why.
+  const smoothAvailable = smoothOffered && smoothCaptureSupported !== false;
+  const effectiveMode = smoothAvailable ? screenShareMode : "sharp";
+
+  // Mounted for the app's lifetime (it hosts the picker IPC), so this asks at launch, long before
+  // the first share. An answer that could not be had is asked again on the next opening, below.
+  useEffect(() => {
+    void loadSmoothCaptureSupport();
+    void loadShareAudioSupport();
+  }, [loadSmoothCaptureSupport, loadShareAudioSupport]);
+
+  // macOS without Screen Recording: no picker can open, so this is the only thing the user sees.
+  useEffect(() => {
+    const api = window.electronAPI;
+    if (!api) return;
+    api.onScreenPermissionDenied(() => {
+      useToastStore.getState().addToast("error", t("screenPermissionDenied"), 10_000);
+    });
+    return () => api.removeScreenPermissionListener();
+  }, [t]);
+
+  useEffect(() => {
+    const api = window.electronAPI;
+    if (!api) return;
+
+    api.onShowScreenPicker((incoming) => {
+      setSources(incoming);
+      hdrRef.current = null;
+      const { screenShareMode: mode, smoothCaptureSupported: smooth } = useVoiceStore.getState();
+      if (mode === "sharp" || smooth === false) void askAnyHdr();
+      // A launch-time probe that could not tell (an encoder listed but busy) settles nothing; ask
+      // again rather than carry the doubt for the rest of the session.
+      if (useVoiceStore.getState().smoothCaptureSupported === null) {
+        void useVoiceStore.getState().loadSmoothCaptureSupport();
+      }
+    });
+
+    return () => api.removeScreenPickerListener();
+  }, [askAnyHdr]);
+
+  const handleSelect = useCallback(
+    async (source: PickerSource) => {
+      // A pick already in flight — a second one would start a second share.
+      if (startingId || pickingRef.current) return;
+      pickingRef.current = true;
+
+      // Every engine's audio is scoped to this source — record it before any starts.
+      setPickedShareSourceId(source.id);
+
+      // The helper must connect and publish before getDisplayMedia can be cancelled, so this
+      // takes a moment. Mark the pick as in flight: the modal would otherwise look frozen, and
+      // main is waiting on exactly one result — send it whatever happens, or it waits forever.
+      setStartingId(source.id);
+      cancelledRef.current = false;
+      try {
+        // The mode alone is not enough: the setting persists and defaults to "smooth", so a machine
+        // that cannot run the helper would otherwise attempt it on every share.
+        const engine = await resolvePublishEngine({
+          mode: screenShareMode,
+          smoothSupported: smoothCaptureSupported,
+          hasHelper: smoothOffered,
+          askHdr: async () => {
+            // A screen is one fixed monitor: ask about that one, so an SDR screen next to an HDR
+            // one stays in the browser. A window can be dragged onto the HDR monitor mid-share,
+            // which only the helper follows, so for a window "any monitor in HDR" is the question.
+            const any = await askAnyHdr();
+            if (any !== true || !source.id.startsWith("screen:")) return any;
+            return (await window.electronAPI?.getHdrActive(source.id).catch(() => any)) ?? any;
+          },
+        });
+        if (cancelledRef.current) return; // handleCancel already answered main
+        if (engine === "browser") {
+          window.electronAPI?.sendScreenPickerResult(source.id);
+          setSources(null);
+          return;
+        }
+
+        let result: NativeCaptureResult = { ok: false };
+        try {
+          result = await startNativeCapture(source.id, engine);
+        } catch (err) {
+          console.error("[ScreenPicker] native capture failed:", err);
+        }
+        const started = result.ok;
+
+        if (cancelledRef.current) {
+          // Backed out while it was coming up. handleCancel already answered main, and the helper
+          // may have published by now — stop it, or we'd be sharing what the user just cancelled.
+          //
+          // Deliberately silent: reporting here would warn the user about something they chose to
+          // abandon, and file it as a fallback in the operator's log. Cancelling is not a failure.
+          if (started) stopNativeCapture();
+          return;
+        }
+
+        if (!result.ok) reportNativeFallback(result);
+
+        // The helper carries the video, so cancel getDisplayMedia; if it never started, fall
+        // through to the browser with this same source.
+        window.electronAPI?.sendScreenPickerResult(started ? null : source.id);
+        setSources(null);
+      } finally {
+        setStartingId(null);
+        pickingRef.current = false;
+      }
+    },
+    [
+      startingId,
+      smoothOffered,
+      smoothCaptureSupported,
+      screenShareMode,
+      startNativeCapture,
+      stopNativeCapture,
+      setPickedShareSourceId,
+      reportNativeFallback,
+      askAnyHdr,
+    ]
+  );
+
+  const handleCancel = useCallback(() => {
+    // Cancelling stays possible while a helper starts (it may take seconds, or hang) — flag it so
+    // the pick in flight aborts instead of quietly turning into a share.
+    if (startingId) cancelledRef.current = true;
+    setPickedShareSourceId(null);
+    window.electronAPI?.sendScreenPickerResult(null);
+    setSources(null);
+  }, [startingId, setPickedShareSourceId]);
+
+  useEffect(() => {
+    if (!sources) return;
+
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        handleCancel();
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [sources, handleCancel]);
+
+  if (!sources) return null;
+
+  // Group sources: screens (screen:*) and windows (window:*)
+  const screens = sources.filter((s) => s.id.startsWith("screen:"));
+  const windows = sources.filter((s) => s.id.startsWith("window:"));
+
+  const activeSources = activeTab === "screens" ? screens : windows;
+
+  return (
+    <div className="sp-overlay" onClick={handleCancel}>
+      <div className="sp-card" onClick={(e) => e.stopPropagation()}>
+        <div className="sp-header">
+          <h2 className="sp-title">{t("screenPickerTitle")}</h2>
+          <button className="sp-close" onClick={handleCancel}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </div>
+
+        <div className="sp-tabs">
+          <button
+            className={`sp-tab${activeTab === "screens" ? " sp-tab-active" : ""}`}
+            onClick={() => setActiveTab("screens")}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+              <line x1="8" y1="21" x2="16" y2="21" />
+              <line x1="12" y1="17" x2="12" y2="21" />
+            </svg>
+            {t("screenPickerScreens")}
+            <span className="sp-tab-count">{screens.length}</span>
+          </button>
+          <button
+            className={`sp-tab${activeTab === "windows" ? " sp-tab-active" : ""}`}
+            onClick={() => setActiveTab("windows")}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+              <line x1="3" y1="9" x2="21" y2="9" />
+            </svg>
+            {t("screenPickerWindows")}
+            <span className="sp-tab-count">{windows.length}</span>
+          </button>
+        </div>
+
+        <div className="sp-grid">
+          {activeSources.length === 0 ? (
+            <div className="sp-empty">{t("screenPickerNoSources")}</div>
+          ) : (
+            activeSources.map((source) => (
+              <button
+                key={source.id}
+                className={`sp-source${startingId === source.id ? " sp-source-starting" : ""}`}
+                onClick={() => void handleSelect(source)}
+                disabled={startingId !== null}
+                title={source.name}
+              >
+                <div className="sp-thumbnail-wrap">
+                  <img
+                    src={source.thumbnail}
+                    alt={source.name}
+                    className="sp-thumbnail"
+                    draggable={false}
+                  />
+                  {startingId === source.id && (
+                    <span className="sp-starting">{t("screenPickerStarting")}</span>
+                  )}
+                </div>
+                <span className="sp-source-name">{source.name}</span>
+              </button>
+            ))
+          )}
+        </div>
+
+        <div className="sp-footer">
+          {/* Hidden where the helper cannot run: a choice that silently resolves to the same thing
+              either way is worse than no choice. */}
+          {smoothOffered && (
+            <div className="sp-mode">
+              <span className="sp-audio-label">{t("screenModeLabel")}</span>
+              <div className="sp-mode-opts">
+                <button
+                  className={`sp-mode-opt${effectiveMode === "smooth" ? " sp-mode-opt-active" : ""}`}
+                  onClick={() => setScreenShareMode("smooth")}
+                  disabled={!smoothAvailable}
+                >
+                  <span className="sp-mode-name">{t("screenModeSmooth")}</span>
+                  <span className="sp-mode-hint">
+                    {smoothAvailable
+                      ? t("screenModeSmoothHint")
+                      : // Every Apple Silicon Mac has the hardware encoder; what a Mac can lack is macOS 14.
+                        t(window.electronAPI?.platform === "darwin" ? "screenModeSmoothNeedsMacos" : "screenModeSmoothUnavailable")}
+                  </span>
+                </button>
+                <button
+                  className={`sp-mode-opt${effectiveMode === "sharp" ? " sp-mode-opt-active" : ""}`}
+                  onClick={() => {
+                    setScreenShareMode("sharp");
+                    if (smoothOffered) void askAnyHdr(); // so the answer is in by the click
+                  }}
+                >
+                  <span className="sp-mode-name">{t("screenModeSharp")}</span>
+                  <span className="sp-mode-hint">{t("screenModeSharpHint")}</span>
+                </button>
+              </div>
+            </div>
+          )}
+          {/* Hidden where the share's audio cannot be captured (Linux, macOS before 13): a switch
+              that promises sound which never goes is worse than none. */}
+          {shareAudioSupported !== false && (
+            <label className="sp-audio-toggle">
+              <span className="sp-audio-label">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                </svg>
+                {t("screenPickerShareAudio")}
+              </span>
+              <div className={`sp-switch${screenShareAudio ? " sp-switch-on" : ""}`}
+                onClick={() => setScreenShareAudio(!screenShareAudio)}
+              >
+                <div className="sp-switch-thumb" />
+              </div>
+            </label>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default ScreenPicker;

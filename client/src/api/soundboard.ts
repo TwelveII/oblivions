@@ -1,0 +1,62 @@
+/**
+ * Soundboard API — per-server sound management and playback.
+ */
+
+import { apiClient, uploadRequest, type UploadOptions } from "./client";
+import type { SoundboardSound } from "../types";
+
+export async function getSounds(serverId: string) {
+  return apiClient<SoundboardSound[]>(`/servers/${serverId}/soundboard/sounds`);
+}
+
+/** Every server the user is in, grouped by server. What may be PLAYED is decided per voice
+ *  channel at play time, so this list is not filtered by permission. */
+export async function getAllSounds() {
+  return apiClient<SoundboardSound[]>(`/soundboard/sounds`);
+}
+
+export async function createSound(
+  serverId: string,
+  file: File,
+  name: string,
+  durationMs: number,
+  emoji?: string,
+  upload?: UploadOptions
+) {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("name", name);
+  formData.append("duration_ms", String(durationMs));
+  if (emoji) formData.append("emoji", emoji);
+
+  return uploadRequest<SoundboardSound>(
+    `/servers/${serverId}/soundboard/sounds`,
+    formData,
+    upload
+  );
+}
+
+export async function updateSound(
+  serverId: string,
+  soundId: string,
+  data: { name?: string; emoji?: string | null }
+) {
+  return apiClient<SoundboardSound>(
+    `/servers/${serverId}/soundboard/sounds/${soundId}`,
+    { method: "PATCH", body: data }
+  );
+}
+
+export async function deleteSound(serverId: string, soundId: string) {
+  return apiClient<void>(
+    `/servers/${serverId}/soundboard/sounds/${soundId}`,
+    { method: "DELETE" }
+  );
+}
+
+export async function playSound(serverId: string, soundId: string) {
+  return apiClient<void>(
+    `/servers/${serverId}/soundboard/sounds/${soundId}/play`,
+    { method: "POST" }
+  );
+}

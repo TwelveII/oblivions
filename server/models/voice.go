@@ -1,0 +1,151 @@
+package models
+
+import "time"
+
+// VoiceState is ephemeral — stored in-memory only, not in DB.
+// Resets on server restart (all WS connections drop anyway).
+type VoiceState struct {
+	UserID      string `json:"user_id"`
+	ChannelID   string `json:"channel_id"`
+	ChannelName string `json:"channel_name"` // cached for cross-server voice presence popups
+	ServerID    string `json:"server_id"`    // parent server — used to scope WS broadcasts
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+	AvatarURL   string `json:"avatar_url"`
+	IsMuted     bool   `json:"is_muted"`
+	IsDeafened  bool   `json:"is_deafened"`
+	IsStreaming bool   `json:"is_streaming"`
+	// ShareQuality is the ceiling the sharer picked ("720p"/"1080p"), not what is being sent —
+	// the stream follows the shared window's own size under it. Empty when not sharing.
+	ShareQuality     string    `json:"share_quality,omitempty"`
+	IsServerMuted    bool      `json:"is_server_muted"`
+	IsServerDeafened bool      `json:"is_server_deafened"`
+	LastActivity     time.Time `json:"-"` // not serialized — server-side AFK tracking only
+}
+
+type VoiceTokenRequest struct {
+	ChannelID string `json:"channel_id"`
+}
+
+type VoiceTokenResponse struct {
+	Token          string `json:"token"`
+	URL            string `json:"url"`
+	ChannelID      string `json:"channel_id"`
+	E2EEPassphrase string `json:"e2ee_passphrase,omitempty"`
+}
+
+// ScreenShareFallbackRequest is the client saying "the native helper could not start, I used the
+// browser engine instead" — the one failure the operator cannot see from the server, because every
+// step that fails happens on the user's machine.
+type ScreenShareFallbackRequest struct {
+	ChannelID string `json:"channel_id"`
+	// Engine is which helper engine was attempted, from ScreenShareFallbackEngines. Empty means
+	// smooth: clients that predate the field only ever had that one.
+	Engine string `json:"engine,omitempty"`
+	// Reason is a code from ScreenShareFallbackReasons, not free text: it lands in app_logs, so an
+	// unvalidated string would let any member write whatever they like into the operator's log.
+	Reason string `json:"reason"`
+	// Detail is the underlying error, kept for diagnosis and truncated by the handler. Never
+	// interpreted, only stored.
+	Detail string `json:"detail,omitempty"`
+}
+
+// ScreenShareFallbackReasons is the closed set the client may report. Anything else is rejected
+// rather than stored, so the log stays scannable by cause.
+//
+// There is deliberately no "unsupported": smooth capture is only offered where it can run, so a
+// platform that cannot do it never reports a fallback — it never attempted one.
+var ScreenShareFallbackReasons = map[string]bool{
+	"no_token":      true, // the screen-token request was refused or carried no passphrase
+	"helper_failed": true, // the native helper never reported that it was publishing
+}
+
+// ScreenShareFallbackEngines is the closed set of helper engines a fallback can come from.
+var ScreenShareFallbackEngines = map[string]bool{
+	"smooth":    true, // "Smooth Video": hardware H264/H265
+	"sharp_hdr": true, // "Sharp Video" on an HDR display: software VP9 after tone-mapping
+}
+
+// ScreenShareStopRequest is the client saying a share ended without the user pressing stop. Like the
+// fallback above, everything that ends it happens on the user's machine, so without this report
+// nothing reaches the server at all.
+type ScreenShareStopRequest struct {
+	ChannelID string `json:"channel_id"`
+	// Engine is which engine carried the share, from ScreenShareStopEngines. Empty means browser:
+	// clients that predate the field only reported the browser engine.
+	Engine string `json:"engine,omitempty"`
+	// Reason is a code from ScreenShareStopReasons; the same closed-set rule as the fallback.
+	Reason string `json:"reason"`
+	// AliveMs is how long the share ran before it ended — a share that dies within a second of
+	// starting is the reported bug, one that ends after an hour is a closed window.
+	AliveMs int64 `json:"alive_ms"`
+	// Detail is the underlying error for start_failed, truncated by the handler.
+	Detail string `json:"detail,omitempty"`
+}
+
+// ScreenShareStopReasons is the closed set of ways a share can end without the stop button.
+var ScreenShareStopReasons = map[string]bool{
+	"start_failed":  true, // publishing the share threw (capture refused, picker failed, SDK error)
+	"track_ended":   true, // the captured source ended: window closed, OS "stop sharing", game exited
+	"unpublished":   true, // LiveKit unpublished the track: reconnect, SFU drop
+	"helper_exited": true, // the native helper died mid-share: encoder failure, crash, room dropped
+}
+
+// ScreenShareStopEngines is the closed set of engines a stop report can name.
+var ScreenShareStopEngines = map[string]bool{
+	"browser":   true, // getDisplayMedia — "Sharp Video" on an SDR display
+	"smooth":    true, // the helper's hardware engine — "Smooth Video"
+	"sharp_hdr": true, // the helper's tone-mapping VP9 engine — "Sharp Video" on an HDR display
+	"mobile":    true, // the phone's native capture (ReplayKit / MediaProjection)
+}
+
+// ScreenShareShortLivedMs splits a share that ended with its source into the reported bug (it ends
+// within seconds of starting) and someone closing what they were sharing. Only the first is a
+// failure; the second is recorded at Info so the Warn rows stay the ones worth reading.
+const ScreenShareShortLivedMs = 10_000
+
+// ScreenShareFallbackDetailMax is how much of Detail survives: long enough for a helper error,
+// short enough that a member cannot use the field as storage.
+const ScreenShareFallbackDetailMax = 200
+
+// VoiceReportBodyMax caps the body of the client reports (screen-share fallback and stop, noise
+// reduction failure). Their fields are bounded after decoding, but the decoder reads the whole body
+// first; an honest report is a few hundred bytes, so this leaves ample room and nothing more.
+const VoiceReportBodyMax = 4 << 10
+
+// ScreenShareChannelIDMax bounds the other field a member controls. Channel ids are 16 hex chars
+// (`lower(hex(randomblob(8)))`); this is generous room around that, and the point is only that the
+// value cannot be unbounded — it lands in app_logs metadata, and nothing else caps a JSON body.
+const ScreenShareChannelIDMax = 64
+
+// NoiseReductionFailureRequest is the client saying "the mic denoiser did not attach".
+//
+// Same blind spot as the screen-share fallback and worse in one way: a share that fails is visible
+// to the person sharing, whereas a denoiser that never attached is not visible to anyone. The user
+// simply sounds noisy and assumes the feature is weak. Until this existed the only record was a
+// console.error nobody reads in a packaged app.
+type NoiseReductionFailureRequest struct {
+	ChannelID string `json:"channel_id"`
+	// Engine is which denoiser was being attached, from NoiseReductionEngines.
+	Engine string `json:"engine"`
+	// Reason is a code from NoiseReductionFailureReasons, not free text — it lands in app_logs.
+	Reason string `json:"reason"`
+	// Detail is the underlying error, kept for diagnosis and truncated by the handler. Never
+	// interpreted, only stored.
+	Detail string `json:"detail,omitempty"`
+}
+
+// NoiseReductionEngines is the closed set of denoisers the client may name.
+var NoiseReductionEngines = map[string]bool{
+	"rnnoise": true, // "Standard" — RNNoise, full-band
+	"gtcrn":   true, // "Strong" — GTCRN, 16 kHz model
+	"vadgate": true, // no denoising, sensitivity gate only
+}
+
+// NoiseReductionFailureReasons is the closed set of causes, so the category stays scannable.
+var NoiseReductionFailureReasons = map[string]bool{
+	// The device's audio rate is one GTCRN cannot run; the client dropped to "Standard" and said so.
+	"unsupported_sample_rate": true,
+	// Anything else thrown while attaching. The user has no denoising at all and was not told.
+	"attach_failed": true,
+}

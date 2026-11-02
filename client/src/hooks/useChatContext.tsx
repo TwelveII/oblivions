@@ -1,0 +1,152 @@
+/**
+ * ChatContext — Shared interface between Channel and DM chat components.
+ *
+ * Abstracts store differences so shared components (Message, MessageInput, etc.)
+ * work with both channel and DM modes via a single interface (DIP).
+ *
+ * ChatMessage uses structural subtyping — both Message and DMMessage satisfy it.
+ */
+
+import { createContext, useContext, type RefObject } from "react";
+import type { User, ReactionGroup, MessageReference, MemberWithRoles, CallMeta } from "../types";
+import type { UploadOptions } from "../api/client";
+import type { EncryptedFileMeta } from "../crypto/fileEncryption";
+
+// ─── ChatMessage — Common message type ───
+// Display-relevant intersection of Message and DMMessage.
+
+export type ChatAttachment = {
+  id: string;
+  filename: string;
+  file_url: string;
+  file_size: number | null;
+  mime_type: string | null;
+  /** Companion preview. Absent on attachments predating thumbnails and on types with no preview. */
+  thumb_url?: string | null;
+  thumb_width?: number | null;
+  thumb_height?: number | null;
+};
+
+export type ChatMessage = {
+  id: string;
+  user_id: string;
+  content: string | null;
+  edited_at: string | null;
+  created_at: string;
+  reply_to_id: string | null;
+  is_pinned: boolean;
+  author: User;
+  attachments: ChatAttachment[];
+  reactions: ReactionGroup[];
+  referenced_message: MessageReference | null;
+  /** User IDs mentioned in this message */
+  mentions?: string[];
+  /** Role IDs mentioned in this message */
+  role_mentions?: string[];
+  /** E2EE: 0 = plaintext, 1 = encrypted */
+  encryption_version?: number;
+  /** E2EE: File encryption keys (index-matched to attachments) */
+  e2ee_file_keys?: EncryptedFileMeta[];
+  /** This device's own send: the nonce it went out under. Keys its row from pending to stored. */
+  client_nonce?: string;
+  /** DM-only, own messages: the other participant's app has received it. */
+  delivered?: boolean;
+  /** DM-only: "text" (default) or "call" — a system call-log entry. */
+  message_type?: string;
+  call_meta?: CallMeta | null;
+};
+
+// ─── Context Value ───
+
+export type ChatContextValue = {
+  mode: "channel" | "dm" | "voice";
+  channelId: string;
+  channelName: string;
+  /** Server ID this channel belongs to (undefined for DMs) */
+  serverId?: string;
+
+  // ─── State ───
+  messages: ChatMessage[];
+  isLoading: boolean;
+  isLoadingMore: boolean;
+  hasMore: boolean;
+  replyingTo: ChatMessage | null;
+  scrollToMessageId: string | null;
+
+  // ─── Message Actions ───
+  sendMessage: (content: string, files?: File[], replyToId?: string, upload?: UploadOptions) => Promise<boolean>;
+  /**
+   * True when sendMessage only queues the message and the bubble reports how delivery went — the
+   * composer clears at once and shows no upload bar of its own. False: sendMessage resolves when
+   * the send is done, and `upload` carries its progress.
+   */
+  sendsInBackground: boolean;
+  /** Pending (unconfirmed) messages: send again under the same nonce, or drop. */
+  retryPending: (nonce: string) => void;
+  discardPending: (nonce: string) => void;
+  editMessage: (id: string, content: string) => Promise<boolean>;
+  deleteMessage: (id: string) => Promise<boolean>;
+  fetchMessages: () => Promise<void>;
+  fetchOlderMessages: () => Promise<void>;
+
+  // ─── Reaction ───
+  toggleReaction: (messageId: string, emoji: string) => void;
+
+  // ─── Reply ───
+  setReplyingTo: (msg: ChatMessage | null) => void;
+  setScrollToMessageId: (id: string | null) => void;
+
+  // ─── Typing ───
+  sendTyping: () => void;
+
+  // ─── Pin ───
+  pinMessage: (messageId: string) => Promise<void>;
+  unpinMessage: (messageId: string) => Promise<void>;
+  isMessagePinned: (messageId: string) => boolean;
+
+  // ─── File Drop ───
+  /** Ref for passing dropped files from ChatArea to MessageInput */
+  addFilesRef: RefObject<((files: File[]) => void) | null>;
+
+  // ─── Permissions / UI ───
+  canSend: boolean;
+  canManageMessages: boolean;
+  showRoleColors: boolean;
+  members: MemberWithRoles[];
+};
+
+// ─── Context ───
+
+const ChatContext = createContext<ChatContextValue | null>(null);
+
+/**
+ * Typing lives in its own context, deliberately.
+ *
+ * It changes on every keystroke anyone in the conversation makes. Folded into the
+ * message-bearing value above, each of those changes minted a new context object and re-rendered
+ * every consumer — including every loaded message row, none of which reads it.
+ *
+ * Keep it that way: adding a frequently-changing field to ChatContextValue puts the cost back.
+ */
+const TypingContext = createContext<string[]>([]);
+
+export const TypingProvider = TypingContext.Provider;
+
+/** Usernames currently typing in this conversation. Empty outside a provider. */
+export function useTypingUsers(): string[] {
+  return useContext(TypingContext);
+}
+
+/**
+ * useChatContext — Must be called within ChannelChatProvider or DMChatProvider.
+ * Throws if used outside a provider.
+ */
+export function useChatContext(): ChatContextValue {
+  const ctx = useContext(ChatContext);
+  if (!ctx) {
+    throw new Error("useChatContext must be used within a ChatProvider");
+  }
+  return ctx;
+}
+
+export { ChatContext };

@@ -1,0 +1,101 @@
+package services
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
+	"github.com/akinalp/mqvi/repository"
+)
+
+// PushTokenService manages registration of device push notification tokens.
+type PushTokenService interface {
+	// RegisterToken binds the token to sessionID (the registering device) so signing that device
+	// out removes it. sessionID is "" for tokens issued without a sid.
+	RegisterToken(ctx context.Context, userID, sessionID string, req *models.RegisterPushTokenRequest) (*models.PushToken, error)
+	UnregisterToken(ctx context.Context, userID, token string) error
+	ListUserTokens(ctx context.Context, userID string) ([]models.PushToken, error)
+	// HasVoIPToken reports whether this device registered a VoIP (CallKit) token: the only proof
+	// the server has that a connection claiming native call media really is the iOS app.
+	HasVoIPToken(ctx context.Context, userID, deviceID string) bool
+}
+
+type pushTokenService struct {
+	repo repository.PushTokenRepository
+}
+
+func NewPushTokenService(repo repository.PushTokenRepository) PushTokenService {
+	return &pushTokenService{repo: repo}
+}
+
+func (s *pushTokenService) RegisterToken(ctx context.Context, userID, sessionID string, req *models.RegisterPushTokenRequest) (*models.PushToken, error) {
+	if err := req.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %s", pkg.ErrBadRequest, err.Error())
+	}
+
+	tokenType := req.TokenType
+	if tokenType == "" {
+		tokenType = models.PushTokenTypeFCM
+	}
+	t := &models.PushToken{
+		UserID:    userID,
+		Token:     req.Token,
+		Platform:  req.Platform,
+		TokenType: tokenType,
+	}
+	if req.DeviceLabel != "" {
+		t.DeviceLabel = &req.DeviceLabel
+	}
+	// Empty for clients that predate the device chain — the server then addresses the whole user.
+	if req.DeviceID != "" {
+		t.DeviceID = &req.DeviceID
+	}
+	if sessionID != "" {
+		t.SessionID = &sessionID
+	}
+
+	if err := s.repo.Upsert(ctx, t); err != nil {
+		return nil, fmt.Errorf("failed to register push token: %w", err)
+	}
+	return t, nil
+}
+
+func (s *pushTokenService) UnregisterToken(ctx context.Context, userID, token string) error {
+	if token == "" {
+		return fmt.Errorf("%w: token is required", pkg.ErrBadRequest)
+	}
+	if err := s.repo.Delete(ctx, userID, token); err != nil {
+		return fmt.Errorf("failed to unregister push token: %w", err)
+	}
+	return nil
+}
+
+func (s *pushTokenService) ListUserTokens(ctx context.Context, userID string) ([]models.PushToken, error) {
+	tokens, err := s.repo.ListByUser(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list push tokens: %w", err)
+	}
+	if tokens == nil {
+		tokens = []models.PushToken{}
+	}
+	return tokens, nil
+}
+
+func (s *pushTokenService) HasVoIPToken(ctx context.Context, userID, deviceID string) bool {
+	if deviceID == "" {
+		return false
+	}
+	tokens, err := s.repo.ListByUser(ctx, userID)
+	if err != nil {
+		log.Printf("[push] voip token lookup for %s: %v", userID, err)
+		return false
+	}
+	for _, t := range tokens {
+		if t.TokenType == models.PushTokenTypeAPNsVoIP && t.DeviceID != nil && *t.DeviceID == deviceID {
+			return true
+		}
+	}
+	return false
+}

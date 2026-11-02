@@ -1,0 +1,599 @@
+/**
+ * voiceStore — Voice channel state management.
+ *
+ * Composes three slices:
+ * - voiceSettingsSlice: persisted voice settings (input mode, PTT, volumes, devices)
+ * - voiceWsSlice: WebSocket event handlers (voice state sync/update, force disconnect)
+ * - voiceScreenShareSlice: screen share watch/focus actions
+ *
+ * This file keeps the core connection + controls (join/leave/mute/deafen/stream).
+ *
+ * Discord-like behaviors:
+ * - Mute toggle: if deafened, deafen is disabled first
+ * - Deafen toggle: enabling deafen also mutes; disabling deafen also unmutes
+ * - A user can only be in one voice channel at a time
+ */
+
+import { create } from "zustand";
+import type { VoiceState, VoiceStateUpdateData, VoiceTokenResponse } from "../types";
+import * as voiceApi from "../api/voice";
+import {
+  startVoiceCallService,
+  useNativeVoice, nativeVoiceConnect, stopNativeVoiceSession,
+  nativeVoiceSetMic, nativeVoiceSetDeafened,
+} from "../utils/nativePlugins";
+import { ensureMicPermission } from "../utils/devicePermissions";
+import { ensureFreshToken } from "../api/client";
+import { useToastStore } from "./toastStore";
+import i18n from "../i18n";
+import { useServerStore } from "./serverStore";
+import { useAuthStore } from "./authStore";
+import {
+  closeAudioContext,
+  playMuteOnSound,
+  playMuteOffSound,
+  playDeafenOnSound,
+  playDeafenOffSound,
+} from "../utils/sounds";
+import { markVoiceActive, clearVoiceRecoveryMark } from "./shared/voiceRecovery";
+import { endP2PCallForVoice } from "./shared/p2pCallControl";
+import {
+  createVoiceSettingsSlice,
+  type VoiceSettingsSlice,
+  type InputMode,
+  type ScreenShareQuality,
+} from "./slices/voiceSettingsSlice";
+import {
+  createVoiceWsSlice,
+  type VoiceWsSlice,
+} from "./slices/voiceWsSlice";
+import {
+  createVoiceScreenShareSlice,
+  type VoiceScreenShareSlice,
+} from "./slices/voiceScreenShareSlice";
+import {
+  HELPER_EXIT_SOURCE_GONE,
+  hasCaptureHelper,
+  sharpShareEncoding,
+  type NativeEngine,
+} from "../utils/publishEngine";
+
+export type { InputMode, ScreenShareQuality };
+
+// Lazy getter for the current user's id. Used to scrub our own voice entry
+// on leave — circular import avoided via getState().
+function getOwnUserId(): string | null {
+  return useAuthStore.getState().user?.id ?? null;
+}
+
+// ─── Mute/Deafen persistence ───
+// Stored separately from voice settings: per-device, never synced to server.
+// Without this, reload resets to unmuted — a privacy risk for anyone who
+// intentionally joined muted and briefly disconnects.
+const MUTE_STATE_KEY = "mqvi_voice_mute_state";
+
+
+function loadMuteState(): { isMuted: boolean; isDeafened: boolean } {
+  try {
+    const raw = localStorage.getItem(MUTE_STATE_KEY);
+    if (!raw) return { isMuted: false, isDeafened: false };
+    const parsed = JSON.parse(raw) as { isMuted?: boolean; isDeafened?: boolean };
+    return {
+      isMuted: !!parsed.isMuted,
+      isDeafened: !!parsed.isDeafened,
+    };
+  } catch {
+    return { isMuted: false, isDeafened: false };
+  }
+}
+
+function saveMuteState(state: { isMuted: boolean; isDeafened: boolean }): void {
+  try {
+    localStorage.setItem(MUTE_STATE_KEY, JSON.stringify(state));
+  } catch {
+    /* localStorage full or inaccessible */
+  }
+}
+
+const initialMuteState = loadMuteState();
+
+/**
+ * Why a helper engine did not start, carried back to whoever asked for it.
+ *
+ * `reason` is absent when nothing was attempted — no active channel, no Electron bridge. That is
+ * not a fallback and must not be announced or logged as one; only the two real failures carry a
+ * reason, along with what is needed to report them.
+ */
+export type NativeCaptureFailure =
+  | { ok: false; reason?: undefined }
+  | {
+      ok: false;
+      engine: NativeEngine;
+      reason: voiceApi.ScreenShareFallbackReason;
+      detail?: string;
+      serverId: string;
+      channelId: string;
+    };
+
+export type NativeCaptureResult = { ok: true } | NativeCaptureFailure;
+
+type VoiceCoreState = {
+  /** channelId -> VoiceState[] mapping */
+  voiceStates: Record<string, VoiceState[]>;
+  currentVoiceChannelId: string | null;
+  /** Server owning the current voice channel — used to disconnect on server leave/delete. */
+  currentVoiceServerId: string | null;
+  isMuted: boolean;
+  isDeafened: boolean;
+  isStreaming: boolean;
+  /** A helper engine is live ("Smooth Video", or "Sharp Video" on HDR): it publishes {userId}_ss */
+  isNativeCapturing: boolean;
+  /** Which helper engine is live and since when; null exactly when isNativeCapturing is false. */
+  nativeCapture: { engine: NativeEngine; startedAt: number } | null;
+  /**
+   * Whether this machine can hardware-encode — "Smooth Video" needs it. null until asked, or if
+   * the probe could not answer (then it is offered as before). Never persisted: it belongs to this
+   * machine, while the smooth/sharp preference is the account's and stays untouched.
+   */
+  smoothCaptureSupported: boolean | null;
+  loadSmoothCaptureSupport: () => Promise<void>;
+  /**
+   * Whether this system can capture a share's audio: Windows, and macOS from 13. null until asked.
+   * Where it is false the picker hides "share audio" rather than offer sound that never goes.
+   */
+  shareAudioSupported: boolean | null;
+  loadShareAudioSupport: () => Promise<void>;
+  /** desktopCapturer id of the source being shared ("window:<HWND>:0" / "screen:<id>:0").
+   *  Set by the picker; the audio capture needs it to scope itself to the share. */
+  pickedShareSourceId: string | null;
+  /** Server-enforced mute — admin silenced this user's mic */
+  isServerMuted: boolean;
+  /** Server-enforced deafen — admin silenced all audio for this user */
+  isServerDeafened: boolean;
+  livekitUrl: string | null;
+  livekitToken: string | null;
+  /** Room-level E2EE passphrase (SFrame) */
+  e2eePassphrase: string | null;
+  /** Monotonically increasing — discards stale API responses */
+  _joinGeneration: number;
+
+  /** Currently speaking users — transient, not persisted */
+  activeSpeakers: Record<string, boolean>;
+
+  /** LiveKit signal server round-trip time (ms) */
+  rtt: number;
+
+  /** Set when another session takes over voice — prevents auto-rejoin loop */
+  wasReplaced: boolean;
+
+  /** channelId → call start time (Unix ms). Populated by server; empty when channel has no participants. */
+  channelTimers: Record<string, number>;
+
+  /** Tab close voice leave callback — registered by useVoice hook */
+  _onLeaveCallback: (() => void) | null;
+  /** Generic WS send callback — avoids prop drilling for deep components */
+  _wsSend: ((op: string, data?: unknown) => void) | null;
+};
+
+type VoiceCoreActions = {
+  joinVoiceChannel: (channelId: string) => Promise<VoiceTokenResponse | null>;
+  /** Hot-swap LiveKit token without disconnect cycle — used for auto-rejoin. */
+  refreshVoiceToken: (channelId: string) => Promise<VoiceTokenResponse | null>;
+  leaveVoiceChannel: () => void;
+  toggleMute: () => void;
+  toggleDeafen: () => void;
+  setStreaming: (isStreaming: boolean) => void;
+  /**
+   * Hand the share to the native helper (Electron/Windows) instead of getDisplayMedia: "smooth" is
+   * WGC + hardware encode, "sharp_hdr" is the same capture tone-mapped into software VP9 for an HDR
+   * display. Resolves not-ok if it couldn't start, so the caller can fall back to the browser.
+   */
+  startNativeCapture: (sourceId: string, engine: NativeEngine) => Promise<NativeCaptureResult>;
+  /**
+   * Tell the user, and the operator, that a helper engine did not start.
+   *
+   * Separate from starting it because only the caller knows whether the failure is worth
+   * announcing: backing out of the picker while the helper comes up also lands here, and warning
+   * someone about a thing they just cancelled — then filing it as a fallback — makes the log worse
+   * rather than better.
+   */
+  reportNativeFallback: (failure: NativeCaptureFailure) => void;
+  stopNativeCapture: () => void;
+  /**
+   * The helper exited on its own mid-share. Its source closing is the user's doing and ends the
+   * share quietly, as the browser engine does; anything else is a failure, shown and reported.
+   */
+  endNativeCaptureByHelper: (exitCode: number | null, said: string) => void;
+  setPickedShareSourceId: (sourceId: string | null) => void;
+  setRtt: (rtt: number) => void;
+  setActiveSpeakers: (speakerIds: string[]) => void;
+  registerOnLeave: (fn: (() => void) | null) => void;
+  registerWsSend: (fn: ((op: string, data?: unknown) => void) | null) => void;
+};
+
+export type VoiceStore =
+  & VoiceCoreState
+  & VoiceCoreActions
+  & VoiceSettingsSlice
+  & VoiceWsSlice
+  & VoiceScreenShareSlice;
+
+// Re-export so legacy direct imports still resolve
+export type { VoiceStateUpdateData };
+
+export const useVoiceStore = create<VoiceStore>((set, get, store) => ({
+  // ─── Slices ───
+  ...createVoiceSettingsSlice(set, get, store),
+  ...createVoiceWsSlice(set, get, store),
+  ...createVoiceScreenShareSlice(set, get, store),
+
+  // ─── Core State ───
+  voiceStates: {},
+  currentVoiceChannelId: null,
+  currentVoiceServerId: null,
+  isMuted: initialMuteState.isMuted,
+  isDeafened: initialMuteState.isDeafened,
+  isStreaming: false,
+  isNativeCapturing: false,
+  nativeCapture: null,
+  smoothCaptureSupported: null,
+  shareAudioSupported: null,
+  pickedShareSourceId: null,
+  isServerMuted: false,
+  isServerDeafened: false,
+  livekitUrl: null,
+  livekitToken: null,
+  e2eePassphrase: null,
+  _joinGeneration: 0,
+  activeSpeakers: {},
+  channelTimers: {},
+  rtt: 0,
+  wasReplaced: false,
+  _onLeaveCallback: null,
+  _wsSend: null,
+
+  // ─── Core Actions ───
+
+  registerOnLeave: (fn) => set({ _onLeaveCallback: fn }),
+  registerWsSend: (fn) => set({ _wsSend: fn }),
+
+  joinVoiceChannel: async (channelId: string) => {
+    try {
+      const serverId = useServerStore.getState().activeServerId;
+      if (!serverId) return null;
+
+      // On mobile, ensure microphone permission before proceeding
+      const micGranted = await ensureMicPermission();
+      if (!micGranted) {
+        console.warn("[voiceStore] Microphone permission denied");
+        return null;
+      }
+
+      const gen = get()._joinGeneration + 1;
+      set({ _joinGeneration: gen });
+
+      await ensureFreshToken();
+      let response = await voiceApi.getVoiceToken(serverId, channelId);
+
+      // Retry once on auth failure — token may have expired mid-request
+      if (!response.success && response.error?.includes("401")) {
+        const refreshed = await ensureFreshToken();
+        if (refreshed) {
+          response = await voiceApi.getVoiceToken(serverId, channelId);
+        }
+      }
+
+      // Discard stale response if generation changed (leave/join interleaved)
+      if (get()._joinGeneration !== gen) {
+        return null;
+      }
+
+      if (!response.success || !response.data) {
+        console.error("[voiceStore] Failed to get voice token:", response.error);
+        return null;
+      }
+
+      // Only once the join is certain; before the native connect, which the bridge runs after this teardown.
+      if (!await endP2PCallForVoice()) return null;
+      // A second join/leave can supersede us while native P2P releases its session.
+      if (get()._joinGeneration !== gen) return null;
+
+      // isMuted is left untouched — PTT idle (mic off until key press) is
+      // enforced at the track level by VoiceStateManager, not via mute state.
+      const initialMuted = get().isMuted;
+      const initialDeafened = get().isDeafened;
+
+      set({
+        currentVoiceChannelId: channelId,
+        currentVoiceServerId: serverId,
+        livekitUrl: response.data.url,
+        livekitToken: response.data.token,
+        e2eePassphrase: response.data.e2ee_passphrase ?? null,
+        isStreaming: false,
+      });
+
+      // Remember this tab owns the voice session — enables F5 recovery
+      // for THIS tab only, prevents unrelated tabs/windows from auto-joining.
+      markVoiceActive(channelId);
+
+      // iOS: connect natively (audio works in background)
+      // Other platforms: VoiceProvider connects via LiveKitRoom props
+      if (useNativeVoice()) {
+        await nativeVoiceConnect(response.data.url, response.data.token, initialMuted, initialDeafened);
+      }
+
+      // Start native foreground service for background audio (mobile only)
+      startVoiceCallService();
+
+      return response.data;
+    } catch (err) {
+      console.error("[voiceStore] Voice join error:", err);
+      return null;
+    }
+  },
+
+  refreshVoiceToken: async (channelId: string) => {
+    try {
+      const serverId = get().currentVoiceServerId ?? useServerStore.getState().activeServerId;
+      if (!serverId) return null;
+
+      await ensureFreshToken();
+      const response = await voiceApi.getVoiceToken(serverId, channelId);
+
+      if (!response.success || !response.data) {
+        return null;
+      }
+
+      // Hot-swap only connection credentials — keep all other state intact.
+      // This avoids the connect=false→true transition that causes LiveKitRoom
+      // to create multiple Room instances (the DUPLICATE_IDENTITY ping-pong).
+      set({
+        livekitUrl: response.data.url,
+        livekitToken: response.data.token,
+        e2eePassphrase: response.data.e2ee_passphrase ?? null,
+      });
+
+      return response.data;
+    } catch (err) {
+      console.error("[voiceStore] refreshVoiceToken error:", err);
+      return null;
+    }
+  },
+
+  leaveVoiceChannel: () => {
+    clearVoiceRecoveryMark();
+    stopNativeVoiceSession();
+
+    // Send unwatch WS events for all active screen share watches before clearing
+    const { watchingScreenShares, _wsSend, currentVoiceChannelId, voiceStates } = get();
+    if (_wsSend) {
+      for (const streamerId of Object.keys(watchingScreenShares)) {
+        _wsSend("screen_share_watch", { streamer_user_id: streamerId, watching: false });
+      }
+    }
+
+    // Proactively scrub our own entry from the participant map. The server's
+    // voice_state_update(leave) may never reach us — e.g. when leaving a server
+    // removes us from that server's broadcast index before the voice leave fires.
+    // Without this, rejoining the server would show ourselves as a phantom voice
+    // participant until another event rebuilds the map.
+    let newVoiceStates = voiceStates;
+    if (currentVoiceChannelId && voiceStates[currentVoiceChannelId]) {
+      const ownId = getOwnUserId();
+      if (ownId) {
+        const filtered = voiceStates[currentVoiceChannelId].filter((s) => s.user_id !== ownId);
+        newVoiceStates = { ...voiceStates };
+        if (filtered.length === 0) {
+          delete newVoiceStates[currentVoiceChannelId];
+        } else {
+          newVoiceStates[currentVoiceChannelId] = filtered;
+        }
+      }
+    }
+
+    // Stop the helper if a share is running in it (it outlives the JS otherwise).
+    if (get().isNativeCapturing) {
+      void window.electronAPI?.stopGameCapture();
+    }
+
+    set({
+      voiceStates: newVoiceStates,
+      currentVoiceChannelId: null,
+      currentVoiceServerId: null,
+      livekitUrl: null,
+      livekitToken: null,
+      e2eePassphrase: null,
+      // isMuted/isDeafened intentionally NOT reset — they persist across sessions
+      isStreaming: false,
+      isNativeCapturing: false,
+      nativeCapture: null,
+  pickedShareSourceId: null,
+      isServerMuted: false,
+      isServerDeafened: false,
+      activeSpeakers: {},
+      watchingScreenShares: {},
+      screenShareViewers: {},
+      rtt: 0,
+      _joinGeneration: get()._joinGeneration + 1,
+    });
+
+    // Release AudioContext memory (2-5MB + accumulated node refs)
+    closeAudioContext();
+  },
+
+  toggleMute: () => {
+    const { isMuted, isDeafened } = get();
+
+    if (isDeafened) {
+      set({ isDeafened: false, isMuted: !isMuted });
+      if (useNativeVoice()) {
+        nativeVoiceSetDeafened(false);
+        nativeVoiceSetMic(isMuted); // was muted, now toggling
+      }
+    } else {
+      set({ isMuted: !isMuted });
+      if (useNativeVoice()) {
+        nativeVoiceSetMic(isMuted); // was muted → enable, was unmuted → disable
+      }
+    }
+    saveMuteState({ isMuted: get().isMuted, isDeafened: get().isDeafened });
+    if (get().isMuted) playMuteOnSound();
+    else playMuteOffSound();
+  },
+
+  toggleDeafen: () => {
+    const { isDeafened } = get();
+
+    if (!isDeafened) {
+      // Deafen on -> mute also on (Discord behavior)
+      set({ isDeafened: true, isMuted: true });
+      if (useNativeVoice()) {
+        nativeVoiceSetDeafened(true);
+        nativeVoiceSetMic(false);
+      }
+    } else {
+      // Deafen off -> unmute too (Discord behavior)
+      set({ isDeafened: false, isMuted: false });
+      if (useNativeVoice()) {
+        nativeVoiceSetDeafened(false);
+        nativeVoiceSetMic(true);
+      }
+    }
+    saveMuteState({ isMuted: get().isMuted, isDeafened: get().isDeafened });
+    if (get().isDeafened) playDeafenOnSound();
+    else playDeafenOffSound();
+  },
+
+  setStreaming: (isStreaming: boolean) => {
+    set({ isStreaming });
+  },
+
+  startNativeCapture: async (sourceId, engine) => {
+    // The voice channel's server, not the one on screen: someone in voice can be browsing another
+    // server, and a token asked of that one is refused — the share would fall back for no reason.
+    const serverId = get().currentVoiceServerId ?? useServerStore.getState().activeServerId;
+    const channelId = get().currentVoiceChannelId;
+    // Not reportable: nothing was attempted, and no share is routed to the helper without these.
+    if (!serverId || !channelId || !window.electronAPI) return { ok: false };
+    // Before the token round-trip, not after: the helper ships only on Windows and macOS, so
+    // anywhere else this would mint a screen-share token and hand the room passphrase to a path that
+    // only rejects it. Also not reportable: shares are only routed to the helper where it exists, so
+    // nothing was attempted.
+    if (!hasCaptureHelper(window.electronAPI.platform)) return { ok: false };
+
+    // Screen-token = the {userId}_ss identity + the room's E2EE passphrase; the native helper
+    // publishes with these, so it decrypts on every client exactly like any screen share.
+    const resp = await voiceApi.getScreenShareToken(serverId, channelId);
+    if (!resp.success || !resp.data?.e2ee_passphrase) {
+      return { ok: false, engine, reason: "no_token", detail: resp.error, serverId, channelId };
+    }
+    const { url, token, e2ee_passphrase } = resp.data;
+    const quality = get().screenShareQuality;
+    // Resolves only once the helper is really publishing — a false here means nothing was ever
+    // on the wire, so the caller can still fall back to the browser.
+    const res = await window.electronAPI.startGameCapture({
+      url,
+      token,
+      e2eePassphrase: e2ee_passphrase,
+      sourceId,
+      // The same setting "Sharp Video" already honours — a cap on the stream, not the capture.
+      maxHeight: quality === "720p" ? 720 : 1080,
+      ...(engine === "sharp_hdr"
+        ? { engine: "sharp" as const, maxBitrate: sharpShareEncoding(quality).maxBitrate }
+        : {}),
+    });
+    if (!res.started) {
+      return { ok: false, engine, reason: "helper_failed", detail: res.error, serverId, channelId };
+    }
+    // Presence is derived from (isStreaming || isNativeCapturing) in VoiceStateManager — one
+    // sharing concept, two engines — so nothing to broadcast here.
+    set({ isNativeCapturing: true, nativeCapture: { engine, startedAt: Date.now() } });
+    return { ok: true };
+  },
+
+  loadShareAudioSupport: async () => {
+    const api = window.electronAPI;
+    if (!api) {
+      set({ shareAudioSupported: false });
+      return;
+    }
+    // A failed ask keeps the switch, as before: hiding it over an IPC hiccup would lose a feature.
+    const supported = await api.getShareAudioSupport().catch(() => null);
+    set({ shareAudioSupported: supported });
+  },
+
+  loadSmoothCaptureSupport: async () => {
+    const api = window.electronAPI;
+    if (!api || !hasCaptureHelper(api.platform)) {
+      set({ smoothCaptureSupported: false });
+      return;
+    }
+    const supported = await api.getSmoothCaptureSupport().catch(() => null);
+    set({ smoothCaptureSupported: supported });
+  },
+
+  reportNativeFallback: (failure) => {
+    if (!failure.reason) return; // nothing was attempted — see startNativeCapture
+    useToastStore
+      .getState()
+      .addToast(
+        "warning",
+        i18n.t(failure.engine === "sharp_hdr" ? "voice:hdrSharpFellBack" : "voice:smoothFellBackToSharp")
+      );
+    void voiceApi.reportScreenShareFallback(
+      failure.serverId,
+      failure.channelId,
+      failure.engine,
+      failure.reason,
+      failure.detail
+    );
+  },
+
+  stopNativeCapture: () => {
+    void window.electronAPI?.stopGameCapture();
+    set({ isNativeCapturing: false, nativeCapture: null });
+  },
+
+  endNativeCaptureByHelper: (exitCode, said) => {
+    const { isNativeCapturing, nativeCapture, currentVoiceServerId, currentVoiceChannelId } = get();
+    if (!isNativeCapturing) return; // we stopped it ourselves
+    get().stopNativeCapture();
+
+    const engine = nativeCapture?.engine ?? "smooth";
+    const aliveMs = nativeCapture ? Date.now() - nativeCapture.startedAt : 0;
+    const sourceGone = exitCode === HELPER_EXIT_SOURCE_GONE;
+    if (!sourceGone) {
+      useToastStore
+        .getState()
+        .addToast(
+          "error",
+          i18n.t(engine === "sharp_hdr" ? "voice:sharpCaptureStopped" : "voice:smoothCaptureStopped")
+        );
+    }
+
+    const serverId = currentVoiceServerId ?? useServerStore.getState().activeServerId;
+    if (!serverId || !currentVoiceChannelId) return;
+    void voiceApi.reportScreenShareStop(
+      serverId,
+      currentVoiceChannelId,
+      engine,
+      sourceGone ? "track_ended" : "helper_exited",
+      aliveMs,
+      sourceGone ? undefined : said || `exit ${exitCode}`
+    );
+  },
+
+  setPickedShareSourceId: (sourceId) => {
+    set({ pickedShareSourceId: sourceId });
+  },
+
+  setRtt: (rtt) => set({ rtt }),
+
+  setActiveSpeakers: (speakerIds) => {
+    const map: Record<string, boolean> = {};
+    for (const id of speakerIds) {
+      map[id] = true;
+    }
+    set({ activeSpeakers: map });
+  },
+}));

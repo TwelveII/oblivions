@@ -1,0 +1,337 @@
+// Package services — voice token generation.
+// LiveKit JWT token creation for voice join and screen share sub-participants.
+package services
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"strconv"
+	"time"
+
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
+
+	"github.com/livekit/protocol/auth"
+)
+
+func (s *voiceService) GenerateToken(ctx context.Context, userID, username, displayName, channelID string) (*models.VoiceTokenResponse, error) {
+	channel, err := s.channelGetter.GetByID(ctx, channelID)
+	if err != nil {
+		return nil, err
+	}
+	if channel.Type != models.ChannelTypeVoice {
+		return nil, fmt.Errorf("%w: not a voice channel", pkg.ErrBadRequest)
+	}
+
+	// Resolve effective permissions (role base + channel overrides)
+	effectivePerms, err := s.permResolver.ResolveChannelPermissions(ctx, userID, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve channel permissions: %w", err)
+	}
+
+	if !effectivePerms.Has(models.PermConnectVoice) {
+		// Check for a one-time force-move grant (admin moved this user here)
+		s.mu.Lock()
+		grant, hasGrant := s.forceMoveGrants[userID]
+		if hasGrant && grant.channelID == channelID && time.Now().Before(grant.expiresAt) {
+			delete(s.forceMoveGrants, userID) // consume — single use only
+			s.mu.Unlock()
+			log.Printf("[voice] force-move grant consumed for user %s in channel %s", userID, channelID)
+		} else {
+			if hasGrant {
+				delete(s.forceMoveGrants, userID) // expired or wrong channel — clean up
+			}
+			s.mu.Unlock()
+			return nil, fmt.Errorf("%w: missing voice connect permission", pkg.ErrForbidden)
+		}
+	}
+
+	// User limit check (0 = unlimited)
+	if channel.UserLimit > 0 {
+		participants := s.GetChannelParticipants(channelID)
+		alreadyIn := false
+		for _, p := range participants {
+			if p.UserID == userID {
+				alreadyIn = true
+				break
+			}
+		}
+		if !alreadyIn && len(participants) >= channel.UserLimit {
+			return nil, fmt.Errorf("%w: voice channel is full", pkg.ErrBadRequest)
+		}
+	}
+
+	// Marked before the claim, not after. The claim persists a row and the abandoned-binding sweep
+	// runs every five seconds; a tick landing in between saw a channel with no participants and
+	// nobody connecting, and released a binding whose token had already gone out.
+	s.markPendingJoin(channelID, userID)
+
+	// Only now. Resolving claims the channel's LiveKit instance on first use — an actual write, to
+	// memory and to channel_voice_bindings — and it used to run before any of the checks above. A
+	// member without PermConnectVoice could therefore pin a staff-only channel to an instance chosen
+	// for their region and then be refused, and the binding outlived the refusal. Everything above
+	// this line is read-only; nothing below is reachable without passing it.
+	room, err := s.resolveRoomInstance(ctx, channel.ServerID, channelID)
+	if err != nil {
+		s.logError(models.LogCategoryVoice, &userID, "LiveKit instance unavailable", map[string]string{
+			"server_id": channel.ServerID, "error": err.Error(),
+		})
+		return nil, err
+	}
+
+	canPublish := effectivePerms.Has(models.PermSpeak)
+	canSubscribe := true
+	canPublishData := true
+
+	at := auth.NewAccessToken(room.APIKey, room.APISecret)
+
+	roomName := generateRoomName(channel.ServerID, channelID)
+
+	grant := &auth.VideoGrant{
+		RoomJoin:       true,
+		Room:           roomName,
+		CanPublish:     &canPublish,
+		CanSubscribe:   &canSubscribe,
+		CanPublishData: &canPublishData,
+	}
+
+	// Server-mute durability: if this user is currently server-muted, bake the mic-source
+	// exclusion into the token so the mute survives reconnect and admin-move — a fresh token
+	// would otherwise re-grant mic publish, letting a client shed the mute by reconnecting.
+	// Mirrors the live SFU enforcement in AdminUpdateState (same allow-list).
+	if canPublish {
+		s.mu.RLock()
+		serverMuted := false
+		if st, ok := s.states[userID]; ok {
+			serverMuted = st.IsServerMuted
+		}
+		s.mu.RUnlock()
+		if serverMuted {
+			grant.SetCanPublishSources(serverMuteAllowedSources())
+		}
+	}
+
+	participantName := username
+	if displayName != "" {
+		participantName = displayName
+	}
+
+	at.AddGrant(grant).
+		SetIdentity(userID).
+		SetName(participantName).
+		SetValidFor(24 * time.Hour)
+
+	token, err := at.ToJWT()
+	if err != nil {
+		s.logError(models.LogCategoryVoice, &userID, "LiveKit JWT generation failed", map[string]string{
+			"channel_id": channelID, "error": err.Error(),
+		})
+		return nil, fmt.Errorf("failed to generate livekit token: %w", err)
+	}
+
+	// E2EE: per-room SFrame passphrase (created on first join, reused for session)
+	passphrase, err := s.getOrCreateRoomPassphrase(roomName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create E2EE passphrase: %w", err)
+	}
+
+	return &models.VoiceTokenResponse{
+		Token:          token,
+		URL:            room.URL,
+		ChannelID:      channelID,
+		E2EEPassphrase: passphrase,
+	}, nil
+}
+
+// logScreenShareRefusal records a screen-share token that was NOT issued, under the `screen_share`
+// category. Failures only — a working share writes nothing, so anything in that category is a
+// share someone tried and did not get. `reason` is a short stable code, not prose, so the admin
+// log can be scanned by cause.
+func (s *voiceService) logScreenShareRefusal(level models.LogLevel, userID, channelID, reason string, extra map[string]string) {
+	if s.appLogger == nil {
+		return
+	}
+	metadata := map[string]string{"reason": reason, "channel_id": channelID}
+	for k, v := range extra {
+		metadata[k] = v
+	}
+	s.appLogger.Log(level, models.LogCategoryScreenShare, &userID, nil, "screen share token refused: "+reason, metadata)
+}
+
+// RecordScreenShareStop notes a share that ended without the stop button. Same `screen_share`
+// category: from the operator's side it is still "someone tried to share and did not get it".
+// The duration is in the message, not only the metadata: a sub-second share is the bug, and the
+// log list is scanned by eye.
+//
+// One case is not a failure: a share that ran a while and then ended with its source is someone
+// closing the window or game they were sharing. That is recorded at Info, so Warn holds only what
+// is worth reading — see models.ScreenShareShortLivedMs.
+func (s *voiceService) RecordScreenShareStop(userID, channelID, engine, reason, detail string, aliveMs int64) {
+	if s.appLogger == nil {
+		return
+	}
+	metadata := map[string]string{
+		"reason":     reason,
+		"engine":     engine,
+		"channel_id": channelID,
+		"alive_ms":   strconv.FormatInt(aliveMs, 10),
+	}
+	if detail != "" {
+		metadata["detail"] = detail
+	}
+	if reason == "track_ended" && aliveMs >= models.ScreenShareShortLivedMs {
+		s.appLogger.Log(models.LogLevelInfo, models.LogCategoryScreenShare, &userID, nil,
+			fmt.Sprintf("screen share ended with its source after %dms", aliveMs), metadata)
+		return
+	}
+	s.appLogger.Log(models.LogLevelWarn, models.LogCategoryScreenShare, &userID, nil,
+		fmt.Sprintf("screen share stopped by itself: %s after %dms", reason, aliveMs), metadata)
+}
+
+// RecordScreenShareFallback notes that a client asked for the native capture path and ended up on
+// the browser one. Filed under the same `screen_share` category as a refused token, because from
+// the operator's side they are the same question — "who tried to share and did not get what they
+// picked" — and a refusal often causes the fallback that follows it.
+//
+// Warn, not Error: the user is still sharing. Something worked.
+func (s *voiceService) RecordScreenShareFallback(userID, channelID, engine, reason, detail string) {
+	extra := map[string]string{"fell_back_to": "sharp", "engine": engine}
+	if detail != "" {
+		extra["detail"] = detail
+	}
+	if s.appLogger != nil {
+		metadata := map[string]string{"reason": reason, "channel_id": channelID}
+		for k, v := range extra {
+			metadata[k] = v
+		}
+		s.appLogger.Log(models.LogLevelWarn, models.LogCategoryScreenShare, &userID,
+			nil, screenShareFallbackMessage(engine)+reason, metadata)
+	}
+}
+
+// screenShareFallbackMessage names what fell back, so the two engines read apart in the log. The
+// smooth wording is unchanged from before the engine field existed.
+func screenShareFallbackMessage(engine string) string {
+	if engine == "sharp_hdr" {
+		return "hdr sharp capture fell back to the browser: "
+	}
+	return "smooth capture fell back to sharp: "
+}
+
+// RecordNoiseReductionFailure notes that a mic denoiser could not be attached on a client.
+//
+// Warn rather than error even for a full attach failure: the call itself carries on, the user is
+// simply unfiltered. Error level is for things that stop someone using the app.
+func (s *voiceService) RecordNoiseReductionFailure(userID, channelID, engine, reason, detail string) {
+	if s.appLogger == nil {
+		return
+	}
+	metadata := map[string]string{
+		"reason":     reason,
+		"engine":     engine,
+		"channel_id": channelID,
+	}
+	if detail != "" {
+		metadata["detail"] = detail
+	}
+	// Says which engine in the message, not just the metadata: the log list is scanned by eye, and
+	// "gtcrn" vs "rnnoise" is the first thing that narrows a report.
+	s.appLogger.Log(models.LogLevelWarn, models.LogCategoryNoiseReduction, &userID,
+		nil, "noise reduction "+engine+" failed to attach: "+reason, metadata)
+}
+
+// GenerateScreenShareToken generates a LiveKit token for the iOS native screen share connection.
+// The identity is "{userID}_ss" so it joins the same room as a separate participant
+// that only publishes the screen share track. The main JS SDK connection stays active for voice.
+func (s *voiceService) GenerateScreenShareToken(ctx context.Context, userID, username, displayName, channelID string) (*models.VoiceTokenResponse, error) {
+	channel, err := s.channelGetter.GetByID(ctx, channelID)
+	if err != nil {
+		s.logScreenShareRefusal(models.LogLevelWarn, userID, channelID, "channel_lookup_failed", map[string]string{"error": err.Error()})
+		return nil, err
+	}
+	if channel.Type != models.ChannelTypeVoice {
+		s.logScreenShareRefusal(models.LogLevelWarn, userID, channelID, "not_a_voice_channel", map[string]string{"type": string(channel.Type)})
+		return nil, fmt.Errorf("%w: not a voice channel", pkg.ErrBadRequest)
+	}
+
+	// User must already be in this voice channel to screen share
+	s.mu.RLock()
+	state, inVoice := s.states[userID]
+	s.mu.RUnlock()
+	if !inVoice || state.ChannelID != channelID {
+		// Split the two cases: "in no voice channel at all" and "in a different one" fail the same
+		// check but mean different things — the second is a real client/server divergence.
+		extra := map[string]string{"in_voice": "false"}
+		if inVoice {
+			extra["in_voice"] = "true"
+			extra["state_channel_id"] = state.ChannelID
+		}
+		s.logScreenShareRefusal(models.LogLevelWarn, userID, channelID, "not_in_voice_channel", extra)
+		return nil, fmt.Errorf("%w: must be in the voice channel to screen share", pkg.ErrBadRequest)
+	}
+
+	// Follows the binding rather than claiming one. The sub-participant joins a room that already
+	// exists — the sharer is in it — so this is not a first join, and claiming here would pick an
+	// instance from a request that carries no region (the screen-share handler sets none), pinning
+	// the channel to somewhere the voice call is not.
+	room, err := s.boundRoomInstance(ctx, channelID)
+	if err != nil {
+		reason := "livekit_instance_missing"
+		if errors.Is(err, errChannelNotBound) {
+			reason = "channel_not_bound"
+		}
+		s.logScreenShareRefusal(models.LogLevelError, userID, channelID, reason, map[string]string{"server_id": channel.ServerID, "error": err.Error()})
+		return nil, err
+	}
+
+	canPublish := true
+	canSubscribe := false   // screen share participant doesn't need to subscribe
+	canPublishData := false // no data channel needed
+
+	at := auth.NewAccessToken(room.APIKey, room.APISecret)
+
+	roomName := generateRoomName(channel.ServerID, channelID)
+
+	grant := &auth.VideoGrant{
+		RoomJoin:       true,
+		Room:           roomName,
+		CanPublish:     &canPublish,
+		CanSubscribe:   &canSubscribe,
+		CanPublishData: &canPublishData,
+	}
+
+	// Identity suffix "_ss" marks this as a screen share sub-participant
+	ssIdentity := userID + "_ss"
+	participantName := username + " (Screen)"
+	if displayName != "" {
+		participantName = displayName + " (Screen)"
+	}
+
+	at.AddGrant(grant).
+		SetIdentity(ssIdentity).
+		SetName(participantName).
+		SetValidFor(4 * time.Hour)
+
+	token, err := at.ToJWT()
+	if err != nil {
+		s.logScreenShareRefusal(models.LogLevelError, userID, channelID, "jwt_sign_failed", nil)
+		return nil, fmt.Errorf("failed to generate screen share token: %w", err)
+	}
+
+	passphrase, err := s.getOrCreateRoomPassphrase(roomName)
+	if err != nil {
+		// The client refuses a token with no passphrase, so this reads to the user as a plain
+		// failure to start — worth seeing here rather than only in the client's console.
+		s.logScreenShareRefusal(models.LogLevelError, userID, channelID, "passphrase_failed", nil)
+		return nil, fmt.Errorf("failed to create E2EE passphrase: %w", err)
+	}
+
+	return &models.VoiceTokenResponse{
+		Token:          token,
+		URL:            room.URL,
+		ChannelID:      channelID,
+		E2EEPassphrase: passphrase,
+	}, nil
+}

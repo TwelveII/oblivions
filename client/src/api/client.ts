@@ -1,0 +1,475 @@
+/**
+ * HTTP API client — all backend requests go through this module.
+ *
+ * Handles auth token injection, 401 refresh flow, and consistent error handling.
+ */
+
+import type { APIResponse } from "../types";
+import { API_BASE_URL } from "../utils/constants";
+import { clientHeaders } from "../utils/clientPlatform";
+import { extensionForType, type GeneratedThumbnail } from "../utils/imageEncoding";
+
+function getAccessToken(): string | null {
+  return localStorage.getItem("access_token");
+}
+
+function getRefreshToken(): string | null {
+  return localStorage.getItem("refresh_token");
+}
+
+function setTokens(access: string, refresh: string, file: string): void {
+  localStorage.setItem("access_token", access);
+  localStorage.setItem("refresh_token", refresh);
+  localStorage.setItem("file_token", file);
+  void window.electronAPI?.setFileAuthToken(file, API_BASE_URL);
+}
+
+function clearTokens(): void {
+  localStorage.removeItem("access_token");
+  localStorage.removeItem("refresh_token");
+  localStorage.removeItem("file_token");
+  void window.electronAPI?.clearFileAuthToken();
+}
+
+/**
+ * Auth-rejection signal. Fired when a refresh is genuinely rejected (401/403) — the
+ * session is unrecoverable. authStore registers a handler that tears the session down
+ * and routes to login, so a dead token can't leave the UI in a zombie logged-in state
+ * (F5). Kept as a module-level callback rather than importing authStore, to avoid a
+ * circular dependency (authStore already imports the token helpers from this module).
+ */
+let onAuthRejected: (() => void) | null = null;
+
+function setAuthRejectedHandler(handler: (() => void) | null): void {
+  onAuthRejected = handler;
+}
+
+/**
+ * Refreshes an expired access token using the refresh token.
+ *
+ * Uses a shared promise lock to prevent multiple concurrent refresh requests.
+ * Without this, parallel 401s would each try to refresh, invalidating each other's
+ * tokens and causing unexpected logouts.
+ */
+let refreshPromise: Promise<boolean> | null = null;
+
+async function refreshAccessToken(): Promise<boolean> {
+  if (refreshPromise) return refreshPromise;
+
+  refreshPromise = doRefresh();
+  try {
+    return await refreshPromise;
+  } finally {
+    refreshPromise = null;
+  }
+}
+
+async function doRefresh(): Promise<boolean> {
+  const refreshToken = getRefreshToken();
+  if (!refreshToken) return false;
+
+  try {
+    const res = await fetch(`${API_BASE_URL}/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...clientHeaders() },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+      // Honor the rotated file-serve cookie that /auth/refresh sets.
+      credentials: "include",
+    });
+
+    if (!res.ok) {
+      // Only clear tokens on explicit auth rejection — 5xx/429/network errors
+      // don't mean the token is invalid, just that the server/network failed.
+      if (res.status === 401 || res.status === 403) {
+        console.warn(`[apiClient] refresh endpoint returned ${res.status} — CLEARING TOKENS`, {
+          timestamp: new Date().toISOString(),
+        });
+        clearTokens();
+        // Genuine rejection — notify authStore to tear down the session and route to
+        // login. Only on 401/403 (never 5xx/network), so a transient blip can't force
+        // a logout. Idempotent on the receiver, so parallel 401s are safe.
+        onAuthRejected?.();
+      } else {
+        console.warn(`[apiClient] refresh endpoint returned ${res.status} — tokens preserved`);
+      }
+      return false;
+    }
+
+    const data: APIResponse<{ access_token: string; refresh_token: string; file_token: string }> =
+      await res.json();
+
+    if (data.success && data.data) {
+      setTokens(data.data.access_token, data.data.refresh_token, data.data.file_token);
+      return true;
+    }
+
+    return false;
+  } catch {
+    // Network error (timeout, DNS, offline) — tokens may still be valid, don't clear.
+    return false;
+  }
+}
+
+type RequestOptions = {
+  method?: string;
+  body?: unknown;
+  headers?: Record<string, string>;
+  signal?: AbortSignal;
+};
+
+/**
+ * Core HTTP request function. Generic type <T> specifies the expected response data type.
+ *
+ * Usage:
+ *   const data = await apiClient<User[]>("/users");
+ *   const user = await apiClient<User>("/users/me", { method: "PATCH", body: { display_name: "New" } });
+ */
+/**
+ * Runs one authenticated attempt, and on a 401 refreshes once and retries.
+ *
+ * Shared by the fetch and XHR transports so the refresh policy cannot drift between them.
+ */
+async function withTokenRefresh<T>(
+  label: string,
+  send: (token: string | null) => Promise<XhrResult<T>>
+): Promise<APIResponse<T>> {
+  const token = getAccessToken();
+  const first = await send(token);
+  if (first.status !== 401) return withStatus(first);
+
+  if (!getRefreshToken()) {
+    console.warn(`[api] 401 on ${label} but NO refresh_token in storage`, { hadAuthHeader: !!token });
+    return withStatus(first);
+  }
+
+  console.warn(`[api] 401 on ${label} — attempting refresh`, {
+    timestamp: new Date().toISOString(),
+    hadAuthHeader: !!token,
+  });
+  const refreshed = await refreshAccessToken();
+  console.warn(`[api] refresh result: ${refreshed}`, {
+    hasAccessTokenAfter: !!getAccessToken(),
+    hasRefreshTokenAfter: !!getRefreshToken(),
+  });
+  if (!refreshed) {
+    console.warn(`[api] refresh FAILED on ${label} — returning original 401`);
+    // Tokens still stored means the refresh did not get an answer (network, 5xx), not a
+    // rejection: report no response, so callers treat it as the server being away.
+    return getRefreshToken() ? { ...first.response, httpStatus: 0 } : withStatus(first);
+  }
+
+  return withStatus(await send(getAccessToken()));
+}
+
+function withStatus<T>(result: XhrResult<T>): APIResponse<T> {
+  return { ...result.response, httpStatus: result.status };
+}
+
+/**
+ * Aborted when the signed-in session ends. The app does not reload between accounts, so a request
+ * the previous account started and that answers after sign-out would write that account's data
+ * into the stores the next one reads. Every request is tied to it; an aborted one comes back
+ * failed, which callers already treat as "nothing to apply".
+ */
+let sessionController = new AbortController();
+
+export function abortSessionRequests(): void {
+  sessionController.abort();
+  sessionController = new AbortController();
+}
+
+/**
+ * The caller's signal joined with the session's. The listeners are removed by `release` once the
+ * request is done: the session signal lives for the whole session, and listeners left on it would
+ * pile up one per request.
+ */
+function joinSession(signal: AbortSignal | undefined): { signal: AbortSignal; release: () => void } {
+  const session = sessionController.signal;
+  if (!signal) return { signal: session, release: () => {} };
+  const joined = new AbortController();
+  const abort = () => joined.abort();
+  if (signal.aborted || session.aborted) joined.abort();
+  signal.addEventListener("abort", abort, { once: true });
+  session.addEventListener("abort", abort, { once: true });
+  return {
+    signal: joined.signal,
+    release: () => {
+      signal.removeEventListener("abort", abort);
+      session.removeEventListener("abort", abort);
+    },
+  };
+}
+
+/** No response, a timeout, rate limiting or a server error: the session may be fine, the server is not. */
+function isTransientStatus(status: number | undefined): boolean {
+  return status === undefined || status === 0 || status === 408 || status === 429 || status >= 500;
+}
+
+/**
+ * One fetch attempt, normalised to sendXhr's {status, response} shape. Never throws: a network
+ * error or non-JSON body comes back as a failed envelope, as callers already rely on.
+ */
+async function sendFetch<T>(
+  endpoint: string,
+  method: string,
+  body: RequestOptions["body"],
+  extraHeaders: Record<string, string> | undefined,
+  signal: AbortSignal | undefined,
+  token: string | null
+): Promise<XhrResult<T>> {
+  const headers: Record<string, string> = { ...clientHeaders(), ...extraHeaders };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (body && !(body instanceof FormData)) headers["Content-Type"] = "application/json";
+
+  const fetchOptions: RequestInit = {
+    method,
+    headers,
+    // Send/receive the file-serve session cookie set by /auth/* endpoints. Same-origin web defaults
+    // to "include"; this explicit value is required for the Electron renderer (file:// origin → API
+    // is cross-site).
+    credentials: "include",
+  };
+  if (body) fetchOptions.body = body instanceof FormData ? body : JSON.stringify(body);
+
+  const joined = joinSession(signal);
+  fetchOptions.signal = joined.signal;
+  try {
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE_URL}${endpoint}`, fetchOptions);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Network request failed";
+      console.error(`[apiClient] ${method} ${endpoint}:`, message);
+      return { status: 0, response: { success: false, error: message } as APIResponse<T> };
+    }
+
+    if (res.status === 204) {
+      return { status: 204, response: { success: true, data: undefined as T } };
+    }
+    try {
+      return { status: res.status, response: (await res.json()) as APIResponse<T> };
+    } catch {
+      console.error(`[apiClient] ${method} ${endpoint}: invalid JSON (HTTP ${res.status})`);
+      return {
+        status: res.status,
+        response: { success: false, error: `HTTP ${res.status}: ${res.statusText}` } as APIResponse<T>,
+      };
+    }
+  } finally {
+    joined.release();
+  }
+}
+
+export async function apiClient<T>(
+  endpoint: string,
+  options: RequestOptions = {}
+): Promise<APIResponse<T>> {
+  const { method = "GET", body, headers: extraHeaders, signal } = options;
+  return withTokenRefresh<T>(`${method} ${endpoint}`, (token) =>
+    sendFetch<T>(endpoint, method, body, extraHeaders, signal, token)
+  );
+}
+
+
+/**
+ * Appends companion previews so the server can pair each one with files[i].
+ *
+ * Indexed rather than a parallel list: a file without a preview must not shift every later
+ * attachment onto the wrong one.
+ */
+function appendThumbnails(form: FormData, thumbs?: (GeneratedThumbnail | null)[]): void {
+  thumbs?.forEach((thumb, index) => {
+    if (!thumb) return;
+    // The extension is what the serve layer resolves the MIME from. Without one the file is served
+    // as application/octet-stream with nosniff, which a cross-origin <img> (Electron, mobile)
+    // refuses to render. An encrypted thumbnail's blob is untyped and falls back to .png, harmless
+    // because it is fetched as bytes, never loaded as an image element.
+    const name = `thumb_${index}.${extensionForType(thumb.blob.type)}`;
+    form.append(`thumb_${index}`, thumb.blob, name);
+    form.append(`thumb_${index}_w`, String(thumb.width));
+    form.append(`thumb_${index}_h`, String(thumb.height));
+  });
+}
+
+/** `code` on an APIResponse whose upload the caller cancelled — not a failure, stay silent. */
+const UPLOAD_ABORTED = "UPLOAD_ABORTED";
+
+type UploadOptions = {
+  method?: string;
+  headers?: Record<string, string>;
+  signal?: AbortSignal;
+  /** `total` is null when the browser cannot compute the body length. */
+  onProgress?: (loaded: number, total: number | null) => void;
+};
+
+type XhrResult<T> = { status: number; response: APIResponse<T> };
+
+function sendXhr<T>(
+  endpoint: string,
+  body: FormData,
+  method: string,
+  extraHeaders: Record<string, string> | undefined,
+  callerSignal: AbortSignal | undefined,
+  onProgress: UploadOptions["onProgress"],
+  token: string | null
+): Promise<XhrResult<T>> {
+  const joined = joinSession(callerSignal);
+  const signal = joined.signal;
+  const settled = new Promise<XhrResult<T>>((resolve) => {
+    const aborted: XhrResult<T> = {
+      status: 0,
+      response: { success: false, error: "Upload cancelled", code: UPLOAD_ABORTED },
+    };
+    if (signal.aborted) {
+      resolve(aborted);
+      return;
+    }
+
+    // Declared out here so a synchronous throw below can still detach the abort listener. Left
+    // attached it kept the dead xhr alive, and a later cancel() aborted a request never sent.
+    let cleanup = () => {};
+
+    // open()/send() can throw synchronously (malformed URL, SecurityError). Callers rely on this
+    // layer never throwing — apiClient guarantees the same — so a throw here must come back as a
+    // failed response, not a rejected promise nobody catches.
+    try {
+      const xhr = new XMLHttpRequest();
+      xhr.open(method, `${API_BASE_URL}${endpoint}`);
+      // Matches apiClient's credentials:"include" — the file-serve cookie must ride along, and the
+      // Electron renderer's file:// origin makes every API call cross-site.
+      xhr.withCredentials = true;
+
+      if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+      for (const [key, value] of Object.entries({ ...clientHeaders(), ...extraHeaders })) {
+        xhr.setRequestHeader(key, value);
+      }
+      // Content-Type is left unset on purpose: the browser derives it from the FormData, including
+      // the multipart boundary. Setting it by hand produces a body the server cannot parse.
+
+      const onAbort = () => xhr.abort();
+      signal.addEventListener("abort", onAbort);
+      cleanup = () => signal.removeEventListener("abort", onAbort);
+
+      let lastTotal: number | null = null;
+      if (onProgress) {
+        xhr.upload.onprogress = (e) => {
+          lastTotal = e.lengthComputable ? e.total : null;
+          onProgress(e.loaded, lastTotal);
+        };
+      }
+
+      xhr.onload = () => {
+        cleanup();
+        // The last upload.onprogress can land below total; settle the bar so it never sticks at 99%.
+        if (onProgress && lastTotal !== null) onProgress(lastTotal, lastTotal);
+
+        if (xhr.status === 204) {
+          resolve({ status: 204, response: { success: true, data: undefined as T } });
+          return;
+        }
+        try {
+          resolve({ status: xhr.status, response: JSON.parse(xhr.responseText) as APIResponse<T> });
+        } catch {
+          // Non-JSON body — a proxy rejection (Cloudflare 413) or a crash page.
+          console.error(`[upload] ${method} ${endpoint}: invalid JSON (HTTP ${xhr.status})`);
+          resolve({
+            status: xhr.status,
+            response: { success: false, error: `HTTP ${xhr.status}: ${xhr.statusText}` },
+          });
+        }
+      };
+
+      xhr.onerror = () => {
+        cleanup();
+        console.error(`[upload] ${method} ${endpoint}: network error`);
+        resolve({ status: 0, response: { success: false, error: "Network request failed" } });
+      };
+
+      xhr.onabort = () => {
+        cleanup();
+        resolve(aborted);
+      };
+
+      xhr.send(body);
+    } catch (err) {
+      cleanup();
+      const message = err instanceof Error ? err.message : "Upload request failed";
+      console.error(`[upload] ${method} ${endpoint}: ${message}`);
+      resolve({ status: 0, response: { success: false, error: message } });
+    }
+  });
+  return settled.finally(() => joined.release());
+}
+
+/**
+ * Multipart upload transport. On XMLHttpRequest because fetch cannot report upload progress or be
+ * cancelled mid-transfer. A refresh retry re-sends the body, so progress restarts from zero.
+ */
+async function uploadRequest<T>(
+  endpoint: string,
+  body: FormData,
+  options: UploadOptions = {}
+): Promise<APIResponse<T>> {
+  const { method = "POST", headers, signal, onProgress } = options;
+  return withTokenRefresh<T>(`${method} ${endpoint}`, (token) =>
+    sendXhr<T>(endpoint, body, method, headers, signal, onProgress, token)
+  );
+}
+
+/**
+ * Checks if a JWT access token is expired.
+ * Includes a 10s buffer so tokens about to expire are treated as expired,
+ * preventing requests that expire mid-transport.
+ */
+function isTokenExpired(token: string): boolean {
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    return payload.exp * 1000 < Date.now() + 10_000;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Ensures a valid access token exists, refreshing if needed.
+ *
+ * Used before WebSocket connections — unlike HTTP requests, WS connections
+ * don't return 401 on expired tokens, they just get rejected, causing
+ * infinite reconnect loops.
+ */
+async function ensureFreshToken(): Promise<string | null> {
+  const token = getAccessToken();
+  if (!token) return null;
+
+  if (!isTokenExpired(token)) return token;
+
+  const refreshed = await refreshAccessToken();
+  if (!refreshed) return null;
+
+  return getAccessToken();
+}
+
+/**
+ * Renews the file token if it has lapsed. Media requests carry it with no 401 retry of their own,
+ * so after a long sleep images would fail until something else happened to refresh.
+ */
+async function ensureFreshFileToken(): Promise<void> {
+  const fileToken = localStorage.getItem("file_token");
+  if (!fileToken || !getRefreshToken() || !isTokenExpired(fileToken)) return;
+  await refreshAccessToken();
+}
+
+export {
+  setTokens,
+  clearTokens,
+  getAccessToken,
+  getRefreshToken,
+  ensureFreshToken,
+  ensureFreshFileToken,
+  isTransientStatus,
+  setAuthRejectedHandler,
+  uploadRequest,
+  UPLOAD_ABORTED,
+};
+export { appendThumbnails };
+export type { UploadOptions };

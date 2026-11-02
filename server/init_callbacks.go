@@ -1,0 +1,285 @@
+package main
+
+import (
+	"context"
+	"log"
+
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/repository"
+	"github.com/akinalp/mqvi/services"
+	"github.com/akinalp/mqvi/ws"
+)
+
+// dmTypingRouter decides who sees a DM typing indicator.
+type dmTypingRouter interface {
+	TypingRecipient(ctx context.Context, senderUserID, channelID string) (string, error)
+}
+
+// registerHubCallbacks wires Hub events to service layer logic.
+// Callbacks run in separate goroutines (launched by Hub) to avoid mutex deadlock.
+func registerHubCallbacks(
+	hub *ws.Hub,
+	userRepo repository.UserRepository,
+	dmTyping dmTypingRouter,
+	voiceService services.VoiceService,
+	p2pCallService services.P2PCallService,
+	channelRepo repository.ChannelRepository,
+	serverRepo repository.ServerRepository,
+	channelPermResolver services.ChannelPermResolver,
+) {
+	// ─── Presence Callbacks ───
+
+	hub.OnUserFirstConnect(func(userID, _ string) {
+		// Read persistent pref_status from DB (not client-provided — client may differ per device).
+		user, err := userRepo.GetByID(context.Background(), userID)
+		if err != nil {
+			log.Printf("[presence] failed to get user %s: %v", userID, err)
+			return
+		}
+
+		targetStatus := user.PrefStatus
+		if targetStatus == "" {
+			targetStatus = models.UserStatusOnline
+		}
+
+		if targetStatus == models.UserStatusOffline {
+			// Invisible — SetInvisible already called in handler.
+			hub.BroadcastToUsers(hub.GetPresenceAudience(userID), ws.Event{
+				Op: ws.OpPresence,
+				Data: ws.PresenceData{
+					UserID: userID,
+					Status: string(models.UserStatusOffline),
+				},
+			})
+			log.Printf("[presence] user %s connected as invisible (pref_status=offline)", userID)
+			return
+		}
+
+		if updateErr := userRepo.UpdateStatus(context.Background(), userID, targetStatus); updateErr != nil {
+			log.Printf("[presence] failed to update status for user %s: %v", userID, updateErr)
+		}
+
+		hub.BroadcastToUsers(hub.GetPresenceAudience(userID), ws.Event{
+			Op: ws.OpPresence,
+			Data: ws.PresenceData{
+				UserID: userID,
+				Status: string(targetStatus),
+			},
+		})
+		log.Printf("[presence] user %s connected with status %s (from pref_status)", userID, targetStatus)
+	})
+
+	hub.OnUserFullyDisconnected(func(userID string, audience []string) {
+		if updateErr := userRepo.UpdateStatus(context.Background(), userID, models.UserStatusOffline); updateErr != nil {
+			log.Printf("[presence] failed to set offline for user %s: %v", userID, updateErr)
+		}
+
+		hub.SetInvisible(userID, false)
+
+		hub.BroadcastToUsers(audience, ws.Event{
+			Op: ws.OpPresence,
+			Data: ws.PresenceData{
+				UserID: userID,
+				Status: string(models.UserStatusOffline),
+			},
+		})
+		log.Printf("[presence] user %s disconnected (DB set to offline)", userID)
+
+		// Voice state is NOT cleaned here — WS disconnect != voice leave.
+		// LiveKit connection is separate; WS may reconnect shortly.
+		// Cleaned by explicit voice_leave or orphan cleanup sweep.
+	})
+
+	// Call teardown rides EVERY connection close, not the user's last one. A call belongs to a
+	// connection: if the socket carrying it dies while another device of the same user stays
+	// signed in, the last-disconnect hook never fires, and an accepted call has no ring timer to
+	// clean it up — so both parties stay "already in a call" until the server restarts.
+	hub.OnSessionDisconnect(func(userID, sessionID string, nativeMedia bool) {
+		p2pCallService.HandleSessionDisconnect(userID, sessionID, nativeMedia)
+	})
+
+	hub.OnPresenceManualUpdate(func(userID string, status string, isAuto bool) {
+		ctx := context.Background()
+		st := models.UserStatus(status)
+
+		if err := userRepo.UpdateStatus(ctx, userID, st); err != nil {
+			log.Printf("[presence] failed to set %s for user %s: %v", status, userID, err)
+			return
+		}
+
+		// Only persist pref_status for manual changes — auto-idle should not
+		// overwrite the user's preferred status, so idle detection can resume
+		// correctly after WS reconnect.
+		if !isAuto {
+			if err := userRepo.UpdatePrefStatus(ctx, userID, st); err != nil {
+				log.Printf("[presence] failed to set pref_status %s for user %s: %v", status, userID, err)
+			}
+		}
+
+		hub.SetInvisible(userID, status == string(models.UserStatusOffline))
+
+		hub.BroadcastToUsers(hub.GetPresenceAudience(userID), ws.Event{
+			Op: ws.OpPresence,
+			Data: ws.PresenceData{
+				UserID: userID,
+				Status: status,
+			},
+		})
+
+		source := "manual"
+		if isAuto {
+			source = "auto"
+		}
+		log.Printf("[presence] user %s is now %s (%s)", userID, status, source)
+	})
+
+	// ─── Voice Callbacks ───
+
+	hub.OnVoiceJoin(func(userID, username, displayName, avatarURL, channelID string, isMuted, isDeafened bool) {
+		if err := voiceService.JoinChannel(userID, username, displayName, avatarURL, channelID, isMuted, isDeafened); err != nil {
+			log.Printf("[voice] join error user=%s channel=%s: %v", userID, channelID, err)
+			return
+		}
+
+		// Track last voice activity for admin panel
+		if actErr := userRepo.UpdateLastVoiceActivity(context.Background(), userID); actErr != nil {
+			log.Printf("[voice] failed to update user voice activity user=%s: %v", userID, actErr)
+		}
+
+		// Track server-level voice activity
+		ch, chErr := channelRepo.GetByID(context.Background(), channelID)
+		if chErr != nil {
+			log.Printf("[voice] channel lookup for activity tracking failed channel=%s: %v", channelID, chErr)
+			return
+		}
+		if actErr := serverRepo.UpdateLastVoiceActivity(context.Background(), ch.ServerID); actErr != nil {
+			log.Printf("[voice] failed to update server voice activity server=%s: %v", ch.ServerID, actErr)
+		}
+	})
+	hub.OnVoiceLeave(func(userID string) {
+		if err := voiceService.LeaveChannel(userID); err != nil {
+			log.Printf("[voice] leave error user=%s: %v", userID, err)
+		}
+	})
+	hub.OnVoiceStateUpdate(func(userID string, isMuted, isDeafened, isStreaming *bool, shareQuality *string) {
+		if err := voiceService.UpdateState(userID, isMuted, isDeafened, isStreaming, shareQuality); err != nil {
+			log.Printf("[voice] state update error user=%s: %v", userID, err)
+		}
+	})
+	hub.OnVoiceAdminStateUpdate(func(adminUserID, targetUserID string, isServerMuted, isServerDeafened *bool) {
+		if err := voiceService.AdminUpdateState(context.Background(), adminUserID, targetUserID, isServerMuted, isServerDeafened); err != nil {
+			log.Printf("[voice] admin state update error admin=%s target=%s: %v", adminUserID, targetUserID, err)
+		}
+	})
+	hub.OnVoiceMoveUser(func(moverUserID, targetUserID, targetChannelID string) {
+		if err := voiceService.MoveUser(context.Background(), moverUserID, targetUserID, targetChannelID); err != nil {
+			log.Printf("[voice] move user error mover=%s target=%s channel=%s: %v", moverUserID, targetUserID, targetChannelID, err)
+		}
+	})
+	hub.OnVoiceDisconnectUser(func(disconnecterUserID, targetUserID string) {
+		if err := voiceService.AdminDisconnectUser(context.Background(), disconnecterUserID, targetUserID); err != nil {
+			log.Printf("[voice] disconnect user error disconnecter=%s target=%s: %v", disconnecterUserID, targetUserID, err)
+		}
+	})
+	hub.OnScreenShareWatch(func(viewerUserID, streamerUserID string, watching bool) {
+		voiceService.WatchScreenShare(viewerUserID, streamerUserID, watching)
+	})
+	hub.OnVoiceActivity(func(userID string) {
+		voiceService.UpdateActivity(userID)
+	})
+
+	// ─── P2P Call Callbacks ───
+
+	hub.OnP2PCallInitiate(func(callerID, sessionID, instanceID, deviceID string, data ws.P2PCallInitiateData) string {
+		callType := models.P2PCallType(data.CallType)
+		err := p2pCallService.InitiateCall(callerID, sessionID, instanceID, deviceID, data.ReceiverID, callType)
+		if err != nil {
+			log.Printf("[p2p] initiate error caller=%s receiver=%s: %v", callerID, data.ReceiverID, err)
+		}
+		return services.CallRefusal(err)
+	})
+	hub.OnP2PCallAccept(func(userID, sessionID, instanceID, deviceID string, data ws.P2PCallAcceptData) {
+		if err := p2pCallService.AcceptCall(userID, sessionID, instanceID, deviceID, data.CallID); err != nil {
+			log.Printf("[p2p] accept error user=%s call=%s: %v", userID, data.CallID, err)
+		}
+	})
+	hub.OnP2PCallDecline(func(userID, instanceID, deviceID string, data ws.P2PCallDeclineData) {
+		if err := p2pCallService.DeclineCall(userID, instanceID, deviceID, data.CallID); err != nil {
+			log.Printf("[p2p] decline error user=%s call=%s: %v", userID, data.CallID, err)
+		}
+	})
+	hub.OnP2PCallEnd(func(userID, instanceID, deviceID, callID string) {
+		if err := p2pCallService.EndCall(userID, instanceID, deviceID, callID); err != nil {
+			log.Printf("[p2p] end error user=%s: %v", userID, err)
+		}
+	})
+	hub.OnP2PCallResume(func(userID, sessionID, instanceID, callID string) {
+		if err := p2pCallService.ResumeCall(userID, sessionID, instanceID, callID); err != nil {
+			log.Printf("[p2p] resume error user=%s call=%s: %v", userID, callID, err)
+		}
+	})
+	hub.OnP2PCallAdopt(func(userID, sessionID, instanceID, deviceID string, data ws.P2PCallAdoptData) {
+		if err := p2pCallService.AdoptCall(userID, sessionID, instanceID, deviceID, data.CallID, data.InstanceID); err != nil {
+			log.Printf("[p2p] adopt error user=%s call=%s: %v", userID, data.CallID, err)
+		}
+	})
+	hub.OnP2PSignal(func(senderID, senderSessionID string, data ws.P2PSignalData) {
+		if err := p2pCallService.RelaySignal(senderID, senderSessionID, data.CallID, data); err != nil {
+			log.Printf("[p2p] signal relay error sender=%s call=%s: %v", senderID, data.CallID, err)
+		}
+	})
+
+	// ─── Channel Typing Callback ───
+	// Validates sender has ReadMessages permission, then broadcasts to server members only.
+
+	hub.OnChannelTyping(func(senderUserID, senderUsername, channelID string) {
+		ctx := context.Background()
+		ch, chErr := channelRepo.GetByID(ctx, channelID)
+		if chErr != nil {
+			return
+		}
+
+		// Filter recipients to server members who have ViewChannel + ReadMessages
+		// on this channel (respects per-channel permission overrides).
+		onlineUsers := hub.GetOnlineUserIDsForServer(ch.ServerID)
+		recipients := make([]string, 0, len(onlineUsers))
+		for _, uid := range onlineUsers {
+			if uid == senderUserID {
+				continue
+			}
+			perms, err := channelPermResolver.ResolveChannelPermissions(ctx, uid, channelID)
+			if err != nil {
+				continue
+			}
+			if perms.Has(models.PermViewChannel) && perms.Has(models.PermReadMessages) {
+				recipients = append(recipients, uid)
+			}
+		}
+
+		hub.BroadcastToUsers(recipients, ws.Event{
+			Op: ws.OpTypingStart,
+			Data: ws.TypingStartData{
+				UserID:    senderUserID,
+				Username:  senderUsername,
+				ChannelID: channelID,
+			},
+		})
+	})
+
+	// ─── DM Typing Callback ───
+
+	hub.OnDMTyping(func(senderUserID, senderUsername, dmChannelID string) {
+		otherUserID, err := dmTyping.TypingRecipient(context.Background(), senderUserID, dmChannelID)
+		if err != nil {
+			return
+		}
+		hub.BroadcastToUser(otherUserID, ws.Event{
+			Op: ws.OpDMTypingStart,
+			Data: ws.DMTypingStartData{
+				UserID:      senderUserID,
+				Username:    senderUsername,
+				DMChannelID: dmChannelID,
+			},
+		})
+	})
+}

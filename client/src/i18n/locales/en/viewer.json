@@ -1,0 +1,16 @@
+{
+  "download": "Download",
+  "copy": "Copy",
+  "copied": "Image copied to clipboard",
+  "copyFailed": "Could not copy image",
+  "close": "Close",
+  "loading": "Loading preview…",
+  "previewFailed": "Failed to load preview.",
+  "previewTooLarge": "File too large to preview ({{size}}). Download to open in a native app.",
+  "previewUnsupported": "No in-app preview for this file type. Download to open.",
+  "page": "Page {{current}} of {{total}}",
+  "zoomIn": "Zoom in",
+  "zoomOut": "Zoom out",
+  "zoomReset": "Reset zoom",
+  "sheet": "Sheet"
+}

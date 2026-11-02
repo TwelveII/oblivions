@@ -1,0 +1,239 @@
+// Package services — DMService interface, struct, construction, and shared helpers.
+//
+// Method implementations are split across concern-based files in this package:
+//   dm_channel.go — GetOrCreateChannel, ListChannels, MarkRead
+//   dm_message.go — GetMessages, SendMessage, BroadcastCreate, EditMessage, DeleteMessage
+//   dm_request.go — AcceptRequest, DeclineRequest, AcceptPendingChannels
+//   dm_extras.go  — ToggleReaction, pins, search, ToggleE2EE
+//
+// Unlike voice_service, dmService holds no in-memory state — all operations go
+// through the repository layer, so the split is purely organizational.
+package services
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/akinalp/mqvi/models"
+	"github.com/akinalp/mqvi/pkg"
+	"github.com/akinalp/mqvi/repository"
+	"github.com/akinalp/mqvi/ws"
+)
+
+type DMService interface {
+	GetOrCreateChannel(ctx context.Context, userID, otherUserID string) (*models.DMChannelWithUser, error)
+	ListChannels(ctx context.Context, userID string) ([]models.DMChannelWithUser, error)
+
+	// MarkRead advances the user's read watermark and tells their OTHER devices, so a
+	// conversation read on one of them stops showing unread — and stops showing a
+	// notification — on the rest. Returns the unread count left after the write.
+	MarkRead(ctx context.Context, userID, channelID, messageID string) (int, error)
+	// MarkDelivered records that the user's app has received the conversation up to messageID
+	// and, when that moved anything, tells the other participant — the double tick.
+	MarkDelivered(ctx context.Context, userID, channelID, messageID string) error
+	// MarkDeliveredLatest does it for whole conversations at once: an app that just connected has
+	// learned of new messages in them without downloading them. Conversations the user is not in
+	// are skipped, not reported.
+	MarkDeliveredLatest(ctx context.Context, userID string, channelIDs []string) error
+
+	GetMessages(ctx context.Context, userID, channelID string, beforeID string, limit int) (*models.DMMessagePage, error)
+	// SendMessage stores a DM. With a client nonce already used by this author in this conversation
+	// it returns the stored message and repeat=true instead: nothing is created or broadcast.
+	SendMessage(ctx context.Context, userID, channelID string, req *models.CreateDMMessageRequest) (msg *models.DMMessage, repeat bool, err error)
+	BroadcastCreate(message *models.DMMessage)
+	CreateCallLog(ctx context.Context, callerID, receiverID string, meta models.CallMeta) error
+	EditMessage(ctx context.Context, userID, messageID string, req *models.UpdateDMMessageRequest) (*models.DMMessage, error)
+	DeleteMessage(ctx context.Context, userID, messageID string) error
+	// DeleteMessageAsModerator removes a DM message for platform moderation; the admin is not a participant.
+	DeleteMessageAsModerator(ctx context.Context, messageID string) error
+
+	// TypingRecipient is the user to show senderUserID's typing to; an error means show nobody.
+	TypingRecipient(ctx context.Context, senderUserID, channelID string) (string, error)
+
+	AcceptRequest(ctx context.Context, userID, channelID string) error
+	DeclineRequest(ctx context.Context, userID, channelID string) error
+	AcceptPendingChannels(ctx context.Context, userA, userB string) error
+
+	ToggleReaction(ctx context.Context, userID, messageID, emoji string) error
+	PinMessage(ctx context.Context, userID, messageID string) error
+	UnpinMessage(ctx context.Context, userID, messageID string) error
+	GetPinnedMessages(ctx context.Context, userID, channelID string) ([]models.DMMessage, error)
+	SearchMessages(ctx context.Context, userID, channelID, query string, limit, offset int) (*models.DMSearchResult, error)
+	ToggleE2EE(ctx context.Context, userID, channelID string, enabled bool) (*models.DMChannel, error)
+
+	SetPushNotifier(n PushNotifier)
+}
+
+// FriendshipChecker is a minimal ISP interface for friend checks (used by dmService).
+type FriendshipChecker interface {
+	AreFriends(ctx context.Context, userA, userB string) (bool, error)
+}
+
+type dmService struct {
+	dmRepo         repository.DMRepository
+	userRepo       repository.UserRepository
+	hub            ws.BroadcastAndRegisterPeers
+	blockChecker   BlockChecker
+	friendChecker  FriendshipChecker
+	unhider        DMSettingsUnhider
+	urlSigner      FileURLSigner
+	fileDeleter    FileDeleter
+	storageService StorageService
+	pushNotifier   PushNotifier
+}
+
+func NewDMService(
+	dmRepo repository.DMRepository,
+	userRepo repository.UserRepository,
+	hub ws.BroadcastAndRegisterPeers,
+	blockChecker BlockChecker,
+	friendshipChecker FriendshipChecker,
+	unhider DMSettingsUnhider,
+	urlSigner FileURLSigner,
+	fileDeleter FileDeleter,
+	storageService StorageService,
+) DMService {
+	return &dmService{
+		dmRepo:         dmRepo,
+		userRepo:       userRepo,
+		hub:            hub,
+		blockChecker:   blockChecker,
+		friendChecker:  friendshipChecker,
+		unhider:        unhider,
+		urlSigner:      urlSigner,
+		fileDeleter:    fileDeleter,
+		storageService: storageService,
+	}
+}
+
+// ─── Shared Helpers ───
+
+// sortUserIDs ensures consistent ordering for the UNIQUE(user1_id, user2_id) constraint.
+func sortUserIDs(a, b string) (string, string) {
+	if a < b {
+		return a, b
+	}
+	return b, a
+}
+
+func (s *dmService) broadcastToBothUsers(channel *models.DMChannel, event ws.Event) {
+	s.hub.BroadcastToUser(channel.User1ID, event)
+	if channel.User1ID != channel.User2ID {
+		s.hub.BroadcastToUser(channel.User2ID, event)
+	}
+}
+
+func (s *dmService) verifyChannelMembership(ctx context.Context, userID, channelID string) (*models.DMChannel, error) {
+	channel, err := s.dmRepo.GetChannelByID(ctx, channelID)
+	if err != nil {
+		return nil, err
+	}
+	if channel.User1ID != userID && channel.User2ID != userID {
+		return nil, fmt.Errorf("%w: not a member of this DM channel", pkg.ErrForbidden)
+	}
+	return channel, nil
+}
+
+// rejectIfBlocked stops userID reaching otherUserID while a block stands in either direction.
+// Platform admins are exempt, as everywhere in DMs.
+func (s *dmService) rejectIfBlocked(ctx context.Context, isPlatformAdmin bool, userID, otherUserID string) error {
+	if isPlatformAdmin || s.blockChecker == nil {
+		return nil
+	}
+	blocked, err := s.blockChecker.IsBlocked(ctx, userID, otherUserID)
+	if err != nil {
+		return fmt.Errorf("failed to check block status: %w", err)
+	}
+	if blocked {
+		return fmt.Errorf("%w: cannot interact with a blocked user", pkg.ErrForbidden)
+	}
+	return nil
+}
+
+// rejectIfBlockedInChannel is rejectIfBlocked for an action inside an existing conversation.
+func (s *dmService) rejectIfBlockedInChannel(ctx context.Context, userID string, channel *models.DMChannel) error {
+	sender, err := s.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("failed to look up sender: %w", err)
+	}
+	otherUserID := channel.User1ID
+	if otherUserID == userID {
+		otherUserID = channel.User2ID
+	}
+	return s.rejectIfBlocked(ctx, sender.IsPlatformAdmin, userID, otherUserID)
+}
+
+// TypingRecipient is who sees senderUserID typing in the conversation: nobody outside it, and
+// nobody across a block.
+func (s *dmService) TypingRecipient(ctx context.Context, senderUserID, channelID string) (string, error) {
+	channel, err := s.verifyChannelMembership(ctx, senderUserID, channelID)
+	if err != nil {
+		return "", err
+	}
+	if err := s.rejectIfBlockedInChannel(ctx, senderUserID, channel); err != nil {
+		return "", err
+	}
+	if channel.User1ID == senderUserID {
+		return channel.User2ID, nil
+	}
+	return channel.User1ID, nil
+}
+
+func (s *dmService) verifyMessageAccess(ctx context.Context, userID, messageID string) (*models.DMMessage, *models.DMChannel, error) {
+	msg, err := s.dmRepo.GetMessageByID(ctx, messageID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	channel, err := s.verifyChannelMembership(ctx, userID, msg.DMChannelID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return msg, channel, nil
+}
+
+// enrichMessages batch-loads attachments and reactions for a message list (avoids N+1).
+func (s *dmService) enrichMessages(ctx context.Context, messages []models.DMMessage) error {
+	if len(messages) == 0 {
+		return nil
+	}
+
+	messageIDs := make([]string, len(messages))
+	for i, m := range messages {
+		messageIDs[i] = m.ID
+	}
+
+	attachmentMap, err := s.dmRepo.GetAttachmentsByMessageIDs(ctx, messageIDs)
+	if err != nil {
+		return fmt.Errorf("failed to batch load DM attachments: %w", err)
+	}
+
+	reactionMap, err := s.dmRepo.GetReactionsByMessageIDs(ctx, messageIDs)
+	if err != nil {
+		return fmt.Errorf("failed to batch load DM reactions: %w", err)
+	}
+
+	for i := range messages {
+		if messages[i].Author != nil {
+			messages[i].Author.AvatarURL = s.urlSigner.SignURLPtr(messages[i].Author.AvatarURL)
+		}
+		if messages[i].ReferencedMessage != nil && messages[i].ReferencedMessage.Author != nil {
+			messages[i].ReferencedMessage.Author.AvatarURL = s.urlSigner.SignURLPtr(messages[i].ReferencedMessage.Author.AvatarURL)
+		}
+		atts := attachmentMap[messages[i].ID]
+		for j := range atts {
+			SignDMAttachmentURLs(s.urlSigner, &atts[j])
+		}
+		messages[i].Attachments = atts
+		if messages[i].Attachments == nil {
+			messages[i].Attachments = []models.DMAttachment{}
+		}
+		messages[i].Reactions = reactionMap[messages[i].ID]
+		if messages[i].Reactions == nil {
+			messages[i].Reactions = []models.ReactionGroup{}
+		}
+	}
+
+	return nil
+}

@@ -1,0 +1,177 @@
+/**
+ * Settings Store — settings modal + theme state management.
+ *
+ * Theme is synced to server via preferencesStore. On app load,
+ * localStorage is used as immediate fallback; server preferences
+ * override once fetched.
+ */
+
+import { create } from "zustand";
+import { type ThemeId, DEFAULT_THEME, THEMES, applyTheme } from "../styles/themes";
+import { usePreferencesStore } from "./preferencesStore";
+import { isCapacitor } from "../utils/constants";
+
+const THEME_STORAGE_KEY = "mqvi_theme";
+const BLUR_STORAGE_KEY = "mqvi_blur_enabled";
+const TRANSPARENT_KEY = "mqvi_transparent_bg";
+
+function loadPersistedTheme(): ThemeId {
+  try {
+    const stored = localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored && stored in THEMES) {
+      return stored as ThemeId;
+    }
+  } catch {
+    /* localStorage access error */
+  }
+  return DEFAULT_THEME;
+}
+
+function loadPersistedBlur(): boolean {
+  // Capacitor (mobile WebView): blur is never worth the GPU cost here — it repaints per message
+  // bubble and per keystroke. Force it OFF and ignore any stored preference (the toggle is hidden
+  // on mobile too), so there is no way to turn it on.
+  if (isCapacitor()) {
+    return false;
+  }
+  try {
+    const stored = localStorage.getItem(BLUR_STORAGE_KEY);
+    if (stored === "1") return true;
+    if (stored === "0") return false;
+  } catch {
+    /* localStorage access error */
+  }
+  // Heuristic default: disable blur on low-end hardware or when user requests reduced transparency
+  if (typeof navigator !== "undefined" && typeof navigator.hardwareConcurrency === "number" && navigator.hardwareConcurrency < 4) {
+    return false;
+  }
+  if (typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-transparency: reduce)").matches) {
+    return false;
+  }
+  return true;
+}
+
+function loadPersistedTransparent(): boolean {
+  try {
+    const stored = localStorage.getItem(TRANSPARENT_KEY);
+    if (stored === "1") return true;
+  } catch {
+    /* localStorage access error */
+  }
+  return false;
+}
+
+type SettingsTab =
+  | "profile"
+  | "appearance"
+  | "general"
+  | "voice"
+  | "security"
+  | "encryption"
+  | "server-general"
+  | "channels"
+  | "roles"
+  | "members"
+  | "invites"
+  | "join-requests"
+  | "platform"
+  | "platform-crisis"
+  | "platform-servers"
+  | "platform-users"
+  | "platform-reports"
+  | "platform-server-reports"
+  | "platform-logs"
+  | "platform-feedback"
+  | "feedback"
+  | "blocked-users"
+  | "help";
+
+type SettingsState = {
+  isOpen: boolean;
+  activeTab: SettingsTab;
+  /** False when settings was opened to browse rather than to reach a specific section. */
+  openedAtTab: boolean;
+  themeId: ThemeId;
+  blurEnabled: boolean;
+  /** Transparent window background — desktop shows through */
+  transparentBackground: boolean;
+
+  openSettings: (tab?: SettingsTab) => void;
+  closeSettings: () => void;
+  setActiveTab: (tab: SettingsTab) => void;
+  setTheme: (id: ThemeId) => void;
+  setBlurEnabled: (enabled: boolean) => void;
+  setTransparentBackground: (enabled: boolean) => void;
+  /** Apply theme from server preferences (no re-sync to server) */
+  applyFromServer: (themeId: string) => void;
+};
+
+export type { SettingsTab };
+
+const initialTheme = loadPersistedTheme();
+const initialBlur = loadPersistedBlur();
+const initialTransparent = loadPersistedTransparent();
+
+export const useSettingsStore = create<SettingsState>((set) => ({
+  isOpen: false,
+  activeTab: "profile",
+  openedAtTab: false,
+  themeId: initialTheme,
+  blurEnabled: initialBlur,
+  transparentBackground: initialTransparent,
+
+  openSettings: (tab) =>
+    set({ isOpen: true, activeTab: tab ?? "profile", openedAtTab: tab !== undefined }),
+  closeSettings: () => set({ isOpen: false }),
+  setActiveTab: (tab) => set({ activeTab: tab }),
+
+  setTheme: (id) => {
+    applyTheme(id);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, id);
+    } catch {
+      /* localStorage full or inaccessible */
+    }
+    set({ themeId: id });
+    // Sync to server
+    usePreferencesStore.getState().set({ theme: id });
+  },
+
+  setBlurEnabled: (enabled) => {
+    // Blur stays off on mobile no matter what — nothing can turn it on there.
+    const eff = isCapacitor() ? false : enabled;
+    try {
+      localStorage.setItem(BLUR_STORAGE_KEY, eff ? "1" : "0");
+    } catch {
+      /* localStorage full or inaccessible */
+    }
+    set({ blurEnabled: eff });
+  },
+
+  setTransparentBackground: (enabled) => {
+    try {
+      localStorage.setItem(TRANSPARENT_KEY, enabled ? "1" : "0");
+    } catch {
+      /* localStorage full or inaccessible */
+    }
+    // Sync to Electron app settings (requires restart to take effect)
+    if (window.electronAPI?.setAppSetting) {
+      window.electronAPI.setAppSetting("transparentBackground", enabled);
+    }
+    set({ transparentBackground: enabled });
+  },
+
+  applyFromServer: (themeId: string) => {
+    if (themeId in THEMES) {
+      const id = themeId as ThemeId;
+      applyTheme(id);
+      try {
+        localStorage.setItem(THEME_STORAGE_KEY, id);
+      } catch { /* ignore */ }
+      set({ themeId: id });
+    }
+  },
+}));
+
+// Apply persisted theme on module load
+applyTheme(initialTheme);

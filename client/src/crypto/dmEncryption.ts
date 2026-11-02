@@ -1,0 +1,352 @@
+/**
+ * DM Encryption — E2EE encrypt/decrypt layer for DM messages.
+ *
+ * Used by dmStore (sending) and useWebSocket (receiving).
+ * Uses Signal Protocol primitives:
+ * - Send: plaintext → EncryptedEnvelope[] (one per recipient device)
+ * - Receive: EncryptedEnvelope[] → plaintext (for this device)
+ *
+ * Self-fanout: sender encrypts for own other devices so all
+ * devices can see sent messages.
+ *
+ * On first message, recipient's prekey bundle is fetched and
+ * X3DH session is established. Subsequent messages use existing
+ * Double Ratchet session.
+ */
+
+import * as signalProtocol from "./signalProtocol";
+import * as e2eeApi from "../api/e2ee";
+import * as keyStorage from "./keyStorage";
+import * as deviceManager from "./deviceManager";
+import { decodePayload, type E2EEPayload } from "./e2eePayload";
+import type { EncryptedFileMeta } from "./fileEncryption";
+import { useE2EEStore } from "../stores/e2eeStore";
+import type { EncryptedEnvelope, PreKeyBundleResponse, DMMessage } from "../types";
+import type { SignalWireMessage } from "./types";
+
+// ──────────────────────────────────
+// Own Message Plaintext Cache
+// ──────────────────────────────────
+
+// The sender cannot decrypt its own echo (no Double Ratchet session to self). A send's own echo
+// reads its text from the outbox under the nonce it carries (outboxStore.sentPayload); the send
+// response persists it to IndexedDB for history.
+
+/** In-memory cache for edit operations. messageId is known, so a direct Map suffices. */
+const editCache = new Map<string, E2EEPayload>();
+
+/** Cache plaintext before edit API call. */
+export function cacheEditPlaintext(messageId: string, payload: E2EEPayload): void {
+  editCache.set(messageId, payload);
+}
+
+/** Pop plaintext from edit cache. */
+export function popEditPlaintext(messageId: string): E2EEPayload | null {
+  const payload = editCache.get(messageId) ?? null;
+  if (payload) editCache.delete(messageId);
+  return payload;
+}
+
+/** Persist plaintext to IndexedDB after API response for historical access. */
+export async function persistSentPlaintext(
+  messageId: string,
+  dmChannelId: string,
+  content: string,
+  fileKeys: EncryptedFileMeta[] | undefined
+): Promise<void> {
+  await keyStorage.cacheDecryptedMessage({
+    messageId,
+    channelId: "",
+    dmChannelId,
+    content,
+    timestamp: Date.now(),
+    fileKeys,
+  });
+}
+
+/**
+ * Whether a decrypted payload is worth caching. An attachment-only message has empty text but
+ * must be cached all the same: a received message cannot be decrypted twice (the ratchet key is
+ * spent), so a message left out of the cache is unreadable on the next load.
+ */
+export function isCacheable(payload: E2EEPayload): boolean {
+  return !!payload.content || (payload.file_keys?.length ?? 0) > 0;
+}
+
+// ──────────────────────────────────
+// Encryption (Sender Side)
+// ──────────────────────────────────
+
+/**
+ * Encrypt a DM message for all recipient devices + self-fanout.
+ *
+ * 1. Fetch recipient's prekey bundles
+ * 2. Encrypt for each recipient device (X3DH + Double Ratchet)
+ * 3. Encrypt for sender's other devices (self-fanout)
+ * 4. Returns EncryptedEnvelope[] to be JSON-serialized as ciphertext
+ */
+export async function encryptDMMessage(
+  currentUserId: string,
+  recipientUserId: string,
+  localDeviceId: string,
+  plaintext: string
+): Promise<EncryptedEnvelope[]> {
+  const envelopes: EncryptedEnvelope[] = [];
+
+  // Fetch all recipient device bundles
+  const recipientBundles = await e2eeApi.fetchPreKeyBundles(recipientUserId);
+  if (!recipientBundles.success || !recipientBundles.data) {
+    throw new Error("Failed to fetch recipient prekey bundles");
+  }
+
+  // Recipient has no devices/keys — hasn't set up E2EE yet
+  if (recipientBundles.data.length === 0) {
+    throw new Error("RECIPIENT_NO_KEYS");
+  }
+
+  // Encrypt for each recipient device
+  for (const bundle of recipientBundles.data) {
+    const envelope = await encryptForDevice(
+      recipientUserId,
+      bundle,
+      localDeviceId,
+      plaintext
+    );
+    envelopes.push(envelope);
+  }
+
+  // Self-fanout: encrypt for sender's other devices.
+  // Always force PreKey messages — after recovery restore, only key material
+  // exists (no session state), so regular messages can't be decrypted.
+  const selfBundles = await e2eeApi.fetchPreKeyBundles(currentUserId);
+  if (selfBundles.success && selfBundles.data) {
+    for (const bundle of selfBundles.data) {
+      // Skip own device
+      if (bundle.device_id === localDeviceId) continue;
+
+      // forceNewSession rather than a separate delete: the delete has to be inside the same
+      // critical section as the re-establish and the encrypt, or a concurrent self-fanout — two
+      // sends to different people both reach these same devices — can delete the session this one
+      // just created, and its encrypt then finds nothing to encrypt with.
+      const envelope = await encryptForDevice(
+        currentUserId,
+        bundle,
+        localDeviceId,
+        plaintext,
+        { forceNewSession: true }
+      );
+      envelopes.push(envelope);
+    }
+  }
+
+  return envelopes;
+}
+
+/**
+ * Encrypt for a single device, establishing the X3DH session if there is not one.
+ *
+ * Both steps happen inside one lock, in signalProtocol — see establishAndEncrypt for why they
+ * cannot be composed here.
+ */
+async function encryptForDevice(
+  userId: string,
+  bundle: PreKeyBundleResponse,
+  senderDeviceId: string,
+  plaintext: string,
+  opts?: { forceNewSession?: boolean }
+): Promise<EncryptedEnvelope> {
+  const wireMessage = await signalProtocol.establishAndEncrypt(
+    userId,
+    bundle.device_id,
+    {
+      identityKey: bundle.identity_key,
+      // Fallback to identity_key for legacy devices without signing_key
+      signingKey: bundle.signing_key ?? bundle.identity_key,
+      signedPrekeyId: bundle.signed_prekey_id,
+      signedPrekey: bundle.signed_prekey,
+      signedPrekeySignature: bundle.signed_prekey_signature,
+      oneTimePrekeyId: bundle.one_time_prekey_id ?? undefined,
+      oneTimePrekey: bundle.one_time_prekey ?? undefined,
+      registrationId: bundle.registration_id,
+    },
+    plaintext,
+    opts
+  );
+
+  return {
+    sender_device_id: senderDeviceId,
+    recipient_device_id: bundle.device_id,
+    message_type: wireMessage.type,
+    // Full SignalWireMessage stored as JSON (header + ciphertext + preKeyInfo)
+    ciphertext: JSON.stringify(wireMessage),
+  };
+}
+
+// ──────────────────────────────────
+// Decryption (Receiver Side)
+// ──────────────────────────────────
+
+/**
+ * Decrypt a received E2EE DM message.
+ * Finds the envelope for this device, decrypts via Signal Protocol,
+ * and parses the structured payload (content + file_keys).
+ */
+export async function decryptDMMessage(
+  senderUserId: string,
+  ciphertext: string,
+  senderDeviceId: string
+): Promise<E2EEPayload | null> {
+  const localDeviceId = useE2EEStore.getState().localDeviceId;
+  if (!localDeviceId) return null;
+
+  // Parse envelope array
+  let envelopes: EncryptedEnvelope[];
+  try {
+    envelopes = JSON.parse(ciphertext);
+  } catch {
+    console.error("[dmEncryption] Failed to parse ciphertext envelopes");
+    return null;
+  }
+
+  // Find envelope for this device — try current ID first, then legacy IDs
+  // (after recovery restore, old envelopes are encrypted to the old device ID)
+  let myEnvelope = envelopes.find(
+    (env) => env.recipient_device_id === localDeviceId
+  );
+
+  if (!myEnvelope) {
+    // Check legacy device IDs (from before recovery restore)
+    const legacyIds = await deviceManager.getLegacyDeviceIds();
+    for (const legacyId of legacyIds) {
+      myEnvelope = envelopes.find(
+        (env) => env.recipient_device_id === legacyId
+      );
+      if (myEnvelope) break;
+    }
+  }
+
+  if (!myEnvelope) {
+    return null;
+  }
+
+  // Parse wire message
+  let wireMessage: SignalWireMessage;
+  try {
+    wireMessage = JSON.parse(myEnvelope.ciphertext);
+  } catch {
+    console.error("[dmEncryption] Failed to parse wire message");
+    return null;
+  }
+
+  // Decrypt via Signal Protocol
+  try {
+    const plaintext = await signalProtocol.decryptMessage(
+      senderUserId,
+      senderDeviceId,
+      wireMessage
+    );
+
+    if (plaintext === null) return null;
+
+    // Parse structured payload (content + file_keys)
+    return decodePayload(plaintext);
+  } catch (err) {
+    console.error("[dmEncryption] decrypt failed:", err);
+    throw err;
+  }
+}
+
+/**
+ * Batch-decrypt E2EE DM messages from fetchMessages/fetchOlderMessages.
+ * Plaintext messages (encryption_version=0) pass through unchanged.
+ * Successfully decrypted messages are cached to IndexedDB for client-side search.
+ */
+export async function decryptDMMessages(
+  messages: DMMessage[]
+): Promise<DMMessage[]> {
+  // Before init completes there are no keys to decrypt with, and an attempt is not free:
+  // decryptMessage runs processPreKeyMessage first, which writes session and trusted-identity
+  // records. Return placeholders instead — same contract as decryptChannelMessages.
+  if (useE2EEStore.getState().initStatus !== "ready") {
+    return messages.map((msg) =>
+      msg.encryption_version === 1 ? { ...msg, content: null } : msg
+    );
+  }
+
+  const result: DMMessage[] = [];
+  const toCache: import("./types").CachedDecryptedMessage[] = [];
+
+  for (const msg of messages) {
+    if (
+      msg.encryption_version === 1 &&
+      msg.ciphertext &&
+      msg.sender_device_id
+    ) {
+      // Check IndexedDB cache first — re-decrypting breaks Double Ratchet state
+      try {
+        const cached = await keyStorage.getCachedDecryptedMessage(msg.id);
+        if (cached) {
+          result.push({ ...msg, content: cached.content, e2ee_file_keys: cached.fileKeys });
+          continue;
+        }
+      } catch {
+        // Cache read error — fall through to decrypt
+      }
+
+      // Decrypt via Signal Protocol
+      try {
+        const payload = await decryptDMMessage(
+          msg.user_id,
+          msg.ciphertext,
+          msg.sender_device_id
+        );
+
+        if (payload) {
+          result.push({
+            ...msg,
+            content: payload.content,
+            e2ee_file_keys: payload.file_keys,
+          });
+
+          if (isCacheable(payload)) {
+            toCache.push({
+              messageId: msg.id,
+              channelId: "",
+              dmChannelId: msg.dm_channel_id,
+              content: payload.content,
+              timestamp: new Date(msg.created_at).getTime(),
+              fileKeys: payload.file_keys,
+            });
+          }
+        } else {
+          // No envelope found for this device
+          result.push({ ...msg, content: null });
+        }
+      } catch (err) {
+        console.error(
+          `[dmEncryption] Failed to decrypt msg ${msg.id}:`,
+          err
+        );
+        useE2EEStore.getState().addDecryptionError({
+          messageId: msg.id,
+          channelId: msg.dm_channel_id,
+          error: err instanceof Error ? err.message : "Decryption failed",
+          timestamp: Date.now(),
+        });
+        result.push({ ...msg, content: null });
+      }
+    } else {
+      // Plaintext message — pass through
+      result.push(msg);
+    }
+  }
+
+  // Batch cache write for performance
+  if (toCache.length > 0) {
+    keyStorage.cacheDecryptedMessages(toCache).catch((err) => {
+      console.error("[dmEncryption] Failed to cache messages:", err);
+    });
+  }
+
+  return result;
+}

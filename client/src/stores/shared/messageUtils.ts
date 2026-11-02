@@ -1,0 +1,347 @@
+/**
+ * Shared Message Utilities — extracted from messageStore and dmStore
+ * to eliminate duplication in message CRUD, typing, and WS handlers.
+ */
+
+import i18n from "../../i18n";
+import { UPLOAD_ABORTED } from "../../api/client";
+import { encryptFile, encryptThumbnail } from "../../crypto/fileEncryption";
+import { encodePayload } from "../../crypto/e2eePayload";
+import { keepClientNonce } from "../../utils/messageSync";
+import { useToastStore } from "../toastStore";
+import { classifyFailure, type SendOutcome } from "../outboxStore";
+import type { EncryptedFileMeta } from "../../crypto/fileEncryption";
+import type { GeneratedThumbnail } from "../../utils/imageEncoding";
+import type { APIResponse, ReactionGroup } from "../../types";
+
+// ─── File Encryption ───
+
+export type EncryptedFileResult = {
+  files: File[];
+  metas: EncryptedFileMeta[];
+  /** Encrypted previews, index-aligned with `files`. Null where the source had no usable preview. */
+  thumbs: (GeneratedThumbnail | null)[];
+};
+
+/**
+ * Encrypts files with AES-256-GCM for E2EE messages.
+ * Shared between channel and DM sendMessage flows.
+ */
+export async function encryptFilesForE2EE(
+  files: File[],
+  signal?: AbortSignal
+): Promise<EncryptedFileResult> {
+  const encrypted: File[] = [];
+  const metas: EncryptedFileMeta[] = [];
+  const thumbs: (GeneratedThumbnail | null)[] = [];
+
+  for (let i = 0; i < files.length; i++) {
+    // encryptFile is the expensive step and cannot be interrupted once started, so cancelling would
+    // otherwise still encrypt every remaining file. Throwing rather than breaking: a short batch
+    // silently sent fewer attachments than the user picked, and only happened not to because the
+    // transport re-checks the signal.
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const result = await encryptFile(files[i]);
+    encrypted.push(
+      new File([result.encryptedBlob], `encrypted_${i}.bin`, {
+        type: "application/octet-stream",
+      })
+    );
+
+    // Shares the file's key with its own IV, so the payload carries one extra field rather than a
+    // second key. Returns null for non-images and for anything already small enough.
+    const thumb = await encryptThumbnail(files[i], result.meta.key, signal);
+    if (thumb) {
+      result.meta.thumbIv = thumb.iv;
+      thumbs.push({ blob: thumb.encryptedBlob, width: thumb.width, height: thumb.height });
+    } else {
+      thumbs.push(null);
+    }
+
+    metas.push(result.meta);
+  }
+
+  return { files: encrypted, metas, thumbs };
+}
+
+// ─── Rate Limit Toast ───
+
+/**
+ * Shows a toast warning if the API response indicates rate limiting.
+ * Returns true if rate limited.
+ */
+export function handleRateLimitError(res: {
+  success: boolean;
+  error?: string;
+  code?: string;
+}): boolean {
+  if (!res.success && res.error?.includes("too many")) {
+    useToastStore
+      .getState()
+      .addToast("warning", i18n.t("chat:tooManyMessages"));
+    return true;
+  }
+  return false;
+}
+
+export function handleSendError(res: {
+  success: boolean;
+  error?: string;
+  code?: string;
+}): boolean {
+  if (res.success) return false;
+  // The user pressed cancel — that is not a failure, so no toast.
+  if (res.code === UPLOAD_ABORTED) return true;
+  if (handleRateLimitError(res)) return true;
+
+  const err = res.error?.toLowerCase() ?? "";
+  let key = "chat:sendFailed";
+  if (res.code === "upload_infected" || err.includes("failed security scan")) {
+    key = "chat:uploadRejectedInfected";
+  } else if (res.code === "upload_scan_unavailable" || err.includes("security scan is temporarily unavailable")) {
+    key = "chat:uploadScanUnavailable";
+  } else if (res.code === "upload_too_large_scan" || err.includes("too large for security scan")) {
+    key = "chat:uploadTooLargeScan";
+  } else if (res.code === "upload_too_large") {
+    key = "chat:uploadTooLarge";
+  } else if (res.code === "encryption_required") {
+    // The conversation mandates E2EE and this send went out unencrypted — almost always because
+    // encryption is not ready on this device yet, which the generic failure gave no hint of.
+    key = "chat:encryptionRequired";
+  } else if (res.code === "encryption_not_available") {
+    // The reverse: this client encrypted for a conversation that does not use E2EE, so its view of
+    // the setting is stale.
+    key = "chat:encryptionNotAvailable";
+  }
+
+  useToastStore.getState().addToast("error", i18n.t(key));
+  return true;
+}
+
+// ─── Second Copies ───
+
+type HeldCopy = {
+  content: string | null;
+  attachments?: unknown[];
+  e2ee_file_keys?: EncryptedFileMeta[];
+};
+
+/**
+ * A message arriving again — the send response and its echo, or a retry's answer and the first
+ * request's broadcast — may carry more than the copy already held: content the held copy could not
+ * decrypt, or files a retry answered before the first request had stored them. The fuller one wins;
+ * what only the held copy knows (its plaintext, its file keys) is kept. Null: keep the held copy.
+ */
+export function fullerCopy<T extends HeldCopy>(held: T, incoming: T): T | null {
+  const moreContent = held.content === null && incoming.content !== null;
+  const moreFiles = (incoming.attachments?.length ?? 0) > (held.attachments?.length ?? 0);
+  if (!moreContent && !moreFiles) return null;
+  return {
+    ...incoming,
+    content: incoming.content ?? held.content,
+    e2ee_file_keys: incoming.e2ee_file_keys ?? held.e2ee_file_keys,
+  };
+}
+
+// ─── Encrypted Edits ───
+
+/**
+ * The plaintext an encrypted edit carries. An edit replaces the stored ciphertext, so it has to
+ * carry the attachment keys along with the text — the text alone erases them for every reader.
+ * Null when this device does not hold every key: the edit would then break files that the
+ * recipients can still open.
+ */
+export function encryptedEditPayload(
+  content: string,
+  held: { attachments?: unknown[]; e2ee_file_keys?: EncryptedFileMeta[] } | undefined
+): string | null {
+  const attached = held?.attachments?.length ?? 0;
+  if (attached === 0) return encodePayload(content);
+  const keys = held?.e2ee_file_keys;
+  if (!keys || keys.length !== attached) return null;
+  return encodePayload(content, keys);
+}
+
+// ─── Outbox Outcomes ───
+
+/**
+ * The outcome of a send the server did not accept. A rejection is explained to the user; a
+ * transient failure only marks the bubble, since it is retried and a toast per message would pile up.
+ */
+export function sendFailureOutcome(res: APIResponse<unknown>): Exclude<SendOutcome, "sent"> {
+  // Cancel and timeout both abort the request; the outbox knows which it was.
+  if (res.code === UPLOAD_ABORTED) return "transient";
+  const outcome = classifyFailure(res.httpStatus);
+  if (outcome === "rejected") handleSendError(res);
+  return outcome;
+}
+
+/**
+ * The outcome of a send that could not be encrypted. A recipient without keys stays that way until
+ * they set up E2EE; anything else may be the network the key fetch needed, so it may be retried.
+ */
+export function encryptionFailureOutcome(err: unknown, logTag: string): Exclude<SendOutcome, "sent"> {
+  if (err instanceof DOMException && err.name === "AbortError") return "transient";
+  console.error(`[${logTag}] E2EE encryption failed:`, err);
+  if (err instanceof Error && err.message === "RECIPIENT_NO_KEYS") {
+    useToastStore.getState().addToast("error", i18n.t("e2ee:recipientNoKeys"));
+    return "rejected";
+  }
+  useToastStore.getState().addToast("error", i18n.t("e2ee:encryptionFailed"));
+  return "transient";
+}
+
+// ─── Typing Indicator ───
+
+const TYPING_TIMEOUT = 5_000;
+
+/**
+ * Creates a typing handler with its own timer map.
+ * Both messageStore and dmStore use identical typing logic.
+ *
+ * @param set - Zustand set function with typingUsers field
+ */
+export function createTypingHandler(
+  set: (
+    fn: (state: { typingUsers: Record<string, string[]> }) => {
+      typingUsers: Record<string, string[]>;
+    }
+  ) => void
+) {
+  const timers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  return (channelId: string, username: string) => {
+    set((state) => {
+      const current = state.typingUsers[channelId] ?? [];
+      if (current.includes(username)) return state as { typingUsers: Record<string, string[]> };
+
+      return {
+        typingUsers: {
+          ...state.typingUsers,
+          [channelId]: [...current, username],
+        },
+      };
+    });
+
+    const key = `${channelId}:${username}`;
+    const existingTimer = timers.get(key);
+    if (existingTimer) clearTimeout(existingTimer);
+
+    timers.set(
+      key,
+      setTimeout(() => {
+        set((state) => ({
+          typingUsers: {
+            ...state.typingUsers,
+            [channelId]: (state.typingUsers[channelId] ?? []).filter(
+              (u) => u !== username
+            ),
+          },
+        }));
+        timers.delete(key);
+      }, TYPING_TIMEOUT)
+    );
+  };
+}
+
+// ─── Generic WS Message Handlers ───
+
+/**
+ * Generic message-update handler. Replaces a message by ID in a keyed record.
+ * Used by both handleMessageUpdate and handleDMMessageUpdate.
+ */
+export function updateMessageInRecord<
+  T extends { id: string; client_nonce?: string }
+>(
+  messagesByChannel: Record<string, T[]>,
+  channelId: string,
+  updatedMessage: T
+): Record<string, T[]> {
+  const messages = messagesByChannel[channelId];
+  if (!messages) return messagesByChannel;
+
+  return {
+    ...messagesByChannel,
+    [channelId]: messages.map((m) =>
+      m.id === updatedMessage.id ? keepClientNonce(m, updatedMessage) : m
+    ),
+  };
+}
+
+/**
+ * Generic message-delete handler. Removes message and nullifies reply references.
+ * Used by both handleMessageDelete and handleDMMessageDelete.
+ */
+export function deleteMessageFromRecord<
+  T extends { id: string; reply_to_id?: string | null; referenced_message?: unknown }
+>(
+  messagesByChannel: Record<string, T[]>,
+  channelId: string,
+  deletedId: string
+): Record<string, T[]> {
+  const messages = messagesByChannel[channelId];
+  if (!messages) return messagesByChannel;
+
+  const updated = messages
+    .filter((m) => m.id !== deletedId)
+    .map((m) =>
+      m.reply_to_id === deletedId
+        ? { ...m, referenced_message: { id: deletedId, author: null, content: null } }
+        : m
+    );
+
+  return {
+    ...messagesByChannel,
+    [channelId]: updated,
+  };
+}
+
+/**
+ * Generic reaction-update handler. Replaces reaction list on a message.
+ * Used by both handleReactionUpdate and handleDMReactionUpdate.
+ */
+export function updateReactionInRecord<
+  T extends { id: string; reactions?: ReactionGroup[] }
+>(
+  messagesByChannel: Record<string, T[]>,
+  channelId: string,
+  messageId: string,
+  reactions: ReactionGroup[]
+): Record<string, T[]> {
+  const messages = messagesByChannel[channelId];
+  if (!messages) return messagesByChannel;
+
+  return {
+    ...messagesByChannel,
+    [channelId]: messages.map((m) =>
+      m.id === messageId ? { ...m, reactions } : m
+    ),
+  };
+}
+
+/**
+ * Generic author-update handler. Patches author info across all cached messages.
+ * Used by both handleAuthorUpdate and handleDMAuthorUpdate.
+ *
+ * @returns Updated record and whether any change occurred.
+ */
+export function updateAuthorInRecord<
+  T extends { author?: { id: string } | null }
+>(
+  messagesByChannel: Record<string, T[]>,
+  userId: string,
+  patch: { display_name?: string | null; avatar_url?: string | null }
+): { updated: Record<string, T[]>; changed: boolean } {
+  const result: Record<string, T[]> = {};
+  let changed = false;
+
+  for (const [chId, msgs] of Object.entries(messagesByChannel)) {
+    result[chId] = msgs.map((m) => {
+      if (m.author?.id !== userId) return m;
+      changed = true;
+      return { ...m, author: { ...m.author, ...patch } };
+    });
+  }
+
+  return { updated: result, changed };
+}

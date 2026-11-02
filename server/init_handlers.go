@@ -1,0 +1,126 @@
+package main
+
+import (
+	"time"
+
+	"github.com/akinalp/mqvi/config"
+	"github.com/akinalp/mqvi/handlers"
+	"github.com/akinalp/mqvi/pkg/files"
+	"github.com/akinalp/mqvi/services"
+	"github.com/akinalp/mqvi/ws"
+)
+
+// Handlers holds all HTTP handler instances.
+type Handlers struct {
+	Auth              *handlers.AuthHandler
+	Channel           *handlers.ChannelHandler
+	Category          *handlers.CategoryHandler
+	Message           *handlers.MessageHandler
+	Member            *handlers.MemberHandler
+	Role              *handlers.RoleHandler
+	Voice             *handlers.VoiceHandler
+	Server            *handlers.ServerHandler
+	Invite            *handlers.InviteHandler
+	SignupInvite      *handlers.SignupInviteHandler
+	Pin               *handlers.PinHandler
+	Search            *handlers.SearchHandler
+	ReadState         *handlers.ReadStateHandler
+	DM                *handlers.DMHandler
+	Reaction          *handlers.ReactionHandler
+	ChannelPermission *handlers.ChannelPermissionHandler
+	Friendship        *handlers.FriendshipHandler
+	Avatar            *handlers.AvatarHandler
+	Stats             *handlers.StatsHandler
+	ClientPolicy      *handlers.ClientPolicyHandler
+	ClientError       *handlers.ClientErrorHandler
+	Admin             *handlers.AdminHandler
+	ServerMute        *handlers.ServerMuteHandler
+	ChannelMute       *handlers.ChannelMuteHandler
+	DMSettings        *handlers.DMSettingsHandler
+	Block             *handlers.BlockHandler
+	Report            *handlers.ReportHandler
+	Gif               *handlers.GifHandler
+	Device            *handlers.DeviceHandler
+	E2EE              *handlers.E2EEHandler
+	LinkPreview       *handlers.LinkPreviewHandler
+	Badge             *handlers.BadgeHandler
+	Preferences       *handlers.PreferencesHandler
+	DownloadPrompt    *handlers.DownloadPromptHandler
+	Guide             *handlers.GuideHandler
+	Feedback          *handlers.FeedbackHandler
+	Soundboard        *handlers.SoundboardHandler
+	Storage           *handlers.StorageHandler
+	LiveKitWebhook    *handlers.LiveKitWebhookHandler
+	VoiceMessage      *handlers.VoiceMessageHandler
+	ICEServer         *handlers.ICEServerHandler
+	P2PHangup         *handlers.P2PHangupHandler
+	PushToken         *handlers.PushTokenHandler
+	Session           *handlers.SessionHandler
+	Discovery         *handlers.DiscoveryHandler
+	AssetLinks        *handlers.AssetLinksHandler
+	AASA              *handlers.AASAHandler
+	WS                *ws.Handler
+}
+
+func initHandlers(svcs *Services, repos *Repositories, limiters *RateLimiters, hub *ws.Hub, cfg *config.Config, encryptionKey []byte, urlSigner services.FileURLSigner) *Handlers {
+	fileLocator := files.NewLocator(cfg.Upload.Dir, cfg.Upload.PublicURL)
+	h := &Handlers{
+		Auth:              handlers.NewAuthHandler(svcs.Auth, limiters.Login, limiters.Register, limiters.ForgotPwd, limiters.ResetPwd, urlSigner, time.Duration(cfg.JWT.FileTokenExpiry)*time.Hour, limiters.CredentialStore, svcs.CrisisMode),
+		Channel:           handlers.NewChannelHandler(svcs.Channel),
+		Category:          handlers.NewCategoryHandler(svcs.Category),
+		Message:           handlers.NewMessageHandler(svcs.Message, svcs.Upload, svcs.Storage, cfg.Upload.MaxSize, limiters.Message, urlSigner),
+		Member:            handlers.NewMemberHandler(svcs.Member),
+		Role:              handlers.NewRoleHandler(svcs.Role),
+		Voice:             handlers.NewVoiceHandler(svcs.Voice, urlSigner, limiters.ScreenShare, limiters.ScreenShareStop, limiters.NoiseReduction),
+		Server:            handlers.NewServerHandler(svcs.Server),
+		Discovery:         handlers.NewDiscoveryHandler(svcs.Discovery, svcs.Server, svcs.Report, svcs.ServerReportUpload, svcs.Storage, urlSigner, cfg.Upload.MaxSize, limiters.Discovery, limiters.Report),
+		Invite:            handlers.NewInviteHandler(svcs.Invite),
+		SignupInvite:      handlers.NewSignupInviteHandler(svcs.SignupInvite),
+		Pin:               handlers.NewPinHandler(svcs.Pin),
+		Search:            handlers.NewSearchHandler(svcs.Search),
+		ReadState:         handlers.NewReadStateHandler(svcs.ReadState, limiters.ChannelRead),
+		DM:                handlers.NewDMHandler(svcs.DM, svcs.DMUpload, svcs.Storage, cfg.Upload.MaxSize, limiters.Message, limiters.DMRead, limiters.DMDelivery, urlSigner),
+		Reaction:          handlers.NewReactionHandler(svcs.Reaction),
+		ChannelPermission: handlers.NewChannelPermissionHandler(svcs.ChannelPermission),
+		Friendship:        handlers.NewFriendshipHandler(svcs.Friendship),
+		Avatar:            handlers.NewAvatarHandler(svcs.Member, svcs.Server, fileLocator, svcs.UploadPipeline),
+		Stats:             handlers.NewStatsHandler(repos.User),
+		ClientPolicy:      handlers.NewClientPolicyHandler(cfg.ClientVersions.MinAndroid, cfg.ClientVersions.MinIOS),
+		ClientError:       handlers.NewClientErrorHandler(svcs.ClientError, limiters.ClientError, limiters.ClientRenderCrash, limiters.ClientErrorDaily),
+		Admin:             handlers.NewAdminHandler(svcs.LiveKitAdmin, svcs.MetricsHistory, svcs.AdminUser, svcs.AdminServer, svcs.Report, svcs.ReportModeration, svcs.AppLog, svcs.SettingsBadge, svcs.Voice, svcs.CrisisMode),
+		ServerMute:        handlers.NewServerMuteHandler(svcs.ServerMute),
+		ChannelMute:       handlers.NewChannelMuteHandler(svcs.ChannelMute),
+		DMSettings:        handlers.NewDMSettingsHandler(svcs.DMSettings),
+		Block:             handlers.NewBlockHandler(svcs.Block),
+		Report:            handlers.NewReportHandler(svcs.Report, svcs.ReportUpload, svcs.Storage, cfg.Upload.MaxSize, limiters.Report, urlSigner),
+		Gif:               handlers.NewGifHandler(cfg.Klipy.APIKey),
+		AssetLinks:        handlers.NewAssetLinksHandler(cfg.AppLinks.AndroidPackage, cfg.AppLinks.AndroidFingerprints),
+		AASA:              handlers.NewAASAHandler(cfg.AppLinks.IOSAppID),
+		Device:            handlers.NewDeviceHandler(svcs.Device),
+		E2EE:              handlers.NewE2EEHandler(svcs.E2EE),
+		LinkPreview:       handlers.NewLinkPreviewHandler(svcs.LinkPreview, cfg.LinkPreviewEnabled),
+		Badge:             handlers.NewBadgeHandler(svcs.Badge, svcs.UploadPipeline),
+		Preferences:       handlers.NewPreferencesHandler(svcs.Preferences),
+		DownloadPrompt:    handlers.NewDownloadPromptHandler(repos.User),
+		Guide:             handlers.NewGuideHandler(svcs.Guide),
+		Feedback:          handlers.NewFeedbackHandler(svcs.Feedback, svcs.FeedbackUpload, svcs.Storage, svcs.SettingsBadge, cfg.Upload.MaxSize, limiters.Feedback, svcs.AppLog, urlSigner),
+		Soundboard:        handlers.NewSoundboardHandler(svcs.Soundboard, svcs.Storage, cfg.Upload.MaxSize, urlSigner),
+		Storage:           handlers.NewStorageHandler(svcs.Storage),
+		LiveKitWebhook:    handlers.NewLiveKitWebhookHandler(repos.LiveKit, encryptionKey, svcs.AppLog, svcs.Voice),
+		VoiceMessage:      handlers.NewVoiceMessageHandler(svcs.VoiceMessage, svcs.UploadPipeline, svcs.Storage, urlSigner, limiters.Message, cfg.Upload.MaxSize),
+		ICEServer:         handlers.NewICEServerHandler(svcs.TURN, svcs.P2PCall, limiters.ICE),
+		P2PHangup:         handlers.NewP2PHangupHandler(svcs.P2PCall, limiters.Hangup),
+		PushToken:         handlers.NewPushTokenHandler(svcs.PushToken),
+		Session:           handlers.NewSessionHandler(svcs.Session, limiters.SessionRevoke),
+		WS:                ws.NewHandler(hub, svcs.Auth, nil, svcs.Voice, repos.User, repos.Server, svcs.ServerMute, svcs.ChannelMute, urlSigner),
+	}
+	// Re-deliver a ringing incoming call to a receiver on (re)connect (offline/push tap).
+	h.WS.SetIncomingCallProvider(svcs.P2PCall)
+	// A connection claiming native call media is believed only if this device registered a VoIP token.
+	h.WS.SetNativeDeviceChecker(svcs.PushToken)
+	// Friends and DM partners get presence even with no server in common — see PHASE-56.
+	h.WS.SetPresencePeerProvider(repos.Friendship)
+	// Bound what one account can cost at the WS door: concurrent sockets, and handshake rate.
+	h.WS.SetConnectionLimits(cfg.WSLimits.MaxConnectionsPerUser, cfg.WSLimits.ConnectsPerMinute)
+	return h
+}
