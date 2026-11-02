@@ -166,3 +166,81 @@ Before inviting the public:
 - [ ] Review the security limitations: the project has not received an independent security audit.
 
 Self-hosting gives the operator control of the infrastructure; it does not make the application or endpoint devices invulnerable.
+
+
+## 10. Deploy a prebuilt binary during an international outage
+
+GitHub Actions and public package registries may be unreachable during an international route shutdown. For an already-provisioned domestic server, prepare a Linux server binary before the outage and transfer it directly over the domestic network.
+
+Build the artifact while dependencies are reachable (or from your own npm/Go mirrors):
+
+```bash
+cd client
+npm ci
+npm run build
+cd ..
+
+rm -rf server/static/dist
+mkdir -p server/static/dist
+mkdir -p deploy/package
+cp -a client/dist/. server/static/dist/
+
+cd server
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o ../deploy/package/mqvi-server .
+cd ..
+```
+
+For an ARM64 server, use `GOARCH=arm64` instead. The resulting binary includes the frontend assets. Keep the binary and its checksum on storage reachable from your domestic deployment machine before the outage.
+
+The deployment helper does not contact GitHub, package registries, or any external API. It only uses SSH to the host you specify. The host must already have the Oblivions systemd installation, its existing `/opt/mqvi/.env`, database, uploads, and service unit. Verify the SSH host key in `known_hosts` beforehand; strict host-key checking is enabled.
+
+```bash
+chmod +x deploy/domestic-deploy.sh
+deploy/domestic-deploy.sh \
+  --host YOUR_DOMESTIC_SERVER_IP \
+  --user root \
+  --artifact deploy/package/mqvi-server
+```
+
+The helper backs up the previous server binary and SQLite database (including WAL/SHM sidecars), installs the new one, restarts `mqvi-server.service`, and checks the loopback readiness endpoint at `127.0.0.1:9091/health/ready`. If restart or readiness fails, it restores the previous binary and database. It does not change `.env`, the database, uploads, LiveKit, Caddy, DNS, or firewall settings.
+
+This is a deployment path for an already-provisioned host, not an offline installer. OS packages, Caddy, LiveKit, TURN, certificates, DNS, antivirus signatures, and application dependencies must be installed or mirrored domestically in advance. The existing GitHub Actions workflow remains unchanged and continues to target the existing VPS; this helper is separate and does not deploy anything until explicitly run.
+
+
+## 11. Build and install a complete offline application bundle
+
+For a new, already-provisioned domestic Linux host, the repository now includes a bundle builder and a no-download installer. This avoids GitHub Actions and public registries during the actual installation. It does **not** replace provisioning the operating system, TLS, DNS, firewall, or TURN relay.
+
+Before the outage, prepare a local LiveKit binary matching the target architecture (the regular installer currently uses LiveKit v1.9.12), and warm the npm and Go dependency caches while internet is available. From the repository root, run `cd client && npm ci && cd ../server && go mod download`; this caches the exact SheetJS tarball dependency and Go modules. The builder deliberately runs npm and Go in offline mode and fails rather than silently reaching the internet:
+
+```bash
+LIVEKIT_BINARY=/path/to/livekit-server bash deploy/prepare-offline-bundle.sh
+```
+
+The resulting archive is written under `dist/offline/`. Transfer the archive and `deploy/offline-install.sh` to the domestic server using a domestic network or physical media. The installer verifies the archive's SHA-256 manifest and CPU architecture, creates the `mqvi` service account, installs the app and local LiveKit, generates secrets on the host, disables optional external lookups, and checks database-backed readiness:
+
+```bash
+sudo bash deploy/offline-install.sh \
+  --bundle oblivions-offline-linux-amd64-VERSION.tar.gz \
+  --public-ip YOUR_DOMESTIC_PUBLIC_IPV4 \
+  --domain chat.example.ir \
+  --livekit-url wss://livekit.example.ir
+```
+
+Use the actual public IPv4 address that clients can reach. LiveKit is configured with `use_external_ip: false` and an explicit `node_ip`, so it does not need STUN-based public-IP discovery. Its media ports must be routed to that address. Open TCP 80/443 for the TLS proxy, TCP 7881 for ICE/TCP, and UDP 50000-50200; keep TCP 7880 private behind the TLS proxy. Configure an already-installed Caddy or other TLS reverse proxy to forward `chat.example.ir` to `127.0.0.1:9090` and `livekit.example.ir` to `127.0.0.1:7880`; install browser-trusted certificates for both names before the outage. The installer pins the LiveKit hostname to loopback in the server's `/etc/hosts` so backend SDK calls use the local TLS proxy, while domestic clients resolve it to the domestic public IP. The script intentionally does not install packages, modify firewall rules, request certificates, or configure DNS. A basic Caddy reverse-proxy configuration is:
+
+```caddyfile
+chat.example.ir {
+    tls /etc/ssl/oblivions/chat-fullchain.pem /etc/ssl/oblivions/chat-key.pem
+    reverse_proxy 127.0.0.1:9090
+}
+
+livekit.example.ir {
+    tls /etc/ssl/oblivions/livekit-fullchain.pem /etc/ssl/oblivions/livekit-key.pem
+    reverse_proxy 127.0.0.1:7880
+}
+```
+
+Use certificates already installed on the host (or provision them before the outage). Keep the LiveKit signalling port 7880 blocked from direct public access; Caddy exposes it over WSS.
+
+The offline installer starts the application and LiveKit only. It does not install coturn; restrictive carrier NATs may therefore prevent some calls until a domestic TURN relay is provisioned and `TURN_SECRET`/`TURN_URLS` are configured. It also leaves antivirus disabled unless you separately provision and configure ClamAV. Review the generated `/opt/mqvi/.env` before opening registration.
