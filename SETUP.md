@@ -182,6 +182,7 @@ cd ..
 
 rm -rf server/static/dist
 mkdir -p server/static/dist
+mkdir -p deploy/package
 cp -a client/dist/. server/static/dist/
 
 cd server
