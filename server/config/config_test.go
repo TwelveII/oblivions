@@ -2,6 +2,12 @@ package config
 
 import "testing"
 
+func TestDefaultSTUNURLsAreEmpty(t *testing.T) {
+	if defaultSTUNURLs != "" {
+		t.Fatalf("defaultSTUNURLs must not contact a public STUN provider, got %q", defaultSTUNURLs)
+	}
+}
+
 func TestValidateICEServers(t *testing.T) {
 	const goodSecret = "a-sufficiently-long-secret"
 	goodTURN := []string{"turn:turn.example.com:3478?transport=udp"}
