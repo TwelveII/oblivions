@@ -227,6 +227,18 @@ sudo bash deploy/offline-install.sh \
   --livekit-url wss://livekit.example.ir
 ```
 
-Use the actual public IPv4 address that clients can reach. LiveKit is configured with `use_external_ip: false` and an explicit `node_ip`, so it does not need STUN-based public-IP discovery. Its media ports must be routed to that address. Open TCP 80/443 for the TLS proxy, TCP 7881 for ICE/TCP, and UDP 50000-50200; keep TCP 7880 private behind the TLS proxy. Configure an already-installed Caddy or other TLS reverse proxy to forward `chat.example.ir` to `127.0.0.1:9090` and `livekit.example.ir` to `127.0.0.1:7880`; install browser-trusted certificates for both names before the outage. The installer pins the LiveKit hostname to loopback in the server's `/etc/hosts` so backend SDK calls use the local TLS proxy, while domestic clients resolve it to the domestic public IP. The script intentionally does not install packages, modify firewall rules, request certificates, or configure DNS.
+Use the actual public IPv4 address that clients can reach. LiveKit is configured with `use_external_ip: false` and an explicit `node_ip`, so it does not need STUN-based public-IP discovery. Its media ports must be routed to that address. Open TCP 80/443 for the TLS proxy, TCP 7881 for ICE/TCP, and UDP 50000-50200; keep TCP 7880 private behind the TLS proxy. Configure an already-installed Caddy or other TLS reverse proxy to forward `chat.example.ir` to `127.0.0.1:9090` and `livekit.example.ir` to `127.0.0.1:7880`; install browser-trusted certificates for both names before the outage. The installer pins the LiveKit hostname to loopback in the server's `/etc/hosts` so backend SDK calls use the local TLS proxy, while domestic clients resolve it to the domestic public IP. The script intentionally does not install packages, modify firewall rules, request certificates, or configure DNS. A basic Caddy reverse-proxy configuration is:
+
+```caddyfile
+chat.example.ir {
+    reverse_proxy 127.0.0.1:9090
+}
+
+livekit.example.ir {
+    reverse_proxy 127.0.0.1:7880
+}
+```
+
+Use certificates already installed on the host (or provision them before the outage). Keep the LiveKit signalling port 7880 blocked from direct public access; Caddy exposes it over WSS.
 
 The offline installer starts the application and LiveKit only. It does not install coturn; restrictive carrier NATs may therefore prevent some calls until a domestic TURN relay is provisioned and `TURN_SECRET`/`TURN_URLS` are configured. It also leaves antivirus disabled unless you separately provision and configure ClamAV. Review the generated `/opt/mqvi/.env` before opening registration.
