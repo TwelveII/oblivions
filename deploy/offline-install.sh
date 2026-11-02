@@ -8,6 +8,7 @@ BUNDLE=""
 APP_DIR="/opt/mqvi"
 PUBLIC_IP=""
 DOMAIN=""
+LIVEKIT_URL=""
 PORT="9090"
 while (($#)); do
   case "$1" in
@@ -15,9 +16,10 @@ while (($#)); do
     --app-dir) APP_DIR="${2:-}"; shift 2 ;;
     --public-ip) PUBLIC_IP="${2:-}"; shift 2 ;;
     --domain) DOMAIN="${2:-}"; shift 2 ;;
+    --livekit-url) LIVEKIT_URL="${2:-}"; shift 2 ;;
     --port) PORT="${2:-}"; shift 2 ;;
     -h|--help)
-      echo "Usage: sudo deploy/offline-install.sh --bundle FILE --public-ip IPV4 [--domain HOST] [--port 9090]"
+      echo "Usage: sudo deploy/offline-install.sh --bundle FILE --public-ip IPV4 [--domain HOST] --livekit-url wss://livekit.example.ir [--port 9090]"
       echo "Requires preinstalled systemd, curl, openssl, tar, sha256sum and a TLS reverse proxy."
       exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
@@ -27,6 +29,7 @@ done
 die() { echo "ERROR: $*" >&2; exit 1; }
 [[ "$(id -u)" -eq 0 ]] || die "Run as root."
 [[ -n "$BUNDLE" && -s "$BUNDLE" ]] || die "--bundle must point to a non-empty bundle archive."
+[[ "$LIVEKIT_URL" =~ ^wss://[A-Za-z0-9.-]+$ ]] || die "--livekit-url must be a WSS hostname without a path or port."
 [[ "$PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "--public-ip must be the server's public IPv4 address."
 [[ "$PORT" =~ ^[0-9]+$ ]] && ((PORT > 0 && PORT < 65536)) || die "Invalid port."
 for tool in systemctl useradd install tar sha256sum openssl curl; do
@@ -83,12 +86,19 @@ MQVI_GEOIP_AUTO_UPDATE=false
 MQVI_LINK_PREVIEWS_ENABLED=false
 STUN_URLS=
 TURN_URLS=
-LIVEKIT_URL=ws://127.0.0.1:7880
+LIVEKIT_URL=$LIVEKIT_URL
 LIVEKIT_API_KEY=$LK_API_KEY
 LIVEKIT_API_SECRET=$LK_API_SECRET
 APP_URL=$APP_URL
 CORS_ORIGINS=$APP_URL
 EOF
+fi
+
+# Keep the backend SDK on the same public WSS endpoint that browser clients use.
+if grep -q "^LIVEKIT_URL=" "$APP_DIR/.env"; then
+  sed -i "s|^LIVEKIT_URL=.*|LIVEKIT_URL=$LIVEKIT_URL|" "$APP_DIR/.env"
+else
+  printf "LIVEKIT_URL=%s\\n" "$LIVEKIT_URL" >> "$APP_DIR/.env"
 fi
 
 if [[ ! -s "$APP_DIR/livekit.yaml" ]]; then
@@ -186,7 +196,8 @@ fi
 echo "Oblivions is installed and ready."
 echo "App directory: $APP_DIR"
 echo "Local app: http://127.0.0.1:$PORT"
-echo "Configure your already-installed TLS proxy for $DOMAIN (if supplied) -> 127.0.0.1:$PORT."
+echo "Configure TLS proxy: $DOMAIN -> 127.0.0.1:$PORT and the LiveKit WSS hostname -> 127.0.0.1:7880."
 echo "Open TCP 80/443 (proxy), TCP 7880/7881, and UDP 50000-50200 in host/provider firewalls."
+echo "Add the LiveKit WSS hostname to /etc/hosts as 127.0.0.1 on this server so backend SDK calls use the local TLS proxy."
 echo "No Caddy, certificate, coturn, or OS packages were installed."
 echo "For restrictive client networks, provision domestic TURN/coturn separately and set TURN_URLS/TURN_SECRET."
