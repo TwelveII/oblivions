@@ -205,3 +205,27 @@ deploy/domestic-deploy.sh \
 The helper backs up the previous server binary and SQLite database (including WAL/SHM sidecars), installs the new one, restarts `mqvi-server.service`, and checks the loopback readiness endpoint at `127.0.0.1:9091/health/ready`. If restart or readiness fails, it restores the previous binary and database. It does not change `.env`, the database, uploads, LiveKit, Caddy, DNS, or firewall settings.
 
 This is a deployment path for an already-provisioned host, not an offline installer. OS packages, Caddy, LiveKit, TURN, certificates, DNS, antivirus signatures, and application dependencies must be installed or mirrored domestically in advance. The existing GitHub Actions workflow remains unchanged and continues to target the existing VPS; this helper is separate and does not deploy anything until explicitly run.
+
+
+## 11. Build and install a complete offline application bundle
+
+For a new, already-provisioned domestic Linux host, the repository now includes a bundle builder and a no-download installer. This avoids GitHub Actions and public registries during the actual installation. It does **not** replace provisioning the operating system, TLS, DNS, firewall, or TURN relay.
+
+Before the outage, prepare a local LiveKit binary matching the target architecture (the regular installer currently uses LiveKit v1.9.12), and warm the npm and Go dependency caches. The SheetJS dependency is pinned to the SheetJS CDN tarball, so it must already be in npm's local cache. The builder deliberately runs npm and Go in offline mode and fails rather than silently reaching the internet:
+
+```bash
+LIVEKIT_BINARY=/path/to/livekit-server bash deploy/prepare-offline-bundle.sh
+```
+
+The resulting archive is written under `dist/offline/`. Transfer the archive and `deploy/offline-install.sh` to the domestic server using a domestic network or physical media. The installer verifies the archive's SHA-256 manifest and CPU architecture, creates the `mqvi` service account, installs the app and local LiveKit, generates secrets on the host, disables optional external lookups, and checks database-backed readiness:
+
+```bash
+sudo bash deploy/offline-install.sh \
+  --bundle oblivions-offline-linux-amd64-VERSION.tar.gz \
+  --public-ip YOUR_DOMESTIC_PUBLIC_IPV4 \
+  --domain chat.example.ir
+```
+
+Use the actual public IPv4 address that clients can reach. LiveKit is configured with `use_external_ip: false` and an explicit `node_ip`, so it does not need STUN-based public-IP discovery. Its media ports must be routed to that address. Configure an already-installed Caddy or other TLS reverse proxy to forward the domain to `127.0.0.1:9090`; install a browser-trusted certificate before the outage. The script intentionally does not install packages, modify firewall rules, request certificates, or configure DNS.
+
+The offline installer starts the application and LiveKit only. It does not install coturn; restrictive carrier NATs may therefore prevent some calls until a domestic TURN relay is provisioned and `TURN_SECRET`/`TURN_URLS` are configured. It also leaves antivirus disabled unless you separately provision and configure ClamAV. Review the generated `/opt/mqvi/.env` before opening registration.
