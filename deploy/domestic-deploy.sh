@@ -54,7 +54,7 @@ done
 [[ -n "$SSH_HOST" ]] || die "--host is required"
 [[ -n "$ARTIFACT" ]] || die "--artifact is required"
 [[ "$SSH_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid host name or IPv4 address"
-[[ "$SSH_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || die "Invalid SSH user"
+[[ "$SSH_USER" == "root" ]] || die "Use --user root; the installed service and binary are root-owned"
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && ((SSH_PORT > 0 && SSH_PORT < 65536)) || die "Invalid SSH port"
 [[ -f "$ARTIFACT" && -s "$ARTIFACT" ]] || die "Artifact does not exist or is empty: $ARTIFACT"
 if [[ -n "$SSH_KEY" ]]; then
