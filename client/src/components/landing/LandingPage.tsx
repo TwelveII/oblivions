@@ -33,11 +33,6 @@ function LandingPage() {
           </div>
         </section>
 
-        <footer className="lp-footer">
-          <a href="/privacy">Privacy</a>
-          <span>·</span>
-          <a href="/terms">Terms</a>
-        </footer>
       </div>
     </main>
   );
