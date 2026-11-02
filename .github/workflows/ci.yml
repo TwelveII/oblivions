@@ -45,6 +45,13 @@ jobs:
           bash -n deploy/domestic-deploy.sh
           bash -n deploy/prepare-offline-bundle.sh
           bash -n deploy/offline-install.sh
+      - name: Ensure production deployment is manual only
+        run: |
+          grep -Eq '^[[:space:]]+workflow_dispatch:' .github/workflows/deploy.yml
+          if grep -Eq '^[[:space:]]+push:' .github/workflows/deploy.yml; then
+            echo "Automatic push deployment must remain disabled." >&2
+            exit 1
+          fi
       - uses: actions/download-artifact@v4
         with:
           name: frontend-dist
