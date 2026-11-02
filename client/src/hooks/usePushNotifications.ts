@@ -42,6 +42,9 @@ function handleNotificationTap(data: Record<string, unknown>, title?: string): v
 
 export function usePushNotifications(): void {
   useEffect(() => {
+    // FCM/APNs are external push networks. Keep them opt-in so the native app does not
+    // contact Google/Apple in domestic-only deployments; foreground WebSocket delivery remains.
+    if (import.meta.env.VITE_PUSH_NOTIFICATIONS_ENABLED !== "true") return;
     if (!isCapacitor()) return;
 
     const handles: PluginListenerHandle[] = [];
