@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install Oblivions from a prebuilt offline bundle on a freshly provisioned Linux host.
-# This script makes no network requests and never installs OS packages.
+# This script makes no external network requests and never installs OS packages.
 
 set -Eeuo pipefail
 
@@ -228,6 +228,6 @@ echo "App directory: $APP_DIR"
 echo "Local app: http://127.0.0.1:$PORT"
 echo "Configure TLS proxy: $DOMAIN -> 127.0.0.1:$PORT and the LiveKit WSS hostname -> 127.0.0.1:7880."
 echo "Open TCP 80/443 (TLS proxy), TCP 7881 (ICE/TCP), and UDP 50000-50200; keep TCP 7880 private behind the proxy."
-echo "Add the LiveKit WSS hostname to /etc/hosts as 127.0.0.1 on this server so backend SDK calls use the local TLS proxy."
+echo "The LiveKit hostname has been pinned to 127.0.0.1 in /etc/hosts for local backend SDK access."
 echo "No Caddy, certificate, coturn, or OS packages were installed."
 echo "For restrictive client networks, provision domestic TURN/coturn separately and set TURN_URLS/TURN_SECRET."
