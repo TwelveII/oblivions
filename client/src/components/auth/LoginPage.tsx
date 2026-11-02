@@ -172,6 +172,12 @@ function LoginPage() {
           <Link to={searchParams.get("returnUrl") ? `/register?returnUrl=${searchParams.get("returnUrl")}` : "/register"}>{t("registerLink")}</Link>
         </p>
 
+        <p className="auth-link">
+          <Link to="/privacy">Privacy</Link>
+          {" · "}
+          <Link to="/terms">Terms</Link>
+        </p>
+
         {/* Desktop download hint — only on web browsers with desktop OS */}
         {shouldShowDownloadPrompt() && (() => {
           const { url, i18nKey } = detectOS();
