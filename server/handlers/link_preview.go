@@ -13,15 +13,21 @@ import (
 // SSRF protection is in the service layer.
 type LinkPreviewHandler struct {
 	service services.LinkPreviewService
+	enabled bool
 }
 
-func NewLinkPreviewHandler(service services.LinkPreviewService) *LinkPreviewHandler {
-	return &LinkPreviewHandler{service: service}
+func NewLinkPreviewHandler(service services.LinkPreviewService, enabled bool) *LinkPreviewHandler {
+	return &LinkPreviewHandler{service: service, enabled: enabled}
 }
 
 // Get returns Open Graph metadata for the given URL.
 // GET /api/link-preview?url=https://example.com
 func (h *LinkPreviewHandler) Get(w http.ResponseWriter, r *http.Request) {
+	if !h.enabled {
+		pkg.ErrorWithMessage(w, http.StatusServiceUnavailable, "link previews are disabled on this instance")
+		return
+	}
+
 	_, ok := r.Context().Value(ctxkeys.User).(*models.User)
 	if !ok {
 		pkg.ErrorWithMessage(w, http.StatusUnauthorized, "user not found in context")
