@@ -1810,6 +1810,9 @@ function setupIPC(): void {
 
 /** Configure electron-updater for GitHub Releases auto-updates. */
 function setupAutoUpdater(): void {
+  // GitHub Releases is outside the domestic network. Auto-update is opt-in; packaged
+  // domestic builds receive updates through an operator-provided local distribution path.
+  if (process.env.OBLIVIONS_ENABLE_AUTO_UPDATE !== "true") return;
   // Auto-download when update is found
   autoUpdater.autoDownload = true;
   // Install on app quit
@@ -1986,6 +1989,8 @@ function createUpdateWindow(): BrowserWindow {
 }
 
 async function checkForUpdateBeforeLaunch(): Promise<boolean> {
+  // Never block startup or contact GitHub in domestic-only deployments unless explicitly opted in.
+  if (process.env.OBLIVIONS_ENABLE_AUTO_UPDATE !== "true") return false;
   // Skip update check in dev mode
   const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
   if (isDev) return false;

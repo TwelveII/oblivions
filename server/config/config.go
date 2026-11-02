@@ -35,13 +35,16 @@ type Config struct {
 	ClientVersions  ClientVersionConfig
 	EncryptionKey   string // AES-256 key (64 hex chars = 32 bytes) for LiveKit credential encryption
 	HetznerAPIToken string // Hetzner Cloud API token (read-only) — optional
-	// PasswordBreachCheck queries Have I Been Pwned when a password is set. Needs no key or
-	// account; turn it off only for a self-host with no route out. Failures allow the password.
+	// PasswordBreachCheck optionally queries Have I Been Pwned. Disabled by default so
+	// password creation never depends on an international service.
 	PasswordBreachCheck bool
+	// LinkPreviewEnabled allows the server to fetch arbitrary public URLs for Open Graph previews.
+	// Disabled by default to avoid outbound requests during domestic-only operation.
+	LinkPreviewEnabled bool
 	// GeoIPDir holds the DB-IP city database behind the devices screen's locations.
 	GeoIPDir string
-	// GeoIPAutoUpdate downloads the database monthly from DB-IP. Off: only a copy placed in
-	// GeoIPDir by hand is used, and without one locations are blank.
+	// GeoIPAutoUpdate optionally downloads the database monthly from DB-IP. Disabled by
+	// default; a locally provisioned database can still be loaded.
 	GeoIPAutoUpdate bool
 }
 
@@ -131,8 +134,9 @@ type TURNConfig struct {
 	CredentialTTLSeconds int
 }
 
-// defaultSTUNURLs — public Google STUN, used when STUN_URLS is unset.
-const defaultSTUNURLs = "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302"
+// No public STUN provider is used by default. Domestic deployments must configure
+// STUN_URLS and TURN_URLS to infrastructure they control and host domestically.
+const defaultSTUNURLs = ""
 
 // EmailConfig — optional. If RESEND_API_KEY is empty, password reset is disabled.
 type EmailConfig struct {
@@ -305,13 +309,17 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid MQVI_ANTIVIRUS_ENABLED: %w", err)
 	}
 
-	breachCheck, err := strconv.ParseBool(getEnv("MQVI_PASSWORD_BREACH_CHECK", "true"))
+	breachCheck, err := strconv.ParseBool(getEnv("MQVI_PASSWORD_BREACH_CHECK", "false"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid MQVI_PASSWORD_BREACH_CHECK: %w", err)
 	}
-	geoAutoUpdate, err := strconv.ParseBool(getEnv("MQVI_GEOIP_AUTO_UPDATE", "true"))
+	geoAutoUpdate, err := strconv.ParseBool(getEnv("MQVI_GEOIP_AUTO_UPDATE", "false"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid MQVI_GEOIP_AUTO_UPDATE: %w", err)
+	}
+	linkPreviewEnabled, err := strconv.ParseBool(getEnv("MQVI_LINK_PREVIEWS_ENABLED", "false"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid MQVI_LINK_PREVIEWS_ENABLED: %w", err)
 	}
 	avTimeout, err := strconv.Atoi(getEnv("MQVI_ANTIVIRUS_TIMEOUT_SECONDS", "10"))
 	if err != nil {
@@ -522,6 +530,7 @@ func Load() (*Config, error) {
 		EncryptionKey:       encKey,
 		HetznerAPIToken:     getEnv("HETZNER_API_TOKEN", ""),
 		PasswordBreachCheck: breachCheck,
+		LinkPreviewEnabled:  linkPreviewEnabled,
 		GeoIPDir:            getEnv("MQVI_GEOIP_DIR", filepath.Join(filepath.Dir(getEnv("DATABASE_PATH", "./data/mqvi.db")), "geoip")),
 		GeoIPAutoUpdate:     geoAutoUpdate,
 	}

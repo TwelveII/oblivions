@@ -14,6 +14,20 @@ You need:
 
 For a domain deployment, create an `A` record pointing to your server's IPv4 address. If using Cloudflare, initially set the record to DNS-only while obtaining the first certificate. Do not put the LiveKit UDP media ports behind an HTTP-only proxy.
 
+## Domestic-outage deployment (important for Iran)
+
+The default application runtime is designed to keep core chat features local, but a domestic-outage deployment requires **domestic infrastructure**, not just a setting:
+
+- Host the web app, Go API, SQLite database, uploads, LiveKit SFU and coturn TURN relay on servers reachable inside Iran. A foreign VPS cannot be reached when international routes are cut.
+- Use a domain whose authoritative DNS and recursive resolution remain reachable domestically. Do not rely on Cloudflare proxy, foreign DNS resolvers, `sslip.io`, or a foreign CDN for the app hostname.
+- Install a browser-trusted TLS certificate before an outage and plan renewal without relying on a foreign ACME service. Keep the certificate and private key on the server.
+- Configure `LIVEKIT_URL`, `TURN_URLS` and `STUN_URLS` to your own domestic endpoints. Do not use public Google STUN or foreign TURN relays. TURN is important for calls across carrier NATs; direct P2P without a relay is not reliable.
+- Keep Firebase/FCM, APNs, Resend, Klipy, Have I Been Pwned, GeoIP downloads and link previews disabled if you require zero foreign runtime calls. The installer sets the server-side options off by default. Mobile builds also leave push registration off unless `VITE_PUSH_NOTIFICATIONS_ENABLED=true` is explicitly set at build time. Push notifications may not arrive during an outage; users can still receive messages while the app is connected over its WebSocket.
+- Electron auto-updates are disabled by default because they query GitHub Releases. Distribute desktop updates through a domestic mirror or offline installer; `OBLIVIONS_ENABLE_AUTO_UPDATE=true` is an explicit opt-in for networks that can reach GitHub.
+- Preinstall OS packages, server binaries, LiveKit, antivirus signatures, mobile/desktop app builds and all assets before the outage. GitHub Releases, package registries and the installer are not available if international access is cut.
+
+The application cannot guarantee domestic availability if the hosting provider, DNS, TLS validation, power, or domestic routing is unavailable. The installer itself downloads from GitHub and public package repositories, so perform installation and updates before an outage or mirror every required artifact inside Iran. Test from multiple Iranian mobile and fixed-line networks with international access blocked before calling the deployment outage-ready.
+
 ## 2. Install
 
 Download and inspect the installer first:
