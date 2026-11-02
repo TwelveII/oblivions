@@ -364,6 +364,7 @@ MQVI_ANTIVIRUS_ENABLED=${AV_ENABLED}
 # Keep optional international lookups disabled for domestic-network resilience.
 MQVI_PASSWORD_BREACH_CHECK=false
 MQVI_GEOIP_AUTO_UPDATE=false
+MQVI_LINK_PREVIEWS_ENABLED=false
 STUN_URLS=
 # Debian/Ubuntu clamav-daemon listens on this Unix socket by default.
 MQVI_CLAMAV_ADDR=unix:/run/clamav/clamd.ctl
@@ -397,6 +398,7 @@ else
     ensure_env_value "${INSTALL_DIR}/.env" "MQVI_ANTIVIRUS_ENABLED" "${AV_ENABLED}"
     ensure_env_value "${INSTALL_DIR}/.env" "MQVI_PASSWORD_BREACH_CHECK" "false"
     ensure_env_value "${INSTALL_DIR}/.env" "MQVI_GEOIP_AUTO_UPDATE" "false"
+    ensure_env_value "${INSTALL_DIR}/.env" "MQVI_LINK_PREVIEWS_ENABLED" "false"
     ensure_env_value "${INSTALL_DIR}/.env" "MQVI_CLAMAV_ADDR" "unix:/run/clamav/clamd.ctl"
     ensure_env_value "${INSTALL_DIR}/.env" "MQVI_ANTIVIRUS_TIMEOUT_SECONDS" "10"
     ensure_env_value "${INSTALL_DIR}/.env" "MQVI_ANTIVIRUS_MAX_SCAN_SIZE_MB" "25"
