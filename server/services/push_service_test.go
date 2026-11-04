@@ -373,9 +373,20 @@ func TestNotifyDMRead_SilentWhenNothingWasEverDelivered(t *testing.T) {
 
 func TestNotifyDMRead_RetractsOnceWhenSomethingWasDelivered(t *testing.T) {
 	s, fcm, _ := opsPushService(testPushConfig(0))
+	service := s.(*pushService)
 
 	s.NotifyDM("rcv", "Alice", "hi", false, "c1", "alice", "m1")
-	<-fcm.sent // the notification landed on their tray
+	<-fcm.sent // the provider send completed; outstanding is recorded immediately afterward
+
+	// The provider signal happens before NotifyDM records the delivered notification. Wait for
+	// that bookkeeping too, rather than racing NotifyDMRead against markOutstanding.
+	deadline := time.Now().Add(2 * time.Second)
+	for !service.hasOutstanding("rcv", "c1") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !service.hasOutstanding("rcv", "c1") {
+		t.Fatal("the delivered notification was never recorded as outstanding")
+	}
 
 	s.NotifyDMRead("rcv", "c1")
 	<-fcm.sent
