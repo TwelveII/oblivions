@@ -30,19 +30,38 @@ type CreateKeyBackupRequest struct {
 	Salt          string `json:"salt"`
 }
 
-// Validate checks required fields.
+const (
+	MaxKeyBackupEncryptedDataBytes = 4 << 20
+	MaxKeyBackupFieldBytes         = 128
+	MaxGroupSessionDataBytes       = 256 << 10
+	MaxGroupSessionIDBytes         = 128
+)
+
+// Validate checks required fields and bounds opaque client-controlled blobs before persistence.
 func (r *CreateKeyBackupRequest) Validate() error {
 	if strings.TrimSpace(r.EncryptedData) == "" {
 		return fmt.Errorf("encrypted_data is required")
 	}
+	if len(r.EncryptedData) > MaxKeyBackupEncryptedDataBytes {
+		return fmt.Errorf("encrypted_data exceeds the %d-byte limit", MaxKeyBackupEncryptedDataBytes)
+	}
 	if strings.TrimSpace(r.Nonce) == "" {
 		return fmt.Errorf("nonce is required")
+	}
+	if len(r.Nonce) > MaxKeyBackupFieldBytes {
+		return fmt.Errorf("nonce exceeds the %d-byte limit", MaxKeyBackupFieldBytes)
 	}
 	if strings.TrimSpace(r.Salt) == "" {
 		return fmt.Errorf("salt is required")
 	}
+	if len(r.Salt) > MaxKeyBackupFieldBytes {
+		return fmt.Errorf("salt exceeds the %d-byte limit", MaxKeyBackupFieldBytes)
+	}
 	if r.Algorithm == "" {
 		r.Algorithm = "aes-256-gcm"
+	}
+	if len(r.Algorithm) > MaxKeyBackupFieldBytes {
+		return fmt.Errorf("algorithm exceeds the %d-byte limit", MaxKeyBackupFieldBytes)
 	}
 	return nil
 }
@@ -72,8 +91,14 @@ func (r *CreateGroupSessionRequest) Validate() error {
 	if strings.TrimSpace(r.SessionID) == "" {
 		return fmt.Errorf("session_id is required")
 	}
+	if len(r.SessionID) > MaxGroupSessionIDBytes {
+		return fmt.Errorf("session_id exceeds the %d-byte limit", MaxGroupSessionIDBytes)
+	}
 	if strings.TrimSpace(r.SessionData) == "" {
 		return fmt.Errorf("session_data is required")
+	}
+	if len(r.SessionData) > MaxGroupSessionDataBytes {
+		return fmt.Errorf("session_data exceeds the %d-byte limit", MaxGroupSessionDataBytes)
 	}
 	return nil
 }

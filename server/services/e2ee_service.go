@@ -34,6 +34,7 @@ type e2eeService struct {
 	backupRepo       repository.E2EEKeyBackupRepository
 	groupSessionRepo repository.GroupSessionRepository
 	permResolver     ChannelPermResolver
+	audienceResolver ChannelAudienceResolver
 	hub              ws.Broadcaster
 }
 
@@ -41,12 +42,14 @@ func NewE2EEService(
 	backupRepo repository.E2EEKeyBackupRepository,
 	groupSessionRepo repository.GroupSessionRepository,
 	permResolver ChannelPermResolver,
+	audienceResolver ChannelAudienceResolver,
 	hub ws.Broadcaster,
 ) E2EEService {
 	return &e2eeService{
 		backupRepo:       backupRepo,
 		groupSessionRepo: groupSessionRepo,
 		permResolver:     permResolver,
+		audienceResolver: audienceResolver,
 		hub:              hub,
 	}
 }
@@ -99,11 +102,15 @@ func (s *e2eeService) UpsertGroupSession(ctx context.Context, channelID, userID,
 	if err := s.authorizeChannelAccess(ctx, userID, channelID); err != nil {
 		return err
 	}
+	audience, err := s.audienceResolver.GetChannelAudience(ctx, channelID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve group-session audience: %w", err)
+	}
 	if err := s.groupSessionRepo.Upsert(ctx, channelID, userID, deviceID, req); err != nil {
 		return fmt.Errorf("failed to upsert group session: %w", err)
 	}
 
-	s.hub.BroadcastToAll(ws.Event{
+	s.hub.BroadcastToUsers(audience, ws.Event{
 		Op: ws.OpGroupSessionNew,
 		Data: GroupSessionNewData{
 			ChannelID:    channelID,

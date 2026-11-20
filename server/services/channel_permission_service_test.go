@@ -424,3 +424,58 @@ func TestBuildVisibilityFilter_PermRepoError(t *testing.T) {
 		t.Fatal("expected error when perm repo fails")
 	}
 }
+
+
+// TestGetChannelAudience_OnlyIncludesUsersWhoCanReadChannel verifies private-channel
+// recipients are selected using effective role and channel-override permissions.
+func TestGetChannelAudience_OnlyIncludesUsersWhoCanReadChannel(t *testing.T) {
+	const channelID, serverID = "chan-private", "srv-1"
+	rolesByUser := map[string][]models.Role{
+		"visible": {{ID: "reader", Permissions: models.PermViewChannel | models.PermReadMessages}},
+		"hidden":  {{ID: "reader-hidden", Permissions: models.PermViewChannel | models.PermReadMessages}},
+		"granted": {{ID: "limited", Permissions: models.PermReadMessages}},
+		"admin":   {{ID: "admin", Permissions: models.PermAdmin}},
+		"no-read": {{ID: "view-only", Permissions: models.PermViewChannel}},
+	}
+	svc := newTestChannelPermService(
+		&testutil.MockChannelPermRepo{
+			GetByChannelFn: func(_ context.Context, _ string) ([]models.ChannelPermissionOverride, error) {
+				return []models.ChannelPermissionOverride{
+					{RoleID: "reader-hidden", Deny: models.PermViewChannel},
+					{RoleID: "limited", Allow: models.PermViewChannel},
+				}, nil
+			},
+		},
+		&testutil.MockRoleRepo{
+			GetByServerGroupedByUserFn: func(_ context.Context, gotServerID string) (map[string][]models.Role, error) {
+				if gotServerID != serverID {
+					t.Fatalf("server ID = %q, want %q", gotServerID, serverID)
+				}
+				return rolesByUser, nil
+			},
+		},
+		&testutil.MockChannelRepo{
+			GetByIDFn: func(_ context.Context, gotChannelID string) (*models.Channel, error) {
+				if gotChannelID != channelID {
+					t.Fatalf("channel ID = %q, want %q", gotChannelID, channelID)
+				}
+				return &models.Channel{ID: channelID, ServerID: serverID}, nil
+			},
+		},
+		&testutil.MockBroadcaster{},
+	)
+
+	got, err := svc.(ChannelAudienceResolver).GetChannelAudience(context.Background(), channelID)
+	if err != nil {
+		t.Fatalf("GetChannelAudience returned error: %v", err)
+	}
+	want := []string{"admin", "granted", "visible"}
+	if len(got) != len(want) {
+		t.Fatalf("audience = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("audience = %v, want %v", got, want)
+		}
+	}
+}

@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 
 	"github.com/akinalp/mqvi/models"
@@ -9,6 +11,31 @@ import (
 	"github.com/akinalp/mqvi/pkg/ctxkeys"
 	"github.com/akinalp/mqvi/services"
 )
+
+const (
+	maxKeyBackupRequestBytes = 4 << 20
+	maxGroupSessionRequestBytes = 256 << 10
+)
+
+// decodeLimitedJSON bounds E2EE JSON bodies and rejects trailing JSON values.
+func decodeLimitedJSON(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			pkg.ErrorWithMessage(w, http.StatusRequestEntityTooLarge, "request body too large")
+		} else {
+			pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+		}
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		pkg.ErrorWithMessage(w, http.StatusBadRequest, "request body must contain one JSON value")
+		return false
+	}
+	return true
+}
 
 // E2EEHandler handles E2EE key backup and group session management.
 type E2EEHandler struct {
@@ -32,8 +59,7 @@ func (h *E2EEHandler) UpsertKeyBackup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req models.CreateKeyBackupRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+	if !decodeLimitedJSON(w, r, &req, maxKeyBackupRequestBytes) {
 		return
 	}
 
@@ -105,8 +131,7 @@ func (h *E2EEHandler) CreateGroupSession(w http.ResponseWriter, r *http.Request)
 	}
 
 	var req models.CreateGroupSessionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		pkg.ErrorWithMessage(w, http.StatusBadRequest, "invalid request body")
+	if !decodeLimitedJSON(w, r, &req, maxGroupSessionRequestBytes) {
 		return
 	}
 

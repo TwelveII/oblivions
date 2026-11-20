@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,6 +40,12 @@ type ChannelPermResolver interface {
 	// on a just-changed permission — e.g. live voice enforcement after a role/member change,
 	// which does NOT invalidate this cache — sees current state, not a ≤30s-stale entry.
 	ResolveChannelPermissionsFresh(ctx context.Context, userID, channelID string) (models.Permission, error)
+}
+
+// ChannelAudienceResolver returns users who can view and read a channel. It is used for
+// channel-scoped realtime events so private-channel metadata is never broadcast server-wide.
+type ChannelAudienceResolver interface {
+	GetChannelAudience(ctx context.Context, channelID string) ([]string, error)
 }
 
 // VoiceChannelPermissionEnforcer re-applies effective voice permissions at the SFU for
@@ -298,6 +305,55 @@ func (s *channelPermService) BuildVisibilityFilter(ctx context.Context, userID, 
 // resolves (repopulating the cache). Used by live voice enforcement so it acts on current
 // permissions even when the trigger (role / member-role change) didn't invalidate the cache
 // — and so a user disconnected for a lost permission can't rejoin via a stale cache hit.
+// GetChannelAudience resolves the channel's current readable audience in two queries,
+// rather than resolving permissions separately for every member. The result includes offline
+// members; the WebSocket hub only delivers to users with live connections.
+func (s *channelPermService) GetChannelAudience(ctx context.Context, channelID string) ([]string, error) {
+	channel, err := s.channelGetter.GetByID(ctx, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get channel for audience resolution: %w", err)
+	}
+	if channel == nil {
+		return nil, fmt.Errorf("channel %s not found", channelID)
+	}
+
+	rolesByUser, err := s.roleRepo.GetByServerGroupedByUser(ctx, channel.ServerID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get channel audience roles: %w", err)
+	}
+	overrides, err := s.permRepo.GetByChannel(ctx, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get channel audience overrides: %w", err)
+	}
+	overridesByRole := make(map[string]models.ChannelPermissionOverride, len(overrides))
+	for _, override := range overrides {
+		overridesByRole[override.RoleID] = override
+	}
+
+	audience := make([]string, 0, len(rolesByUser))
+	for userID, roles := range rolesByUser {
+		var base, allow, deny models.Permission
+		for _, role := range roles {
+			base |= role.Permissions
+			override, ok := overridesByRole[role.ID]
+			if ok {
+				allow |= override.Allow
+				deny |= override.Deny
+			}
+		}
+		if base.Has(models.PermAdmin) {
+			audience = append(audience, userID)
+			continue
+		}
+		effective := (base & ^deny) | allow
+		if effective.Has(models.PermViewChannel) && effective.Has(models.PermReadMessages) {
+			audience = append(audience, userID)
+		}
+	}
+	sort.Strings(audience)
+	return audience, nil
+}
+
 func (s *channelPermService) ResolveChannelPermissionsFresh(ctx context.Context, userID, channelID string) (models.Permission, error) {
 	s.permCache.Delete(userID + ":" + channelID)
 	return s.ResolveChannelPermissions(ctx, userID, channelID)

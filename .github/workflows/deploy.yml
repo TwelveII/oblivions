@@ -37,7 +37,7 @@ jobs:
         run: |
           npm ci
           npm run build
-          npx vitest run src/crypto
+          npm test
 
       - name: Build and test backend
         working-directory: server
