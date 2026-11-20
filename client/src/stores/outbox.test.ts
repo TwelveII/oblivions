@@ -39,6 +39,13 @@ vi.mock("../crypto/keyStorage", () => ({
   cacheDecryptedMessage: vi.fn(async () => {}),
   getCachedDecryptedMessage: vi.fn(async () => null),
 }));
+vi.mock("./shared/messageUtils", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./shared/messageUtils")>();
+  return {
+    ...actual,
+    encryptFilesForE2EE: vi.fn(async (files: File[]) => ({ files, metas: [], thumbs: [] })),
+  };
+});
 
 const toast = vi.hoisted(() => vi.fn());
 vi.mock("./toastStore", () => ({ useToastStore: { getState: () => ({ addToast: toast }) } }));

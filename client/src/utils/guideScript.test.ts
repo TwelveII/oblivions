@@ -12,7 +12,7 @@ describe("the guide conversation", () => {
   it("greets a new user and offers every step at once", () => {
     const items = guideConversation(none);
     expect(items[0]).toMatchObject({ kind: "message", textKey: "greeting" });
-    expect(cards(none).map(([step]) => step)).toEqual(["community", "message", "voice", "friend", "profile", "roles", "app"]);
+    expect(cards(none).map(([step]) => step)).toEqual(["community", "message", "voice", "friend", "profile", "roles"]);
     expect(cards(none).every(([, done]) => done === false)).toBe(true);
   });
 
