@@ -161,7 +161,7 @@ describe("useMobileUpdate", () => {
     expect(AppUpdate.openAppStore).not.toHaveBeenCalled();
   });
 
-  it("opens the store page otherwise", async () => {
+  it("does not try to open an unconfigured store listing", async () => {
     env.platform = "ios";
     env.store = { updateAvailability: 2, availableVersionName: "1.2.0" };
     const { result } = renderHook(() => useMobileUpdate());

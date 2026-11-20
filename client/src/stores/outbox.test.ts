@@ -276,7 +276,7 @@ describe("retrying after a reconnect", () => {
     await flush();
 
     expect(messageApi.sendEncryptedMessage).toHaveBeenCalledTimes(4);
-    expect(messageApi.sendEncryptedMessage.mock.calls[3][2]).toBe("lost");
+    expect(messageApi.sendEncryptedMessage.mock.calls[3][9]).toBe(messageApi.sendEncryptedMessage.mock.calls[0][9]);
   });
 });
 
@@ -307,7 +307,7 @@ describe("waiting for delivery", () => {
 describe("cancel and sign-out", () => {
   it("should drop a message whose upload the user cancelled, not mark it failed", async () => {
     messageApi.sendEncryptedMessage.mockImplementation((...args: unknown[]) => {
-      const { signal } = args[5] as { signal: AbortSignal };
+      const { signal } = args[7] as { signal: AbortSignal };
       return new Promise((resolve) => signal.addEventListener("abort", () =>
         resolve({ success: false, httpStatus: 0, code: "UPLOAD_ABORTED" })));
     });
