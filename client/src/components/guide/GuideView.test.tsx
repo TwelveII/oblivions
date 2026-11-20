@@ -65,16 +65,12 @@ describe("the guide conversation", () => {
     }
   });
 
-  it("holds the greeting while the download prompt is in front, so it never plays unseen", () => {
-    // A desktop browser that has not seen the prompt yet (jsdom reads as a desktop OS).
+  it("does not pause the greeting for the retired download prompt", () => {
+    // This is a web-only deployment; the old native-app download prompt is disabled.
     const user = useAuthStore.getState().user;
     useAuthStore.setState({ user: { ...user, has_seen_download_prompt: false } } as never);
     render(<GuideView />);
 
-    act(() => vi.advanceTimersByTime(GUIDE_TYPING_MAX_MS * 3));
-    expect(screen.queryByText("greeting")).toBeNull();
-
-    act(() => useAuthStore.setState({ user: { ...user, has_seen_download_prompt: true } } as never));
     act(() => vi.advanceTimersByTime(GUIDE_TYPING_MAX_MS));
     expect(screen.getByText("greeting")).toBeTruthy();
   });

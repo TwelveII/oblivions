@@ -50,6 +50,7 @@ import { AppUpdate } from "@capawesome/capacitor-app-update";
 import { useP2PCallStore } from "../stores/p2pCallStore";
 import { useVoiceStore } from "../stores/voiceStore";
 import { useMobileUpdate } from "./useMobileUpdate";
+import { APP_STORE_ID } from "../utils/detectOS";
 
 const newer = { updateAvailability: 2, availableVersionCode: "9", immediateUpdateAllowed: true };
 
@@ -167,7 +168,11 @@ describe("useMobileUpdate", () => {
     await waitFor(() => expect(result.current.state).toEqual({ kind: "available", id: "1.2.0" }));
 
     await act(async () => result.current.update());
-    expect(AppUpdate.openAppStore).toHaveBeenCalledWith({ appId: "6761312531" });
+    if (APP_STORE_ID) {
+      expect(AppUpdate.openAppStore).toHaveBeenCalledWith({ appId: APP_STORE_ID });
+    } else {
+      expect(AppUpdate.openAppStore).not.toHaveBeenCalled();
+    }
     expect(AppUpdate.performImmediateUpdate).not.toHaveBeenCalled();
   });
 

@@ -31,6 +31,17 @@ vi.mock("../api/soundboard", () => soundApi);
 vi.mock("./voiceStore", () => ({
   useVoiceStore: { getState: () => ({ currentVoiceChannelId: null }), subscribe: () => () => {} },
 }));
+vi.mock("./e2eeStore", () => ({
+  useE2EEStore: { getState: () => ({ initStatus: "ready", localDeviceId: "dev1" }) },
+  canEncrypt: () => true,
+}));
+vi.mock("./authStore", () => ({
+  useAuthStore: { getState: () => ({ user: { id: "u1" } }) },
+}));
+vi.mock("../crypto/channelEncryption", () => ({
+  encryptChannelMessage: vi.fn(async () => ({ distributionId: "dist" })),
+  decryptChannelMessages: vi.fn(async (messages: unknown[]) => messages),
+}));
 
 const { useVoiceMessageStore } = await import("./voiceMessageStore");
 const { useSoundboardStore } = await import("./soundboardStore");

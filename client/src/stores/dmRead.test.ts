@@ -11,6 +11,8 @@ const listDMChannels = vi.fn<() => Promise<ApiResult>>();
 
 vi.mock("../api/dm", () => ({
   markDMRead: (channelId: string, messageId?: string) => markDMRead(channelId, messageId),
+  markDMsDeliveredLatest: vi.fn(async () => ({ success: true })),
+  markDMDelivered: vi.fn(async () => ({ success: true })),
   listDMChannels: () => listDMChannels(),
   getDMMessages: vi.fn(async () => ({ success: false })),
   getDMSettings: vi.fn(async () => ({ success: false })),

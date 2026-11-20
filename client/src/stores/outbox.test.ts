@@ -31,7 +31,7 @@ const dmCrypto = vi.hoisted(() => ({
 }));
 vi.mock("../crypto/dmEncryption", () => dmCrypto);
 vi.mock("../crypto/channelEncryption", () => ({
-  encryptChannelMessage: vi.fn(),
+  encryptChannelMessage: vi.fn(async () => ({ distributionId: "dist" })),
   decryptChannelMessages: vi.fn(async (m: unknown[]) => m),
   decryptChannelMessage: vi.fn(),
 }));
@@ -67,20 +67,21 @@ const stored = (id: string, nonce: string, extra: Partial<Message> = {}): Messag
 const pendingIn = (conversationId: string) => useOutboxStore.getState().pendingByConversation[conversationId] ?? [];
 const channelIds = () => (useMessageStore.getState().messagesByChannel["c1"] ?? []).map((m) => m.id);
 /** The nonce the store handed the API: the 8th argument of sendMessage. */
-const sentNonce = (call: number) => messageApi.sendMessage.mock.calls[call][7] as string;
+const sentNonce = (call: number) => messageApi.sendEncryptedMessage.mock.calls[call][9] as string;
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
 beforeEach(() => {
   resetOutbox();
   vi.clearAllMocks();
   useAuthStore.setState({ user: me });
-  useServerStore.setState({ servers: [{ id: "s1", e2ee_enabled: false }] as never, activeServerId: "s1", activeServer: null });
+  useServerStore.setState({ servers: [{ id: "s1", e2ee_enabled: true }] as never, activeServerId: "s1", activeServer: null });
   useMessageStore.setState({ messagesByChannel: { c1: [] } });
   useDMStore.setState({
     channels: [{ id: "d1", e2ee_enabled: false, other_user: { id: "bob" } } as DMChannelWithUser],
     messagesByChannel: { d1: [] },
   });
   useE2EEStore.setState({ initStatus: "ready", localDeviceId: "dev1" });
+  dmCrypto.encryptDMMessage.mockResolvedValue([]);
   URL.createObjectURL = vi.fn(() => "blob:local");
   URL.revokeObjectURL = vi.fn();
 });
@@ -91,7 +92,7 @@ afterEach(() => {
 
 describe("optimistic channel send", () => {
   it("should show the message as pending before the server answers", async () => {
-    messageApi.sendMessage.mockReturnValue(new Promise(() => {}));
+    messageApi.sendEncryptedMessage.mockReturnValue(new Promise(() => {}));
 
     const queued = await useMessageStore.getState().sendMessage("c1", "hi");
 
@@ -101,8 +102,8 @@ describe("optimistic channel send", () => {
   });
 
   it("should replace the pending copy with the stored message when the response arrives", async () => {
-    messageApi.sendMessage.mockImplementation(async (...args: unknown[]) => ({
-      success: true, data: stored("m1", args[7] as string),
+    messageApi.sendEncryptedMessage.mockImplementation(async (...args: unknown[]) => ({
+      success: true, data: stored("m1", args[9] as string),
     }));
 
     await useMessageStore.getState().sendMessage("c1", "hi");
@@ -114,7 +115,7 @@ describe("optimistic channel send", () => {
 
   it("should keep one copy when the echo arrives before the response", async () => {
     const response = deferred<unknown>();
-    messageApi.sendMessage.mockReturnValue(response.promise);
+    messageApi.sendEncryptedMessage.mockReturnValue(response.promise);
     await useMessageStore.getState().sendMessage("c1", "hi");
     await flush();
     const nonce = sentNonce(0);
@@ -128,7 +129,7 @@ describe("optimistic channel send", () => {
   });
 
   it("should not let another user's message settle this device's pending send", async () => {
-    messageApi.sendMessage.mockReturnValue(new Promise(() => {}));
+    messageApi.sendEncryptedMessage.mockReturnValue(new Promise(() => {}));
     await useMessageStore.getState().sendMessage("c1", "hi");
     await flush();
 
@@ -138,13 +139,13 @@ describe("optimistic channel send", () => {
   });
 
   it("should retry a lost send under the same nonce", async () => {
-    messageApi.sendMessage.mockResolvedValueOnce({ success: false, httpStatus: 0, error: "Network request failed" });
+    messageApi.sendEncryptedMessage.mockResolvedValueOnce({ success: false, httpStatus: 0, error: "Network request failed" });
     await useMessageStore.getState().sendMessage("c1", "hi");
     await flush();
     expect(pendingIn("c1")[0]).toMatchObject({ status: "failed", failure: "transient" });
 
-    messageApi.sendMessage.mockImplementationOnce(async (...args: unknown[]) => ({
-      success: true, data: stored("m1", args[7] as string),
+    messageApi.sendEncryptedMessage.mockImplementationOnce(async (...args: unknown[]) => ({
+      success: true, data: stored("m1", args[9] as string),
     }));
     useMessageStore.getState().retryPending(pendingIn("c1")[0].nonce);
     await flush();
@@ -177,8 +178,8 @@ describe("optimistic channel send", () => {
   it("should fail a send that gets no answer within the timeout, and abort its request", async () => {
     vi.useFakeTimers();
     let signal: AbortSignal | undefined;
-    messageApi.sendMessage.mockImplementation((...args: unknown[]) => {
-      signal = (args[5] as { signal: AbortSignal }).signal;
+    messageApi.sendEncryptedMessage.mockImplementation((...args: unknown[]) => {
+      signal = (args[7] as { signal: AbortSignal }).signal;
       return new Promise(() => {});
     });
 
@@ -190,7 +191,7 @@ describe("optimistic channel send", () => {
   });
 
   it("should not toast a transient failure — the bubble shows it", async () => {
-    messageApi.sendMessage.mockResolvedValue({ success: false, httpStatus: 503, error: "unavailable" });
+    messageApi.sendEncryptedMessage.mockResolvedValue({ success: false, httpStatus: 503, error: "unavailable" });
 
     await useMessageStore.getState().sendMessage("c1", "hi");
     await flush();
@@ -200,21 +201,21 @@ describe("optimistic channel send", () => {
 
   it("should send a conversation's messages one after another", async () => {
     const first = deferred<unknown>();
-    messageApi.sendMessage.mockReturnValueOnce(first.promise);
-    messageApi.sendMessage.mockImplementationOnce(async (...args: unknown[]) => ({
-      success: true, data: stored("m2", args[7] as string),
+    messageApi.sendEncryptedMessage.mockReturnValueOnce(first.promise);
+    messageApi.sendEncryptedMessage.mockImplementationOnce(async (...args: unknown[]) => ({
+      success: true, data: stored("m2", args[9] as string),
     }));
 
     await useMessageStore.getState().sendMessage("c1", "one");
     await useMessageStore.getState().sendMessage("c1", "two");
     await flush();
-    expect(messageApi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(messageApi.sendEncryptedMessage).toHaveBeenCalledTimes(1);
 
     first.resolve({ success: true, data: stored("m1", sentNonce(0)) });
     await flush();
     await flush();
 
-    expect(messageApi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(messageApi.sendEncryptedMessage).toHaveBeenCalledTimes(2);
     expect(channelIds()).toEqual(["m1", "m2"]);
   });
 
@@ -253,13 +254,13 @@ describe("optimistic channel send", () => {
 
     expect(queued).toBe(false);
     expect(pendingIn("c1")).toEqual([]);
-    expect(messageApi.sendMessage).not.toHaveBeenCalled();
+    expect(messageApi.sendEncryptedMessage).not.toHaveBeenCalled();
   });
 });
 
 describe("retrying after a reconnect", () => {
   it("should retry transient text failures and leave rejected ones and files to the user", async () => {
-    messageApi.sendMessage
+    messageApi.sendEncryptedMessage
       .mockResolvedValueOnce({ success: false, httpStatus: 0 }) // text, lost
       .mockResolvedValueOnce({ success: false, httpStatus: 403, error: "forbidden" }) // text, refused
       .mockResolvedValueOnce({ success: false, httpStatus: 0 }); // file, lost
@@ -270,12 +271,12 @@ describe("retrying after a reconnect", () => {
     await flush();
     expect(pendingIn("c1").map((p) => p.status)).toEqual(["failed", "failed", "failed"]);
 
-    messageApi.sendMessage.mockResolvedValue({ success: false, httpStatus: 0 });
+    messageApi.sendEncryptedMessage.mockResolvedValue({ success: false, httpStatus: 0 });
     useMessageStore.getState().retryFailedSends();
     await flush();
 
-    expect(messageApi.sendMessage).toHaveBeenCalledTimes(4);
-    expect(messageApi.sendMessage.mock.calls[3][2]).toBe("lost");
+    expect(messageApi.sendEncryptedMessage).toHaveBeenCalledTimes(4);
+    expect(messageApi.sendEncryptedMessage.mock.calls[3][2]).toBe("lost");
   });
 });
 
@@ -291,13 +292,13 @@ describe("failure classes", () => {
 
 describe("waiting for delivery", () => {
   it("should resolve true only once the server stored the message", async () => {
-    dmApi.sendDMMessage.mockResolvedValueOnce({ success: false, httpStatus: 0 });
+    dmApi.sendEncryptedDMMessage.mockResolvedValueOnce({ success: false, httpStatus: 0 });
     expect(await useDMStore.getState().sendMessageAndWait("d1", "invite")).toBe(false);
     expect(pendingIn("d1")[0].status).toBe("failed");
 
-    dmApi.sendDMMessage.mockImplementationOnce(async (...args: unknown[]) => ({
+    dmApi.sendEncryptedDMMessage.mockImplementationOnce(async (...args: unknown[]) => ({
       success: true,
-      data: { id: "m1", dm_channel_id: "d1", user_id: "me", content: "invite", client_nonce: args[6] } as DMMessage,
+      data: { id: "m1", dm_channel_id: "d1", user_id: "me", content: null, client_nonce: args[8] } as DMMessage,
     }));
     expect(await useDMStore.getState().sendMessageAndWait("d1", "invite")).toBe(true);
   });
@@ -305,7 +306,7 @@ describe("waiting for delivery", () => {
 
 describe("cancel and sign-out", () => {
   it("should drop a message whose upload the user cancelled, not mark it failed", async () => {
-    messageApi.sendMessage.mockImplementation((...args: unknown[]) => {
+    messageApi.sendEncryptedMessage.mockImplementation((...args: unknown[]) => {
       const { signal } = args[5] as { signal: AbortSignal };
       return new Promise((resolve) => signal.addEventListener("abort", () =>
         resolve({ success: false, httpStatus: 0, code: "UPLOAD_ABORTED" })));
@@ -321,7 +322,7 @@ describe("cancel and sign-out", () => {
   });
 
   it("should leave nothing queued for the next account after sign-out", async () => {
-    messageApi.sendMessage.mockResolvedValue({ success: false, httpStatus: 0 });
+    messageApi.sendEncryptedMessage.mockResolvedValue({ success: false, httpStatus: 0 });
     await useMessageStore.getState().sendMessage("c1", "hi");
     await flush();
 
@@ -330,7 +331,7 @@ describe("cancel and sign-out", () => {
     await flush();
 
     expect(pendingIn("c1")).toEqual([]);
-    expect(messageApi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(messageApi.sendEncryptedMessage).toHaveBeenCalledTimes(1);
   });
 });
 

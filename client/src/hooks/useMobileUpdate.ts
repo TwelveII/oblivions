@@ -115,6 +115,7 @@ export function useMobileUpdate() {
         await AppUpdate.performImmediateUpdate();
         return;
       }
+      if (!APP_STORE_ID) return; // Web-only builds have no public store listing.
       await AppUpdate.openAppStore({ appId: APP_STORE_ID });
     } catch {
       // Neither opened; the prompt stays so the user can try again.
