@@ -31,7 +31,7 @@ type CreateKeyBackupRequest struct {
 }
 
 const (
-	MaxKeyBackupEncryptedDataBytes = 4 << 20
+	MaxKeyBackupEncryptedDataBytes = 16 << 20
 	MaxKeyBackupFieldBytes         = 128
 	MaxGroupSessionDataBytes       = 256 << 10
 	MaxGroupSessionIDBytes         = 128

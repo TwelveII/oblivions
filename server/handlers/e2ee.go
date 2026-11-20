@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	maxKeyBackupRequestBytes = 4 << 20
+	maxKeyBackupRequestBytes = 16 << 20
 	maxGroupSessionRequestBytes = 256 << 10
 )
 
